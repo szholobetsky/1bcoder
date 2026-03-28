@@ -1,0 +1,4 @@
+# Wikipedia search — one step
+# Usage: /plan apply WikiSearch.txt phrase={{phrase}}
+/run curl -s "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={{phrase}}&format=json&utf8=1&srlimit=5"
+list the top results with their titles and a one-line snippet each

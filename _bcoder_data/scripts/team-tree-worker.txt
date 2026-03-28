@@ -1,0 +1,9 @@
+# Worker 1 — directory structure angle
+# Looks at the project tree and identifies where {{keyword}} lives structurally.
+# Saves result to .1bcoder/results/tree-analysis.txt
+[v] /tree .
+[v] Look at this directory structure. The task is: {{task}}
+[v] Find all directories and files that are likely related to "{{keyword}}".
+[v] List them as: path — one line reason why it is relevant.
+[v] Keep your answer short. Maximum 10 items.
+[v] /save .1bcoder/results/tree-analysis.txt

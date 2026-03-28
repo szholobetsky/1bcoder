@@ -1,0 +1,9 @@
+# Worker 2 — code search angle
+# Uses /find to locate actual code related to {{keyword}}, then asks about implementation.
+# Saves result to .1bcoder/results/search-analysis.txt
+[v] /find {{keyword}} -c
+[v] Look at these code matches. The task is: {{task}}
+[v] Which functions or classes are the most important entry points for "{{keyword}}"?
+[v] List them as: filename:line — function/class name — one line description.
+[v] Maximum 8 items. No explanation, just the list.
+[v] /save .1bcoder/results/search-analysis.txt

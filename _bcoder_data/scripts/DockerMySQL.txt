@@ -1,0 +1,6 @@
+# Docker Compose for MySQL with persistent volume
+# Usage: /plan apply DockerMySQL.txt db={{db}} user={{user}} password={{password}} port={{port}}
+# e.g.  db=myapp user=user password=user port=3306
+write a docker-compose.yml for MySQL with: database={{db}}, user={{user}}, password={{password}}, port={{port}}, volume ./data:/var/lib/mysql. output only the yaml, no explanation
+/edit docker-compose.yml code
+/run mkdir -p data

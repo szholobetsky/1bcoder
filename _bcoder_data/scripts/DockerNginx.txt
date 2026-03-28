@@ -1,0 +1,6 @@
+# Docker Compose for Nginx static web server
+# Usage: /plan apply DockerNginx.txt port={{port}} folder={{folder}}
+# e.g.  port=8080 folder=./public
+write a docker-compose.yml for Nginx serving static files from {{folder}} on port {{port}}, volume {{folder}}:/usr/share/nginx/html:ro. output only the yaml, no explanation
+/edit docker-compose.yml code
+/run mkdir -p {{folder}}

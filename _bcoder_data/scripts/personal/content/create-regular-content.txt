@@ -1,0 +1,4 @@
+[v] /host 192.168.0.229:11434
+/model gemma3:4b
+/mcp connect fs npx -y @modelcontextprotocol/server-filesystem .
+/mcp tools

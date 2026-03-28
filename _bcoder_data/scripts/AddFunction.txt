@@ -1,0 +1,8 @@
+# Add a new function to an existing file
+# Usage: /plan apply AddFunction.txt file={{file}} line={{line}} task={{task}}
+# line = first empty line where function should be inserted
+/read {{file}}
+write a clean Python function for: {{task}}. output only the function, no explanation
+/bkup save {{file}}
+/edit {{file}} {{line}} code
+/map idiff

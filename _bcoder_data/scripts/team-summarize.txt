@@ -1,0 +1,7 @@
+# Summarize results from all team workers
+# Usage: /plan apply team-summarize.txt task="user gets 404 on login" keyword=authentication
+/read .1bcoder/results/tree-analysis.txt
+/read .1bcoder/results/search-analysis.txt
+/read .1bcoder/results/map-analysis.txt
+Based on all three analyses above, summarize in under 150 words: (1) top 3 files where {{keyword}} is implemented, (2) likely cause of: {{task}}, (3) which file to investigate first and why.
+/save .1bcoder/results/summary.txt

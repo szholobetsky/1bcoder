@@ -1,0 +1,7 @@
+# Find missing dependencies and append them to requirements.txt
+# Usage: /plan apply CheckRequirements.txt
+# Scans all .py files for imports, compares with requirements.txt, appends missing
+/run python -c "import os; lines=set(); [lines.add(l.strip()) for r,_,fs in os.walk('.') for f in fs if f.endswith('.py') for l in open(os.path.join(r,f),errors='ignore') if l.startswith(('import ','from '))]; [print(l) for l in sorted(lines)]"
+/read requirements.txt
+compare the imports list with requirements.txt. list ONLY the package names that are missing from requirements.txt and are not Python stdlib. one package per line, no versions, no explanation
+/save requirements.txt append-below

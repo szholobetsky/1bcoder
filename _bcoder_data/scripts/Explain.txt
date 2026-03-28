@@ -1,0 +1,5 @@
+# Explain a piece of code
+# Usage: /plan apply Explain.txt file={{file}} range={{range}}
+# range = line range, e.g. range=10-40  (or omit for whole file)
+/read {{file}} {{range}}
+explain what this code does in simple terms: what it receives, what it returns, any side effects

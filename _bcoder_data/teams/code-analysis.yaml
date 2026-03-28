@@ -1,0 +1,10 @@
+workers:
+  - host: localhost:11434
+    model: qwen2.5-coder:1.5b
+    plan: team-tree-worker.txt
+  - host: openai://localhost:1234
+    model: qwen2.5-coder:1.5b
+    plan: team-search-worker.txt
+  - host: 192.168.0.229:11434
+    model: gemma3:4b
+    plan: team-map-worker.txt

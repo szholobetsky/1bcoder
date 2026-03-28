@@ -1,0 +1,5 @@
+# SQLite — dump full schema to db_structure.txt (no LLM needed)
+# Usage: /plan apply SQLiteSchema.txt file={{file}}
+# e.g.  file=myapp.db
+/run sqlite3 {{file}} ".schema" > db_structure.txt
+/run sqlite3 {{file}} "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name;" >> db_structure2.txt

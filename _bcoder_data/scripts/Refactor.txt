@@ -1,0 +1,8 @@
+# Refactor a range of lines — better with 7B+ models
+# Usage: /plan apply Refactor.txt file={{file}} range={{range}} task={{task}}
+# e.g.  file=utils.py range=15-35 task="simplify the loop and remove duplication"
+/read {{file}} {{range}}
+refactor this code: {{task}}. output only the improved code block, no explanation
+/bkup save {{file}}
+/edit {{file}} {{range}} code
+/map idiff

@@ -1,0 +1,4 @@
+# DuckDuckGo Instant Answer — one step
+# Usage: /plan apply DuckDuckGoInstant.txt phrase={{phrase}}
+/run curl -s "https://api.duckduckgo.com/?q={{phrase}}&format=json&no_html=1&skip_disambig=1"
+extract Abstract, Answer, Definition and give a short plain-text summary. if all empty — say "no instant answer found"

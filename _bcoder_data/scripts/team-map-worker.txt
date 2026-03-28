@@ -1,0 +1,10 @@
+# Worker 3 — dependency / impact angle (runs on remote GPU with gemma3:4b)
+# Uses /map find to understand what depends on {{keyword}} and what it depends on.
+# Saves result to .1bcoder/results/map-analysis.txt
+[v] /map find \{{keyword}}
+[v] Look at these module relationships. The task is: {{task}}
+[v] Answer two questions:
+[v] 1. What modules CALL or IMPORT "{{keyword}}" — who depends on it?
+[v] 2. What modules does "{{keyword}}" depend on?
+[v] Be specific. Maximum 5 items per question. One line per item: module — reason.
+[v] /save .1bcoder/results/map-analysis.txt

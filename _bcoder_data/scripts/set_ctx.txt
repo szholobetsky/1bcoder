@@ -1,0 +1,4 @@
+# Set context window size for both display and model param
+# Usage: /plan apply set_ctx.txt num_ctx=8192
+[v] /ctx {{num_ctx}}
+[v] /param num_ctx {{num_ctx}}

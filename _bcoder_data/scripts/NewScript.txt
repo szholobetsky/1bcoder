@@ -1,0 +1,5 @@
+# Create a new Python script from description
+# Usage: /plan apply NewScript.txt file={{file}} task={{task}}
+write a complete Python script that: {{task}}. output only the code, no explanation
+/edit {{file}} code
+/run python {{file}}

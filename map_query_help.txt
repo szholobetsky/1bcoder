@@ -1,0 +1,178 @@
+map_query.py — query a 1bcoder map file
+========================================
+
+Standalone CLI tool to search and trace identifiers in a map.txt file
+produced by map_index.py.
+
+Requires map.txt built first:
+    python map_index.py .
+    python map_index.py src/ 3
+
+
+USAGE
+-----
+
+    python map_query.py find [tokens ...] [--map FILE]
+    python map_query.py trace <identifier>  [--map FILE]
+
+--map FILE   Path to map.txt (default: .1bcoder/map.txt)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMAND: find
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Filters file blocks from the map. No tokens → prints the full map.
+
+TOKEN SYNTAX
+------------
+
+    term       include block if FILENAME contains term
+    !term      exclude block if filename contains term
+    \term      include block if any CHILD LINE contains term
+    \!term     include block but HIDE child lines containing term
+    \\!term    exclude block if any child line contains term
+
+All tokens are AND-ed together. Terms are case-insensitive.
+Combine as many tokens as needed in one command.
+
+
+EXAMPLES
+--------
+
+Print the full map:
+    python map_query.py find
+
+Find all files whose name contains "auth":
+    python map_query.py find auth
+
+Find files whose name contains "auth" AND children mention "register":
+    python map_query.py find auth \register
+
+Find any file that references "register" (in child lines), skip mock files:
+    python map_query.py find \register !mock
+
+Show files referencing "register" but hide lines that mention "test_data":
+    python map_query.py find \register \!test_data
+
+Exclude blocks where any child line mentions "deprecated":
+    python map_query.py find auth \\!deprecated
+
+Combined real-world example — find auth-related files that reference
+UserService, skip deprecated blocks, hide test_data child lines:
+    python map_query.py find auth \UserService \\!deprecated \!test_data
+
+Search a different map file:
+    python map_query.py find register --map path/to/other_map.txt
+
+
+HOW TO READ THE OUTPUT
+----------------------
+
+Each printed block is one file from the map:
+
+    app/auth/routes.py
+      defines : login(ln:12), logout(ln:28), register(ln:45)
+      links  → app/models.py (call:User, import:UserSchema)
+      links  → app/auth/forms.py (call:LoginForm, call:RegisterForm)
+
+    - "defines" — identifiers declared in this file, with line numbers
+    - "links → X" — this file references identifiers defined in X,
+                     with relationship type: import / call / ref / expr
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMAND: trace
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Follows the call chain BACKWARDS from a defined identifier using BFS.
+Answers the question: "who calls X, and who calls the callers of X?"
+
+    python map_query.py trace <identifier>
+
+Max traversal depth: 8 levels. Cycles are detected and skipped.
+
+
+EXAMPLES
+--------
+
+Trace where "register" is used across the codebase:
+    python map_query.py trace register
+
+Trace a database function:
+    python map_query.py trace insertEmail
+
+Trace an endpoint handler:
+    python map_query.py trace login_required
+
+Trace using a non-default map:
+    python map_query.py trace process_payment --map maps/backend.txt
+
+
+HOW TO READ THE OUTPUT
+----------------------
+
+    trace: register
+    app/auth/routes.py  [defines register(ln:45)]
+      ← import:register  app/__init__.py
+          ← import:init  main.py
+      ← call:register  tests/test_auth.py
+
+    - Line 1: the identifier being traced
+    - Line 2: the file that DEFINES it, with the line number
+    - Indented lines: files that reference the file above them,
+                      with the relationship type and identifier name used
+    - Each level of indentation = one hop in the call graph
+
+Relationship types:
+    import  — referenced in an import/require/include/use statement
+    call    — referenced as a function call: name(...)
+    ref     — referenced as an argument or list element: [name], f(name)
+    expr    — referenced in some other expression
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WORKFLOW EXAMPLE — exploring an unfamiliar codebase
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1. Build the map from the project root:
+    python map_index.py .
+
+Step 2. Find files related to authentication:
+    python map_query.py find auth
+
+Step 3. Look for where "register" is defined or linked:
+    python map_query.py find \register
+
+Step 4. Trace the full call chain for "register":
+    python map_query.py trace register
+
+Step 5. Narrow down — who calls it, excluding tests:
+    python map_query.py find \register !test
+
+Step 6. Re-index after code changes (depth 3 for variables too):
+    python map_index.py . 3
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USING AS A LIBRARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All functions are importable:
+
+    from map_query import parse_map, find_map, trace_map
+
+    # parse the map file into dicts
+    defines_map, links_map = parse_map('.1bcoder/map.txt')
+
+    # filter blocks — returns (hits_list, rendered_string)
+    hits, text = find_map('.1bcoder/map.txt', r'\register !mock')
+
+    # trace backwards — returns rendered string or None if not found
+    result = trace_map('.1bcoder/map.txt', 'register')
+    if result:
+        print(result)
+
+parse_map returns:
+    defines_map  — { rel_file: { name: lineno } }
+    links_map    — { caller_file: { target_file: { name: kind } } }

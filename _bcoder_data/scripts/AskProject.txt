@@ -1,0 +1,5 @@
+# Ask a question about the project (use after ExploreProjectStructure.txt)
+# Usage: /plan apply AskProject.txt task={{task}}
+# e.g.   /plan apply AskProject.txt task="how is authentication implemented"
+[v] /map keyword extract {{task}} -f -c
+[v] {{task}}

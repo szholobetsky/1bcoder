@@ -1,0 +1,4 @@
+[v] /read example/calc.py
+[v] /run python example/calc.py
+[v] "what is wrong with the programme? explain the error, locate the bug position, describe the root cause, describe the fixes. No other text!"
+[v] "You are a code repair tool. Respond with list of fix in this exact format:\n "LINE <number>: <corrected line content>\n". One fix per line only. No explanation. No other text. Preserve indentation."

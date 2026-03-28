@@ -1,0 +1,5 @@
+# Wikipedia page summary — one step
+# Usage: /plan apply WikiPage.txt keyword={{keyword}}
+# keyword = article title, spaces as underscores (e.g. keyword=Cockchafer or keyword=Pandas_library)
+/run curl -s "https://en.wikipedia.org/api/rest_v1/page/summary/{{keyword}}"
+summarize the key facts from this article in plain text

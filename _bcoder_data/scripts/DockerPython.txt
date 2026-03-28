@@ -1,0 +1,7 @@
+# Docker Compose for Python backend app (FastAPI/Flask with uvicorn)
+# Usage: /plan apply DockerPython.txt app={{app}} port={{port}}
+# app = module:instance e.g. app=main:app  port=8000
+write a docker-compose.yml for a Python app with: build from current directory, uvicorn {{app}}, port {{port}}, volume .:/app, restart=always. output only the yaml, no explanation
+/edit docker-compose.yml code
+write a minimal Dockerfile for Python 3.11: WORKDIR /app, COPY requirements.txt, RUN pip install, COPY ., CMD uvicorn {{app}} --host 0.0.0.0 --port {{port}}. output only the Dockerfile, no explanation
+/edit Dockerfile code

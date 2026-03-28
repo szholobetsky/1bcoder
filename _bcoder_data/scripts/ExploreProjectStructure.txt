@@ -1,0 +1,8 @@
+# Explore project structure and research a task
+# Usage: /plan apply ExploreProjectStructure.txt task={{task}}
+# e.g.   /plan apply ExploreProjectStructure.txt task="what does this project do"
+[v] /tree
+[v] /map index
+[v] /map keyword index
+[v] /map keyword extract {{task}} -f -c
+[v] {{task}}

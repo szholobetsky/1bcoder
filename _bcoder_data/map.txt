@@ -1,0 +1,27 @@
+# project map — C:\Project\codeXplorer\capestone\simrgl\1bcoder  depth:2
+
+chat.py
+  defines : _BOLD(ln:22), _DIM(ln:23), _RED(ln:24), _GREEN(ln:25), _YELL(ln:26), _CYAN(ln:27), _GRAY(ln:28), _err(ln:32), _info(ln:33), _warn(ln:34), _cdiff(ln:37), BANNER(ln:54), WORKDIR(ln:63), BCODER_DIR(ln:64), PLANS_DIR(ln:65), GLOBAL_PLANS_DIR(ln:66), NUM_CTX(ln:67), TIMEOUT(ln:68), AGENT_CONFIG_FILE(ln:72), DEFAULT_AGENT_TOOLS(ln:74), DEFAULT_AGENT_TOOLS_ADVANCED(ln:78), AGENT_SYSTEM_BASIC(ln:85), Rules(ln:111), AGENT_SYSTEM_ADVANCED(ln:118), FIX_SYSTEM(ln:151), PATCH_SYSTEM(ln:158), HELP_TEXT(ln:174), parameters(ln:387), get_help_list(ln:533), parse_host(ln:582), list_models(ln:595), _OPENAI_CTX(ln:608), _fmt_size(ln:620), _fmt_ctx(ln:627), read_file(ln:634), edit_line(ln:651), _parse_openai_stream(ln:661), ai_fix(ln:682), _parse_patch(ln:724), _strip_line_numbers(ln:735), _find_in_lines(ln:744), _extract_code_block(ln:773), _extract_all_code_blocks(ln:779), _copy_to_clipboard(ln:784), _next_suffix_path(ln:800), _load_profile(ln:814), _list_profiles(ln:837), _save_profile(ln:862), _load_plan(ln:889), _save_plan(ln:896), _apply_params(ln:903), _find_template_keys(ln:910), _parse_plan_apply_args(ln:918), _list_plan_files(ln:939), _scan(ln:941), MCPClient(ln:962), __init__(ln:965), _drain_stderr(ln:989), _last_err(ln:993), _send(ln:996), _recv(ln:1001), _rpc(ln:1010), list_tools(ln:1025), call_tool(ln:1028), close(ln:1034), _split_identifier(ln:1043), _path_to_seg_name(ln:1077), _adjust_map_paths(ln:1087), _map_patch_remove(ln:1113), _KNOWN_CMDS(ln:1148), _CMD_SPEC(ln:1158), _fuzzy_fix(ln:1179), _fix_path(ln:1193), fix_command(ln:1212), CoderCLI(ln:1305), _load_model_meta(ln:1310), _short_model(ln:1381), _print_status(ln:1399), _log(ln:1440), _sep(ln:1443), _confirm(ln:1449), _prompt_input(ln:1457), _stream_chat(ln:1464), _print(ln:1467), _route(ln:1546), _cmd_init(ln:1635), max_turns(ln:1649), auto_apply(ln:1650), tools(ln:1652), advanced_tools(ln:1658), _cmd_format(ln:1698), _cmd_param(ln:1724), _cmd_ctx(ln:1766), _cmd_model(ln:1853), _cmd_host(ln:1897), _cmd_tree(ln:1926), _walk(ln:1968), _cmd_find(ln:2038), _cmd_read(ln:2166), _cmd_edit(ln:2192), _cmd_insert(ln:2294), _cmd_fix(ln:2365), on_chunk(ln:2393), _cmd_bkup(ln:2425), _cmd_patch(ln:2458), _cmd_save(ln:2556), _cmd_diff(ln:2614), _cmd_run(ln:2647), _cmd_plan(ln:2665), _need_plan(ln:2670), _cmd_mcp(ln:2860), _cmd_parallel(ln:2937), get_prompt(ln:3023), call_one(ln:3028), _cmd_help(ln:3069), _cmd_map(ln:3098), _map_index(ln:3155), _map_keyword_index(ln:3206), _map_keyword_extract(ln:3231), _map_find(ln:3312), _depth_filter(ln:3339), _map_trace(ln:3371), _map_diff(ln:3480), _map_delta_asymmetry(ln:3543), _load_agent_config(ln:3560), _agent_confirm(ln:3607), _agent_exec(ln:3663), _Tee(ln:3671), write(ln:3675), flush(ln:3678), _cmd_agent(ln:3702), main(ln:3950)
+  links  → map_index.py (expr:Examples, import:always, call:build_map, ref,expr:lineno)
+  links  → map_query.py (call:Modes, call:find_map, call:find_path, call:idiff_report, call:parse_map, call:trace_deps, call:trace_map)
+  links  → pyproject.toml (import,expr:1bcoder, expr:dependencies, import,call,ref,expr:name, expr:requires, expr:version)
+
+install.bat
+
+map_index.py
+  defines : parameters(ln:8), Usage(ln:10), Examples(ln:19), tqdm(ln:34), MAX_FILE_KB(ln:39), SCAN_EXTENSIONS(ln:41), SKIP_DIRS(ln:57), DEFINE_PATTERNS(ln:65), VAR_PATTERNS(ln:76), STOP_WORDS(ln:80), _ASSIGN_RE(ln:94), _WORD_RE(ln:95), _IMPORT_KW(ln:99), classify_ref(ln:104), collect_files(ln:127), extract_definitions(ln:145), lineno(ln:147), build_map(ln:187), always(ln:206), classification(ln:217), main(ln:254)
+  links  → chat.py (call:main, call,expr:parameters, call:write)
+  links  → pyproject.toml (expr:1bcoder, import,ref,expr:name)
+
+map_query.py
+  defines : Modes(ln:5), Usage(ln:12), Examples(ln:28), DEFAULT_MAP(ln:43), parse_map(ln:48), compute_asymmetry(ln:91), compute_cohesion(ln:114), find_map(ln:147), process_block(ln:185), trace_deps(ln:219), trace_map(ln:295), _resolve_id(ln:344), _bfs_path(ln:359), _bfs(ln:374), rev_adj(ln:387), fwd_adj(ln:390), _reconstruct_path(ln:399), _render_path(ln:415), find_path(ln:427), detect_ghosts(ln:460), idiff_report(ln:491), main(ln:543)
+  links  → chat.py (call:main)
+  links  → map_index.py (expr:Examples, expr:Usage, ref,expr:lineno)
+  links  → pyproject.toml (expr:1bcoder, import,ref,expr:name)
+
+pyproject.toml
+  defines : requires(ln:2), build-backend(ln:3), 1bcoder(ln:6), name(ln:6), version(ln:7), requires-python(ln:8), dependencies(ln:9), py-modules(ln:19)
+  links  → chat.py (expr:main)
+  links  → map_index.py (expr:tqdm)
+
+run.bat

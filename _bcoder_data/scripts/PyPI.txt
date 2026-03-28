@@ -1,0 +1,5 @@
+# PyPI package info — one step
+# Usage: /plan apply PyPI.txt package={{package}}
+# e.g. package=pandas  package=scikit-learn  package=requests
+/run curl -s "https://pypi.org/pypi/{{package}}/json"
+extract and show: name, latest version, summary, homepage, requires_python, top 5 dependencies (requires_dist)

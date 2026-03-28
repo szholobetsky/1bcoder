@@ -1,0 +1,8 @@
+# Docker Compose for Python app + MySQL (full stack)
+# Usage: /plan apply DockerStack.txt db={{db}} user={{user}} password={{password}} app={{app}} port={{port}}
+# e.g.  db=myapp user=user password=user app=main:app port=8000
+write a docker-compose.yml with two services: 1) MySQL with database={{db}} user={{user}} password={{password}} volume ./data:/var/lib/mysql 2) Python app built from current dir, uvicorn {{app}}, port {{port}}, depends_on mysql, restart=always. output only the yaml, no explanation
+/edit docker-compose.yml code
+write a minimal Dockerfile for Python 3.11: WORKDIR /app, COPY requirements.txt, RUN pip install, COPY ., CMD uvicorn {{app}} --host 0.0.0.0 --port {{port}}. output only the Dockerfile, no explanation
+/edit Dockerfile code
+/run mkdir -p data

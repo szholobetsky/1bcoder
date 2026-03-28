@@ -1,0 +1,4 @@
+# Freeze current venv dependencies to requirements.txt (no LLM needed)
+# Usage: /plan apply PipFreeze.txt
+/run pip freeze > requirements.txt
+/run echo "requirements.txt updated"

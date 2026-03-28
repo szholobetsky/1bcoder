@@ -1,0 +1,6 @@
+# Generate .env.example from existing .env or source files
+# Usage: /plan apply EnvTemplate.txt file={{file}}
+# file = your main app file that reads env vars, e.g. file=main.py
+/read {{file}}
+find all os.environ, os.getenv and dotenv variable names in this code. write a .env.example with those keys set to empty or obvious placeholder values. output only the file content, no explanation
+/edit .env.example code

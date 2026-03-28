@@ -1,0 +1,8 @@
+# Run script, read error, fix it
+# Usage: /plan apply RunAndFix.txt file={{file}} run={{run}}
+# run = command to execute, e.g. run=python main.py
+/run {{run}}
+what is the error and which line causes it? give only the line number
+/read {{file}}
+/fix {{file}}
+/run {{run}}

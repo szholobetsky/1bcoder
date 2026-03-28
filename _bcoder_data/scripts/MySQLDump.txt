@@ -1,0 +1,5 @@
+# MySQL — dump database to file (no LLM needed)
+# Usage: /plan apply MySQLDump.txt host={{host}} user={{user}} password={{password}} db={{db}}
+# e.g.  host=localhost user=root password=root db=myapp
+/run mysqldump -h {{host}} -u {{user}} -p{{password}} {{db}} > {{db}}_dump.sql
+/run echo "dump saved to {{db}}_dump.sql"

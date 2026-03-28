@@ -1,0 +1,16 @@
+# profiles.txt — worker profiles for /parallel
+# Format: name: host|model|output_file  host|model|output_file ...
+# Each worker is separated by a space. Fields separated by |
+# Lines starting with # are comments.
+
+# single small model on localhost
+solo: localhost:11434|qwen2.5-coder:1.5b-base|ans/solo.txt
+
+# two workers on the same machine, different models
+duo: localhost:11434|gemma3:1b|ans/w1.txt localhost:11434|llama3.2:1b|ans/w2.txt
+
+# two workers on the same machine, same models
+lm-ol: localhost:11434|qwen3:1.7b|ans/w1.txt openai://localhost:1234|qwen/qwen3-1.7b|ans/w2.txt
+
+# mining rig — 3 workers on separate GPUs (different ports)
+rig3: 192.168.0.229:11434|rnj-1:8b|ans/rig1.txt localhost:11434|lfm2.5-thinking:1.2b|ans/rig2.txt openai://localhost:1234|qwen/qwen3-1.7b|ans/rig3.txt

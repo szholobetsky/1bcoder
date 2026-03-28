@@ -1,0 +1,2 @@
+[v] /read example/calc.py
+[v] /parallel "what is wrong in the programme" 192.168.0.229:11434|gemma3:4b|ans/ans1.txt localhost:11434|gemma3:1b|ans/ans2.txt

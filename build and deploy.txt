@@ -1,0 +1,12 @@
+запускати послідовно
+спочатку build.bat
+потім pypi_deploy.bat
+
+
+  1. Tag the release in git:
+  git tag v0.1.0
+  git push origin v0.1.0
+  2. Check that ~/.1bcoder/ was bootstrapped on the second PC — the agents, procs, and scripts should be there after first launch.
+  3. Next version — when you make changes, bump version in pyproject.toml, rebuild and upload:
+  python -m build
+  twine upload dist/*

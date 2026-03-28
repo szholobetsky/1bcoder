@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "1bcoder"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+    "pyreadline3>=3.4; sys_platform == 'win32'",
+    "tqdm>=4.64",
+    "rich>=13.0",
+]
+
+[project.scripts]
+1bcoder = "chat:main"
+
+[tool.setuptools]
+py-modules = ["chat", "map_index", "map_query"]
+
+[tool.setuptools.packages.find]
+include = ["_bcoder_data*"]
+
+[tool.setuptools.package-data]
+"_bcoder_data" = ["**/*"]

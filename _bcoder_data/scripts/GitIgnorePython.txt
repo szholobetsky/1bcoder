@@ -1,0 +1,4 @@
+# Generate .gitignore for a Python project
+# Usage: /plan apply GitIgnorePython.txt
+write a .gitignore for a Python project. include: __pycache__, *.pyc, .env, venv/, .venv/, dist/, build/, *.egg-info/, .pytest_cache/, .mypy_cache/, *.sqlite, *.db. output only the file content, no explanation
+/edit .gitignore code
