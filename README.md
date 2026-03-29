@@ -4,14 +4,6 @@ AI-assisted code editor designed for small (1B parameter) language models runnin
 
 ---
 
-**(c) 2026 Stanislav Zholobetskyi**
-Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv
-
-*Створено в рамках аспірантського дослідження на тему:
-«Інтелектуальна технологія підтримки розробки та супроводу програмних продуктів»*
-
----
-
 **Core idea:** 1B models hallucinate badly when asked to rewrite large blocks of code. 1bcoder works around this by keeping changes small and structured — the model outputs a single-line fix (`LINE N: content`) or a minimal SEARCH/REPLACE block, which the tool then applies with a diff preview before writing to disk.
 
 Planning and navigation are externalized: plans live in `.txt` files, project structure is indexed into a searchable map — so the model never has to hold the whole codebase in its head.
@@ -1175,3 +1167,9 @@ For human input, the corrected command is shown with `[fix?]` and you are asked 
 | text-generation-webui | Linux / Win | `--api` flag | 5000 | `openai://` | oobabooga UI, needs `--api` flag to expose OpenAI endpoint |
 | TabbyAPI | Linux / Win | built-in | 5000 | `openai://` | Focused on exl2/GPTQ quantized models, low VRAM |
 | vLLM | Linux | built-in | 8000 | `openai://` | Production server, high throughput, requires significant VRAM |
+
+---
+
+**(c) 2026 Stanislav Zholobetskyi**
+Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv
+*PhD research: «Intelligent Technology for Software Development and Maintenance Support»*
