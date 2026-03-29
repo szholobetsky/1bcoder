@@ -24,3 +24,6 @@ log_debug.txt
 # OS
 .DS_Store
 Thumbs.db
+
+#AI
+.claude/

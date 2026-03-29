@@ -105,7 +105,7 @@ On first launch, default agents, procs, and scripts are copied to `~/.1bcoder/` 
 ### Option 2 — Clone and install locally
 
 ```bash
-git clone https://github.com/your-username/1bcoder.git
+git clone https://github.com/szholobetsky/1bcoder.git
 cd 1bcoder
 pip install -e .
 ```
@@ -113,7 +113,7 @@ pip install -e .
 ### Option 3 — Install directly from GitHub
 
 ```bash
-pip install git+https://github.com/your-username/1bcoder.git
+pip install git+https://github.com/szholobetsky/1bcoder.git
 ```
 
 Then run anywhere:

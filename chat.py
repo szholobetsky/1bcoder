@@ -4877,6 +4877,7 @@ advanced_tools =
 {_DIM}Offline-first tool for 1B–7B local language models{_R}
 
 {_CYAN}(c) 2026 Stanislav Zholobetskyi{_R}
+{_DIM}https://github.com/szholobetsky/1bcoder{_R}
 
 {_DIM}PhD research: «Intelligent Technology for Software Development and Maintenance Support»{_R}
 {_DIM}Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv{_R}
