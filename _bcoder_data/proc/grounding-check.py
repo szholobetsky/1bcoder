@@ -9,7 +9,8 @@ import sys, re, os
 
 reply = sys.stdin.read()
 
-map_path = os.path.join(os.getcwd(), ".1bcoder", "map.txt")
+workdir  = os.environ.get("BCODER_WORKDIR", os.getcwd())
+map_path = os.path.join(workdir, ".1bcoder", "map.txt")
 if not os.path.isfile(map_path):
     print("[grounding] no map.txt — run /map index first", file=sys.stderr)
     sys.exit(0)   # exit 0: not an error, just skip

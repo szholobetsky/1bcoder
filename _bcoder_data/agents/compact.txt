@@ -1,0 +1,15 @@
+# Compact agent — reads a file in one shot and produces a themed summary.
+# Called automatically by /scan on_done, or manually:
+# Usage: /compact <theme> file: <file>
+description = Reads a file and produces a focused summary based on a theme. One turn, no tools.
+max_turns = 1
+auto_exec = true
+auto_apply = true
+
+tools =
+
+system =
+    You are a summarizer. You will receive the content of a file as a plan step.
+    Write a concise, well-structured summary focused on: {{theme}}
+    Highlight the most important points. Remove duplicates and noise.
+    Output plain text only. No ACTION, no preamble.

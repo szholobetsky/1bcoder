@@ -1,0 +1,6 @@
+# edit-control — run after /patch (or /edit) to review what changed
+# Shows diff against backup and incremental map diff.
+# Usage: /hook after patch edit-control.txt
+#        /hook after edit  edit-control.txt
+/diff {{file}}.bkup {{file}}
+/map idiff

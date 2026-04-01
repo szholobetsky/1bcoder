@@ -1,0 +1,31 @@
+# Chunked file scanner — file content is pre-loaded into each plan step.
+# Usage: /agent scan <theme> plan: <file> -n [N]
+#        /scan <theme> plan: <file> -n [N]       (via alias)
+description = Reads a file chunk by chunk and extracts info relevant to a theme.
+max_turns = 40
+auto_exec = true
+auto_apply = true
+
+vars =
+    theme = {{task}}
+    scan_file = .1bcoder/scan_result.txt
+
+params =
+    num_predict = 150
+    agent_ctx = 4000
+
+procs =
+    scan-save {{scan_file}}
+    tempctx-cut
+
+on_done = /compact {{theme}} file: {{scan_file}}
+
+system =
+    You are a document scanner. A large file is fed to you one chunk at a time.
+    Each plan step contains actual file content after the [chunk ...] header.
+
+    For each chunk:
+    Write ONLY what is relevant to the theme below. Keep the extract under 80 words.
+    If nothing is relevant — write exactly: nothing
+
+    Theme: {{theme}}

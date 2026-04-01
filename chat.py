@@ -33,6 +33,7 @@ _GREEN = "\033[32m"
 _YELL  = "\033[33m"
 _CYAN  = "\033[36m"
 _GRAY  = "\033[90m"
+_LBLUE = "\033[94m"
 
 
 def _ok(msg: str):   print(f"{_GREEN}{msg}{_R}")
@@ -97,9 +98,11 @@ HOME_BCODER_DIR   = os.path.join(os.path.expanduser("~"), ".1bcoder")  # user ho
 INSTALL_BCODER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bcoder_data")  # wheel defaults
 
 SCRIPTS_DIR        = os.path.join(BCODER_DIR, "scripts")
+CTX_DIR            = os.path.join(BCODER_DIR, "ctx")
 GLOBAL_SCRIPTS_DIR = os.path.join(HOME_BCODER_DIR, "scripts")
 PROMPTS_FILE       = os.path.join(HOME_BCODER_DIR, "prompts.txt")
 PROC_DIR           = os.path.join(HOME_BCODER_DIR, "proc")
+LOCAL_PROC_DIR     = os.path.join(BCODER_DIR, "proc")
 TEAMS_DIR          = os.path.join(HOME_BCODER_DIR, "teams")
 LOCAL_TEAMS_DIR    = os.path.join(BCODER_DIR, "teams")
 NUM_CTX    = 8192        # default Ollama context window (tokens)
@@ -110,6 +113,7 @@ TIMEOUT    = 120         # default HTTP read timeout in seconds
 AGENT_CONFIG_FILE   = os.path.join(BCODER_DIR, "agent.txt")
 ALIASES_FILE        = os.path.join(BCODER_DIR, "aliases.txt")
 CONFIG_FILE         = os.path.join(BCODER_DIR, "config.yml")
+GLOBAL_CONFIG_FILE  = os.path.join(HOME_BCODER_DIR, "config.yml")
 GLOBAL_ALIASES_FILE  = os.path.join(HOME_BCODER_DIR, "aliases.txt")
 AGENTS_DIR           = os.path.join(BCODER_DIR, "agents")
 GLOBAL_AGENTS_DIR    = os.path.join(HOME_BCODER_DIR, "agents")
@@ -140,7 +144,7 @@ You are a coding assistant. Complete the task using the available tools.
 
 To call a tool, write ACTION: on its own line. Wait for [tool result].
 Run actions in a loop until the task is complete.
-When all actions are done, write a plain text summary with no ACTION.
+When all actions are done, write a short summary with no ACTION and end with: Task is complete.
 
 Available actions:
   ACTION: /read <file>            ← read whole file
@@ -150,9 +154,11 @@ To modify a file:
 1. Write the code block (```...```)
 2. Then call:
    ACTION: /insert <file> <line> code        ← insert code block before line N
-  ACTION: /insert <file> <line> <text>     ← insert literal text before line N
-   ACTION: /patch <file> code          ← apply SEARCH/REPLACE block
-   ACTION: /save <file> code           ← save or overwrite whole file
+   ACTION: /insert <file> <line> <text>      ← insert literal text before line N
+   ACTION: /patch <file> code                ← apply SEARCH/REPLACE block
+   ACTION: /save <file> code                 ← save or overwrite whole file
+
+The keyword "code" in the action means: use the last code block (``` ```) written above as the content.
 
 SEARCH/REPLACE format for /patch:
 <<<<<<< SEARCH
@@ -172,9 +178,9 @@ AGENT_SYSTEM_ADVANCED = """\
 You are an autonomous coding assistant. Complete the task using the available tools.
 
 To call a tool, write ACTION: followed by the command. Stop and wait for [tool result].
-When the task is complete, write a plain text summary with no ACTION.
+When the task is complete, write a short summary and end with: Task is complete.
 
-How to write files:
+How to write files (the keyword "code" means: use the last ``` ``` block written above):
 - To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch <file> code
 - To INSERT new code at a line: write the code block, then ACTION: /insert <file> <line> code
 - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
@@ -284,17 +290,14 @@ Commands
 /edit <file> <line>
     Manually replace a line. Type new content when prompted.
     e.g.  /edit main.py 15
-
 /edit <file> code
     Apply last AI reply (first code block) to the whole file.
     Creates the file if it does not exist. Shows unified diff before applying.
     e.g.  /edit main.py code
-
 /edit <file> <line> code
     Apply last AI reply code block starting at <line>.
     Replaces as many lines as the new code has. Creates file if missing. Shows diff.
     e.g.  /edit main.py 312 code
-
 /edit <file> <start>-<end> code
     Apply last AI reply code block replacing exactly lines start–end.
     Most precise form — use when you know the exact line range.
@@ -303,11 +306,9 @@ Commands
 /insert <file> <line>
     Insert last AI reply before line N (full text, no code extraction).
     e.g.  /insert notes.txt 5
-
 /insert <file> <line> code
     Insert extracted code block from last AI reply before line N.
     e.g.  /insert main.py 14 code
-
 /insert <file> <line> <inline text>
     Insert literal text directly (anything that is not the keyword "code").
     e.g.  /insert main.py 14 SET_SLEEP_DELAY = 10
@@ -386,14 +387,45 @@ Commands
 /proc run <name> [-f <file>]  Run processor against last LLM reply (or file with -f).
 /proc on <name>         Persistent mode: run processor after every LLM reply automatically.
 /proc off               Stop persistent processor.
+/proc before on <name>  Before-proc: run processor BEFORE every LLM call to enrich agent context.
+                        Plain text output is injected as [context]. ACTION: lines are executed
+                        and the resulting LLM reply is injected as [context] (not added to main ctx).
+/proc before off        Stop before processor.
+/proc gate on <name> [args ...]  Gate: run processor AFTER reply; FAIL retries current plan step.
+/proc gate off          Stop gate processor.
 /proc new <name>        Create a new processor from template.
     Processor protocol: stdin = last LLM reply. stdout = result (injected to context).
     Output lines "key=value" are extracted as params.
     Output line "ACTION: /command" is confirmed with user then executed (run mode only).
+    Output line "ALERT: message"   prints a warning but continues.
+    Output line "BLOCK: reason"    cancels the triggering command (hooks only).
+    Output line "FAIL: reason"     gate mode: retries plan step; proc mode: prints warning.
+    Output line "CAPTURE: text"   sets $ to text; use with ACTION: /parallel $ to avoid quoting issues.
     Exit code non-zero = show stderr as warning, skip ACTION.
+    Env vars available in all proc subprocesses:
+      BCODER_WORKDIR      current working directory
+      BCODER_TASK         current agent task string (set when inside /agent or /ask)
+      BCODER_CTX_USED     estimated tokens used in main context
+      BCODER_CTX_MAX      configured context limit
+      BCODER_CTX_PCT      usage percentage
     e.g.  /proc run extract-files
           /proc on grounding-check
           /proc off
+          /proc before on assist /short
+          /proc gate on action-required
+          /proc gate on pattern-gate "@Query" "use CriteriaBuilder only"
+    Guard processors (run via /proc on or /hook before <cmd>):
+          /proc on ctx_cut            auto /ctx cut when context exceeds 90%
+          /proc on ctx_cut 80         custom threshold
+          /proc on rude_words         alert if LLM reply contains profanity
+          /proc on rude_words ua      + Ukrainian word list
+          /proc on secret_check       alert if reply contains sensitive names (google, anthropic...)
+          /proc on secret_check client=acme,invoice   add custom keywords
+          /hook before run   sql_readonly_guard.py      block /run if SQL contains DELETE/DROP/TRUNCATE/UPDATE
+          /hook before patch auto-bkup.txt              backup file to <file>.bkup before every /patch
+          /hook before edit  auto-bkup.txt              backup file to <file>.bkup before every /edit
+          /hook after  patch edit-control.txt           /diff + /map idiff after every /patch
+          /hook after  edit  edit-control.txt           /diff + /map idiff after every /edit
     regexp-extract <pattern> [-i] [-u] [-g N]  extract regex matches from last reply
           # find all 3-digit numbers
           /proc run regexp-extract \b[0-9]{3}\b
@@ -432,6 +464,17 @@ Commands
           /var set project_name =MyService
           /var get
           /var extract
+Output capture operators (work with any command — LLM reply, tool, proc):
+  <command> -> <varname>   Capture all output of <command> into session variable <varname>.
+  $                        Expand to the last captured output (last AI reply or tool output).
+  ~                        Expand to the last user input (last message or command typed).
+    e.g.  /map keyword extract auth.py -> keywords
+          /ask find files related to {{keywords}}
+          summarize this for me -> myplan
+          /agent planning $
+          /ask ~
+          /small ~
+          поясни: $
 
 /role <persona>             Set a system role prepended to every chat request (survives /ctx clear).
 /role show                  Show the current role.
@@ -439,14 +482,6 @@ Commands
     Default role: "You are a software developer assistant."
     Note: words like "senior", "expert", "professor" push the model to rely on its own knowledge
     and skip cautious steps (read-before-edit, describe-before-change). Use them intentionally.
-
-Output capture operators (work with any command — LLM reply, tool, proc):
-  <command> -> <varname>   Capture all output of <command> into session variable <varname>.
-  $                        Expand to the last captured output anywhere in a command or message.
-    e.g.  /map keyword extract auth.py -> keywords
-          /ask find files related to {{keywords}}
-          summarize this for me -> myplan
-          /agent planning $
 
 /team list                        List all team definitions (.yaml files in teams dir).
 /team show <name>                 Show workers defined in a team.
@@ -471,16 +506,19 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /team show auth-analysis
           /team new my-team
 
-/config save [file]       Save current state (host, model, ctx, params, vars, procs) to .1bcoder/config.yml.
-/config save host         Save only the current host to config.
-/config save model        Save only the current model to config.
-/config save ctx          Save only the current ctx to config.
-/config save params       Save only the current params to config.
-/config save vars         Save only the current vars to config.
-/config save procs        Save only the current procs to config.
-/config load [file]       Restore state from config file.
-/config show [file]       Print config file contents.
-/config auto on|off       Enable/disable auto-load at startup.
+/config save [file]            Save current state (host, model, ctx, params, vars, procs) to .1bcoder/config.yml.
+/config save global            Save current state to ~/.1bcoder/config.yml (global).
+/config save host              Save only the current host to local config.
+/config save global host       Save only the current host to global config.
+/config save model             Save only the current model to local config.
+/config save global model      Save only the current model to global config.
+/config save ctx               Save only the current ctx to config.
+/config save params            Save only the current params to config.
+/config save vars              Save only the current vars to config.
+/config save procs             Save only the current procs to config.
+/config load [file|global]     Restore state from local config, file, or global config.
+/config show [file|global]     Print local config, file, or global config contents.
+/config auto on|off [global]   Enable/disable auto-load at startup (local or global config).
 /config del model|host|ctx              Remove top-level key from config.
 /config del var <name>    Remove specific variable from config.
 /config del vars          Remove entire vars section from config.
@@ -489,7 +527,10 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /config del proc <name>   Remove specific proc from config.
 /config del procs         Remove entire procs section from config.
     e.g.  /config save
+          /config save global
+          /config save global host
           /config auto on
+          /config auto on global
           /config del var project
           /config del procs
 
@@ -498,11 +539,15 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /ctx clear <n>           Remove last N messages from context.
 /ctx cut                 Remove oldest messages until context fits within the limit.
 /ctx compact             Ask AI to summarize the conversation, then replace context with the summary.
+/ctx compact savepoint   Summarize only messages since the savepoint, replace them with summary.
+/ctx compact profile: <name>            Use external model (from profile) for summarization.
+/ctx compact savepoint profile: <name>  External model + savepoint scope.
 /ctx save <file>         Save full conversation context to a text file.
 /ctx load <file>         Restore context from a saved file (appends to current context).
+                         If <file> has no path, looks in .1bcoder/ctx/ automatically.
+/ctx list                List files in .1bcoder/ctx/ (project context library).
 /ctx savepoint set       Mark current context position as a savepoint.
 /ctx savepoint rollback  Remove all messages added since the savepoint.
-/ctx savepoint compact   Summarize messages since savepoint, replace them with the summary.
 /ctx savepoint show      Show savepoint position and how many messages have been added since.
     e.g.  /ctx 16384
           /ctx clear
@@ -511,6 +556,18 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /ctx load ctx.txt
           /ctx savepoint set
           /ctx savepoint rollback
+
+/tempctx <N>               Set agent context limit to N tokens (overrides num_ctx for this agent run).
+/tempctx show              Show agent context size (messages + token estimate).
+/tempctx cut               Remove oldest messages from agent context until it fits within the limit.
+/tempctx clear             Reset agent context to system prompt + task only.
+    Only available inside an agent loop. Use these instead of /ctx when writing agent actions.
+    Agents should list "tempctx" in their tools — this hides /ctx from the model entirely.
+    /tempctx N can also be set via params = agent_ctx = N in the agent file.
+    e.g.  /tempctx 4000
+          ACTION: /tempctx show
+          ACTION: /tempctx cut
+          ACTION: /tempctx clear
 
 /think include      Keep <think>...</think> blocks in context (pass reasoning to next model).
 /think exclude      Strip <think> from context (default).
@@ -565,22 +622,38 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /mcp call read_file        (if only one server connected)
 /mcp disconnect <name>
     Shut down a connected MCP server.
-    See MCP.md for ready-to-use servers (filesystem, web, git, db, browser...).
+    See /doc MCP for ready-to-use servers (filesystem, web, git, db, browser...).
 
-/parallel ["prompt1"] ["prompt2"] [profile <name>] [host|model|file ...]
-    Send prompts to multiple models in parallel. Each response saved to its file.
-    Current context (/read files etc.) is included automatically.
-    Prompts must be quoted. Workers can be a saved profile or inline host|model|file specs.
-    Prompt assignment:
-      1 prompt  → same prompt sent to all workers
-      N prompts = N workers → each prompt matched to its worker
-      M prompts < N workers → matched 1:1, last prompt reused for remaining workers
+/parallel [main question]  [list: a1, a2, a3]  profile: name
+          [ctx: full|last|none]  [file: path [-n N]]
+          [collect: compact [profile: name]]  [--seq]
+    Send prompts to multiple models. No quotes required.
+    $ expands to last output, ~ expands to last input.
+    Context sent to workers (default: ctx: last):
+      ctx: full    send full conversation context
+      ctx: last    send only the last message (default)
+      ctx: none    send no context (prompt only)
+    Prompt modes:
+      plain text only  → same prompt sent to all workers
+      list: a1, a2     → aspects distributed one per worker; combined with main question as:
+                          "{main question}\n\nAspect: {aspect_i}"
+                          Use list: to ask one question from multiple angles simultaneously.
+      comma list only  → matched 1:1 to workers (last reused for remaining)
+    file: path [-n N]  split file into N chunks (one per worker); -n auto = chunks = workers.
+      === separator in file is used if present; otherwise equal line splits.
+    collect: compact [profile: name]
+      after all workers finish, run /ctx compact savepoint [profile: name].
+      savepoint is set automatically before workers run.
+    --seq  run workers sequentially instead of in parallel.
     Profiles stored in .1bcoder/profiles.txt, one per line:
       small1: localhost:11434|gemma3:1b|ans/gem.txt localhost:11435|llama3:1b|ans/lam.txt
-    e.g.  /parallel "review for bugs" profile small1
-          /parallel "explain" "optimise" profile small1
-          /parallel "what does this do" localhost:11434|llama3.2:1b|ans/a.txt
-
+    e.g.  /parallel review for bugs  profile: small1
+          /parallel Hegel philosophy  list: axiology, epistemology, ethics  profile: small1
+          /parallel $  profile: short
+          /parallel {{q1}}, {{q2}}, {{q3}}  profile: three-machines
+          /parallel file: bigfile.txt -n auto  profile: cluster  collect: compact profile: small
+          /parallel what is this  list: pros, cons  profile: small1  collect: compact
+          /parallel what does this do  localhost:11434|llama3.2:1b|ans/a.txt
 /parallel profile create <name> [host|model|file ...]
     Inline: workers supplied as space-separated host|model|file specs.
     Interactive: omit workers — wizard prompts host/model/file one by one.
@@ -679,6 +752,23 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /map keyword extract "add isbn field to the Book class" -f -a
           /map keyword extract "fix rule search" -f -c
 
+/hook before|after <cmd> <script>
+    Run a script before or after a command (edit, patch, fix, insert).
+    Script runs from the scripts dir. {{file}} and {{range}} are injected automatically.
+    before hook: if script not found, the command is cancelled.
+    after hook:  runs unconditionally after the command completes.
+/hook list
+    Show all active hooks.
+/hook clear
+    Remove all hooks.
+/hook clear before|after [<cmd>]
+    Remove specific hook(s).
+    Hooks are saved in config.yml and loaded automatically when auto: true.
+    e.g.  /hook before edit   pre-edit.txt
+          /hook after patch   post-patch.txt
+          /hook list
+          /hook clear before edit
+
 /bkup save <file>
     Save a backup copy as <file>.bkup (overwrites existing).
     e.g.  /bkup save calc.py
@@ -702,14 +792,14 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /alias /ask = /agent ask
           /alias save /sql
 
-/agent <name> [-t N] [-y] <task> [plan: step1, step2, ...]
+/agent <name> [-t N] [-y] <task> [plan: step1, step2, ...] [file: steps.md]
     Run a named agent defined in .1bcoder/agents/<name>.txt (local overrides global).
-    Agent file defines: system prompt, tools, max_turns, auto_exec, aliases.
+    Agent file defines: system prompt, tools, max_turns, auto_exec, aliases, params, before, gates.
     e.g.  /agent ask what does this project do
           /agent advance refactor the auth module
           /agent dbsearcher find all users created this week
     Direct command syntax also works: /dbsearcher find all users created this week
-/agent [-t N] [-y] <task> [plan: step1, step2, ...]
+/agent [-t N] [-y] <task> [plan: step1, step2, ...] [file: steps.md]
     Run the default agent. The model uses tools to complete the task.
     The agent prompt instructs the model to emit one ACTION per turn.
     If the model emits multiple ACTION lines, all are executed in order.
@@ -724,35 +814,35 @@ Output capture operators (work with any command — LLM reply, tool, proc):
       f          send feedback to the AI and skip the action (redirect the model)
       q          stop the agent
     Ctrl+C interrupts at any turn.
-    plan: comma-separated list of hints injected one per turn.
-          OR a .md/.txt filename — list items are extracted as steps.
+    plan: comma-separated list of hints, one injected per turn.
+    file: path to a .md/.txt file — steps extracted from numbered/bulleted list or === sections.
           For .md: numbered/bulleted items → steps; === separator → one step per section.
                    ### Example/Summary → injected as context before step 1.
           For .txt: each non-comment, non-[v] line → one step.
           If a turn returns empty or no ACTION, the agent continues to the next step.
+          Gate FAIL on a plan step retries that step (re-injects hint, removes old one).
     e.g.  /agent find and fix the divide by zero bug in calc.py
           /agent -t 1 read models.py and explain the User class
           /agent -y -t 5 refactor utils.py
-          /agent read file plan: models.py, views.py, urls.py
-          /agent fix the book model plan: steps.md
-          /agent implement sharepoint plan: plan.md
+          /agent read files plan: models.py, views.py, urls.py
+          /agent fix the book model file: steps.md
+          /agent implement sharepoint file: plan.md
+
 /init           Create .1bcoder/ scaffold in current directory (safe to re-run).
 
 /help                   Show full help.
 /help <command>         Show help for one command (e.g. /help map, /help fix).
 /help <command> ctx     Same but also inject the text into AI context.
+
 /doc list               List documentation articles in doc/.
-/doc <name>             Show article (e.g. /doc PARAM, /doc MCP).
+/doc <name>             Show article rendered as Markdown.
+/doc <name> raw         Show article as plain text.
 /doc <name> ctx         Add article to AI context.
+
 /exit           Quit.
 
-ESC         - interrupt AI response mid-stream.
+Ctrl+C      - interrupt AI response mid-stream.
 Enter       - submit message.
-Shift+Enter - insert newline (requires terminal with Kitty keyboard support).
-Ctrl+N      - insert newline (reliable fallback for all terminals).
-
-To select and copy text from the log (Windows):
-  Hold Shift and drag with the left mouse button.
 """
 
 
@@ -1051,13 +1141,67 @@ def _next_suffix_path(path):
         n += 1
 
 
+def _get_package_version() -> str:
+    """Return installed package version string, or '0' if not installed via pip."""
+    try:
+        from importlib.metadata import version
+        return version("1bcoder")
+    except Exception:
+        return "0"
+
+
+def _merge_text_file(src: str, dst: str) -> list[str]:
+    """Append lines from src to dst that are not already present (by key prefix).
+    For aliases.txt: key = '/name'. For profiles.txt: key = 'name:'.
+    Returns list of added keys."""
+    with open(src, encoding="utf-8") as f:
+        src_lines = f.readlines()
+    with open(dst, encoding="utf-8") as f:
+        dst_content = f.read()
+
+    added = []
+    pending = []
+    for line in src_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            pending.append(line)
+            continue
+        # extract key: '/name' for aliases, 'name:' for profiles
+        key = stripped.split("=")[0].strip() if "=" in stripped else stripped.split(":")[0].strip()
+        if key and key not in dst_content:
+            pending.append(line)
+            added.append(key)
+        else:
+            pending = []  # reset comment buffer if key exists
+
+    if added:
+        with open(dst, "a", encoding="utf-8") as f:
+            if not dst_content.endswith("\n"):
+                f.write("\n")
+            f.write("# ── new in this version (uncomment to enable) ──\n")
+            for line in pending:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    f.write("# " + line if not line.startswith("#") else line)
+                else:
+                    f.write(line)
+    return added
+
+
 def _bootstrap_global_dir():
-    """Copy missing subdirs/files from the wheel's .1bcoder/ to ~/.1bcoder/ on first run.
-    Only copies items that don't exist yet, so user customisations are never overwritten."""
+    """Copy missing items from wheel's _bcoder_data/ to ~/.1bcoder/.
+    On upgrade: merges new entries in aliases.txt and profiles.txt without overwriting user data.
+    Tracks last bootstrapped version in ~/.1bcoder/.version to detect upgrades."""
     import shutil
     if not os.path.isdir(INSTALL_BCODER_DIR):
         return  # running from source without bundled defaults
+
     os.makedirs(HOME_BCODER_DIR, exist_ok=True)
+    current_ver = _get_package_version()
+    version_file = os.path.join(HOME_BCODER_DIR, ".version")
+    last_ver = open(version_file, encoding="utf-8").read().strip() if os.path.isfile(version_file) else ""
+
+    # ── first run: copy everything missing ───────────────────────────────────
     bootstrapped = []
     for item in os.listdir(INSTALL_BCODER_DIR):
         src = os.path.join(INSTALL_BCODER_DIR, item)
@@ -1070,6 +1214,25 @@ def _bootstrap_global_dir():
             bootstrapped.append(item)
     if bootstrapped:
         print(f"[1bcoder] initialized ~/.1bcoder/ — copied: {', '.join(sorted(bootstrapped))}")
+
+    # ── upgrade: merge new entries in text files ──────────────────────────────
+    if current_ver and current_ver != last_ver and last_ver:
+        merge_files = ["aliases.txt", "profiles.txt"]
+        merged = []
+        for fname in merge_files:
+            src = os.path.join(INSTALL_BCODER_DIR, fname)
+            dst = os.path.join(HOME_BCODER_DIR, fname)
+            if os.path.isfile(src) and os.path.isfile(dst):
+                added = _merge_text_file(src, dst)
+                if added:
+                    merged.extend(f"{fname}:{k}" for k in added)
+        if merged:
+            print(f"[1bcoder] updated ~/.1bcoder/ — new entries: {', '.join(merged)}")
+
+    # ── save current version ──────────────────────────────────────────────────
+    if current_ver and current_ver != last_ver:
+        with open(version_file, "w", encoding="utf-8") as f:
+            f.write(current_ver)
 
 
 def _load_profile(name):
@@ -1377,25 +1540,37 @@ def _load_agent_script_file(path: str):
 
 
 def _parse_plan_arg(raw: str):
-    """Resolve the argument after 'plan:' to (steps, context_text).
+    """Parse 'plan:' argument — comma-separated inline step list."""
+    return [s.strip() for s in raw.split(',') if s.strip()], ""
 
-    If raw is a single token ending in .md or .txt and the file exists,
-    load steps from file via _load_agent_script_file.
-    Otherwise treat raw as a comma-separated inline list (existing behaviour).
+
+def _parse_file_arg(raw: str):
+    """Parse 'file:' argument — load plan steps from a file (=== separator required).
+
+    Steps must be explicitly separated with === markers (alone on a line).
+    If none are found, the file is returned as a single step after a warning —
+    the user should review, add === markers between steps, and re-run.
     """
     token = raw.strip()
-    if re.match(r'^\S+\.(md|txt)$', token, re.IGNORECASE):
-        path = token if os.path.isabs(token) else os.path.join(WORKDIR, token)
-        if os.path.isfile(path):
-            steps, ctx = _load_agent_script_file(path)
-            if not steps:
-                print(f"[agent] warning: no steps found in {token}")
-            return steps, ctx
-        else:
-            print(f"[agent] script file not found: {token}")
-            return [], ""
-    # inline comma-separated list
-    return [s.strip() for s in token.split(',') if s.strip()], ""
+    path = token if os.path.isabs(token) else os.path.join(WORKDIR, token)
+    if not os.path.isfile(path):
+        print(f"[agent] file not found: {token}")
+        return [], ""
+    try:
+        content = open(path, encoding="utf-8").read()
+    except OSError as e:
+        print(f"[agent] could not read {token}: {e}")
+        return [], ""
+    if re.search(r'^===\s*$', content, re.MULTILINE):
+        steps, ctx = _load_agent_script_file(path)
+        if not steps:
+            print(f"[agent] warning: no steps found in {token}")
+        return steps, ctx
+    # no === markers — warn and return whole file as one step
+    print(f"[agent] warning: {token} has no === step separators.")
+    print(f"        Plan files should be reviewed, corrected, and separated with ===")
+    print(f"        before running. Proceeding with the whole file as a single step.")
+    return [content.strip()], ""
 
 
 # ── MCP client ─────────────────────────────────────────────────────────────────
@@ -1592,7 +1767,7 @@ _KNOWN_CMDS = [
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
-    "/compact", "/doc",
+    "/doc", "/tempctx",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -1611,6 +1786,7 @@ _CMD_SPEC = {
     "/diff":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/agent":    dict(file_idx=None, kw_idx=1, keywords=["advance", "ask", "fill", "planning"]),
     "/ctx":      dict(file_idx=None, kw_idx=1, keywords=["clear", "cut", "compact", "save", "load", "savepoint"]),
+    "/tempctx":      dict(file_idx=None, kw_idx=1, keywords=["clear", "cut", "compact"]),    
     "/think":    dict(file_idx=None, kw_idx=1, keywords=["include", "exclude", "show", "hide"]),
     "/script":     dict(file_idx=None, kw_idx=1, keywords=[
                       "list", "open", "create", "show", "add",
@@ -1659,12 +1835,13 @@ def _fix_path(path: str) -> str | None:
     return _fuzzy_fix(path, candidates, cutoff=0.65)
 
 
-def fix_command(cmd: str, auto: bool = False) -> str:
+def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None) -> str:
     """Check a 1bcoder command for common typos and fix them.
 
     Checks: command name, file path, subcommand/keyword.
     auto=True  — fix silently with a yellow warning (agent mode).
     auto=False — show the fix and ask Y/n (human mode).
+    extra_cmds — additional command names to consider (e.g. active aliases).
     Returns the (possibly corrected) command string.
     """
     if not cmd.startswith("/"):
@@ -1674,8 +1851,9 @@ def fix_command(cmd: str, auto: bool = False) -> str:
     fixes  = {}   # token_index → (original, corrected)
 
     # 1. command name
-    cmd_name = tokens[0]
-    fixed_name = _fuzzy_fix(cmd_name, _KNOWN_CMDS, cutoff=0.65)
+    cmd_name  = tokens[0]
+    all_cmds  = _KNOWN_CMDS + (extra_cmds or [])
+    fixed_name = _fuzzy_fix(cmd_name, all_cmds, cutoff=0.65)
     if fixed_name:
         fixes[0] = (tokens[0], fixed_name)
         tokens[0] = fixed_name
@@ -1873,8 +2051,13 @@ class CoderCLI:
         self._meta_quant: str | None = None
         self._meta_ctx: int | None = None
         self._load_model_meta()
-        self._auto_apply = False   # True while agent is running with auto_apply
-        self._in_agent   = False   # True while inside any agent loop (/agent, /ask)
+        self._auto_apply  = False   # True while agent is running with auto_apply
+        self._in_agent    = False   # True while inside any agent loop (/agent, /ask)
+        self._agent_msgs: list = [] # reference to active agent_msgs list (set in _run_agent_loop)
+        self._agent_ctx:  int  = 0  # agent context limit (0 = use num_ctx); set via /tempctx N
+        self._current_task: str = ""  # current agent task string — exposed as BCODER_TASK to procs
+        self._proc_before: list = []  # procs that run BEFORE each LLM call
+        self._proc_gates:  list = []  # procs that run after reply, PASS/FAIL gate
         self._savepoint  = None    # index into self.messages set by /ctx savepoint
         self._aliases    = self._load_aliases()  # global + local aliases.txt
         self._script_file = None
@@ -1883,6 +2066,8 @@ class CoderCLI:
         self._role: str = "You are a software developer assistant."  # /role — system persona prepended to every chat request
         self._last_proc_stdout: str = ""   # saved last proc output for /var set
         self._last_output: str = ""        # universal last output (LLM, tool, proc) — $ and -> capture
+        self._last_input:  str = ""        # last user message or command — ~ expansion
+        self._hooks: dict = {}             # /hook — before/after command triggers
         self._mcp: dict = {}
         self._history: list[str] = []
         self.cmd_history: list[str] = []   # all /commands typed this session
@@ -1900,7 +2085,7 @@ class CoderCLI:
 
     def _sep(self, label: str = ""):
         if label:
-            print(f"{_DIM}─── {_R}{_BOLD}{label}{_R}{_DIM} " + "─" * (36 - len(label)) + _R)
+            print(f"{_LBLUE}─── {label} " + "─" * (36 - len(label)) + _R)
         else:
             print(f"{_DIM}{self.SEP}{_R}")
 
@@ -1927,7 +2112,7 @@ class CoderCLI:
 
     def _stream_chat(self, messages, hint: str = "") -> str:
         """POST to active provider, stream chunks to stdout. Returns full reply."""
-        if self._role:
+        if self._role and not (messages and messages[0].get("role") == "system"):
             messages = [{"role": "system", "content": self._role}] + list(messages)
         chunks = []
         def _print(c):
@@ -1941,7 +2126,51 @@ class CoderCLI:
                     json=body, stream=True, timeout=self.timeout,
                 ) as resp:
                     resp.raise_for_status()
-                    _parse_openai_stream(resp, _print, chunks)
+                    in_think = False
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        text = line.decode() if isinstance(line, bytes) else line
+                        if text.startswith("data: "):
+                            text = text[6:]
+                        if text == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(text)
+                        except json.JSONDecodeError:
+                            continue
+                        delta = (data.get("choices") or [{}])[0].get("delta", {})
+                        # reasoning_content field (DeepSeek, LM Studio reasoning models)
+                        reasoning = delta.get("reasoning_content") or ""
+                        if reasoning and self.think_show:
+                            _print(f"\033[90m{reasoning}\033[0m")
+                        chunk = delta.get("content") or ""
+                        if chunk:
+                            # apply <think>...</think> state machine (same as Ollama path)
+                            while chunk:
+                                if in_think:
+                                    end = chunk.find('</think>')
+                                    if end == -1:
+                                        if self.think_show:
+                                            _print(f"\033[90m{chunk}\033[0m")
+                                        chunk = ""
+                                    else:
+                                        if self.think_show and end > 0:
+                                            _print(f"\033[2m{chunk[:end]}\033[0m")
+                                        in_think = False
+                                        chunk = chunk[end + 8:]
+                                else:
+                                    start = chunk.find('<think>')
+                                    if start == -1:
+                                        _print(chunk)
+                                        chunks.append(chunk)
+                                        chunk = ""
+                                    else:
+                                        if start > 0:
+                                            _print(chunk[:start])
+                                            chunks.append(chunk[:start])
+                                        in_think = True
+                                        chunk = chunk[start + 7:]
             else:
                 opts = {"num_ctx": self.num_ctx}
                 opts.update(self.params)
@@ -2019,10 +2248,17 @@ class CoderCLI:
         print("  Ctrl+C interrupts stream   /exit to quit")
         print("  <cmd> -> var  capture output into variable   $ = last output")
         print()
-        _auto_cfg = self._load_config_file()
-        if _auto_cfg.get("auto"):
-            print(f"[config] auto-loading {CONFIG_FILE}")
-            self._apply_config(_auto_cfg)
+        _auto_cfg = {}
+        for _cfg_path in (CONFIG_FILE, GLOBAL_CONFIG_FILE):
+            if os.path.isfile(_cfg_path):
+                _c = self._load_config_file(_cfg_path)
+                if _c.get("auto"):
+                    _auto_cfg = _c
+                    break
+        if _auto_cfg:
+            # host/model already applied at startup — only apply remaining settings
+            _session_cfg = {k: v for k, v in _auto_cfg.items() if k not in ("host", "model")}
+            self._apply_config(_session_cfg)
             print()
         while True:
             try:
@@ -2036,6 +2272,16 @@ class CoderCLI:
             if user_input not in self._history or (self._history and self._history[-1] != user_input):
                 self._history.append(user_input)
             self._route(user_input)
+            if user_input.startswith("/"):
+                import shlex as _shlex
+                _args = user_input.split(None, 1)[1] if " " in user_input else ""
+                try:
+                    _parts = _shlex.split(_args)
+                    self._last_input = _parts[0] if len(_parts) == 1 else _args
+                except ValueError:
+                    self._last_input = _args
+            else:
+                self._last_input = user_input
 
     # ── command routing ────────────────────────────────────────────────────────
 
@@ -2047,8 +2293,7 @@ class CoderCLI:
 
     # shorthand aliases expanded before fix_command and routing
     _ALIASES = {
-        "/compact": "/ctx compact",
-    }
+        }
 
     def _route(self, user_input: str, auto: bool = False):
         # ── /prompt save <name> suffix — works appended to any text ───────────
@@ -2072,19 +2317,23 @@ class CoderCLI:
         if user_input.startswith("/"):
             user_input = self._ALIASES.get(user_input.split()[0], user_input)  # hardcoded shorthands
             user_input = self._expand_alias(user_input)                         # user-defined aliases
-            user_input = fix_command(user_input, auto=auto)
+            user_input = fix_command(user_input, auto=auto, extra_cmds=list(self._aliases.keys()))
             if self._vars and "{{" in user_input:
                 user_input = _apply_params(user_input, self._vars)
-            # expand $ to last output
+            # expand $ to last output, ~ to last input
             if "$" in user_input:
                 user_input = user_input.replace("$", self._last_output)
+            if "~" in user_input:
+                user_input = user_input.replace("~", self._last_input)
             cmd_root = user_input.split()[0]
             if cmd_root not in self._HISTORY_SKIP:
                 self.cmd_history.append(user_input)
         else:
-            # expand $ in plain chat messages too
+            # expand $ and ~ in plain chat messages too
             if "$" in user_input:
                 user_input = user_input.replace("$", self._last_output)
+            if "~" in user_input:
+                user_input = user_input.replace("~", self._last_input)
 
         if capture_var:
             with _Tee() as tee:
@@ -2145,9 +2394,15 @@ class CoderCLI:
         elif user_input.startswith("/readln") or user_input.startswith("/read"):
             self._cmd_read(user_input)
         elif user_input.startswith("/insert"):
-            self._cmd_insert(user_input)
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_insert", _ha):
+                self._cmd_insert(user_input)
+                self._run_hook("after_insert", _ha)
         elif user_input.startswith("/edit"):
-            self._cmd_edit(user_input)
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_edit", _ha):
+                self._cmd_edit(user_input)
+                self._run_hook("after_edit", _ha)
         elif user_input.startswith("/save"):
             self._cmd_save(user_input)
         elif user_input.startswith("/run"):
@@ -2155,7 +2410,9 @@ class CoderCLI:
             if len(parts) < 2:
                 print("usage: /run <command>")
             else:
-                self._cmd_run(parts[1])
+                if self._run_hook("before_run", {"content": parts[1]}):
+                    self._cmd_run(parts[1])
+                    self._run_hook("after_run", {"content": parts[1]})
         elif user_input.startswith("/script"):
             self._cmd_script(user_input)
         elif user_input.startswith("/prompt"):
@@ -2167,16 +2424,26 @@ class CoderCLI:
         elif user_input.startswith("/parallel"):
             self._cmd_parallel(user_input)
         elif user_input.startswith("/patch"):
-            self._cmd_patch(user_input)
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_patch", _ha):
+                self._cmd_patch(user_input)
+                self._run_hook("after_patch", _ha)
         elif user_input.startswith("/fix"):
-            self._cmd_fix(user_input)
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_fix", _ha):
+                self._cmd_fix(user_input)
+                self._run_hook("after_fix", _ha)
+        elif user_input.startswith("/hook"):
+            self._cmd_hook(user_input)
         elif user_input.startswith("/bkup"):
             self._cmd_bkup(user_input)
         elif user_input.startswith("/diff"):
             self._cmd_diff(user_input)
         elif user_input.startswith("/alias"):
             self._cmd_alias(user_input)
-        elif user_input.startswith("/ask"):
+        elif user_input.startswith("/tempctx"):
+            self._cmd_tempctx(user_input)
+        elif user_input.startswith("/ask"):  # keep /ask before generic named-agent fallthrough
             self._cmd_ask(user_input)
         elif user_input.startswith("/agent"):
             self._cmd_agent(user_input)
@@ -2395,8 +2662,13 @@ advanced_tools =
             if len(parts) < 3:
                 print("usage: /ctx load <file>")
                 return
+            load_path = parts[2]
+            if not os.path.dirname(load_path) and not os.path.isfile(load_path):
+                candidate = os.path.join(CTX_DIR, load_path)
+                if os.path.isfile(candidate):
+                    load_path = candidate
             try:
-                with open(parts[2], "r", encoding="utf-8") as f:
+                with open(load_path, "r", encoding="utf-8") as f:
                     text = f.read()
                 loaded = []
                 current_role = "user"
@@ -2409,12 +2681,12 @@ advanced_tools =
                     else:
                         loaded.append({"role": current_role, "content": block})
                 if not loaded:
-                    print(f"[no messages found in {parts[2]}]")
+                    print(f"[no messages found in {load_path}]")
                     return
                 self.messages.extend(loaded)
-                print(f"[loaded {len(loaded)} messages from {parts[2]}]")
+                print(f"[loaded {len(loaded)} messages from {load_path}]")
             except FileNotFoundError:
-                print(f"file not found: {parts[2]}")
+                print(f"file not found: {load_path}")
             except OSError as e:
                 _err(e)
             return
@@ -2433,31 +2705,7 @@ advanced_tools =
                 self._savepoint = None
                 _ok(f"[ctx savepoint] rolled back {removed} message(s)")
             elif sub == "compact":
-                if self._savepoint is None:
-                    print("[ctx savepoint] no savepoint set — use /ctx savepoint set first")
-                    return
-                since = self.messages[self._savepoint:]
-                if not since:
-                    print("[ctx savepoint] nothing to compact since savepoint")
-                    return
-                print("[ctx savepoint] compacting messages since savepoint...")
-                summary_msgs = since + [{
-                    "role": "user",
-                    "content": (
-                        "Summarize the above into a concise context block. "
-                        "Include: files read, searches done, key findings. "
-                        "Plain text only. No code fences."
-                    )
-                }]
-                self._sep("AI")
-                summary = self._stream_chat(summary_msgs)
-                if not summary:
-                    print("[ctx savepoint] compact failed — context unchanged")
-                    return
-                del self.messages[self._savepoint:]
-                self.messages.append({"role": "user", "content": f"[summary since savepoint]\n{summary}"})
-                self._savepoint = None
-                _ok(f"[ctx savepoint] compacted {len(since)} message(s) into summary")
+                print("[ctx savepoint compact] use /ctx compact savepoint instead")
             elif sub == "show":
                 if self._savepoint is None:
                     print("[ctx savepoint] not set")
@@ -2484,26 +2732,102 @@ advanced_tools =
             print(f"[context cleared — params and num_ctx ({self.num_ctx}) preserved]")
             return
         if parts[1] == "compact":
-            if not self.messages:
-                print("[context is empty]")
+            # parse: /ctx compact [savepoint] [profile: <name>]
+            rest_parts  = parts[2:]
+            use_savepoint = "savepoint" in rest_parts
+            profile_name  = None
+            for idx, p in enumerate(rest_parts):
+                if p == "profile:" and idx + 1 < len(rest_parts):
+                    profile_name = rest_parts[idx + 1]
+                    break
+                if p.startswith("profile:") and len(p) > 8:
+                    profile_name = p[8:]
+                    break
+
+            if use_savepoint:
+                if self._savepoint is None:
+                    print("[ctx compact] no savepoint set — use /ctx savepoint set first")
+                    return
+                to_compact = self.messages[self._savepoint:]
+                scope_label = "since savepoint"
+            else:
+                to_compact = list(self.messages)
+                scope_label = "full context"
+
+            if not to_compact:
+                print(f"[ctx compact] nothing to compact ({scope_label})")
                 return
-            print("[ctx compact] summarizing conversation...")
-            summary_msgs = list(self.messages) + [{
-                "role": "user",
-                "content": (
-                    "Summarize this entire conversation into a concise but complete context block. "
-                    "Include: files read, changes made, decisions, key findings, current state of the code. "
-                    "Plain text only. No code fences. Be thorough — this summary replaces the full history."
-                )
-            }]
-            self._sep("AI")
-            summary = self._stream_chat(summary_msgs)
+
+            compact_prompt = (
+                "Summarize the above into a concise but complete context block. "
+                "Include: files read, changes made, decisions, key findings, current state. "
+                "Plain text only. No code fences."
+            ) if use_savepoint else (
+                "Summarize this entire conversation into a concise but complete context block. "
+                "Include: files read, changes made, decisions, key findings, current state of the code. "
+                "Plain text only. No code fences. Be thorough — this summary replaces the full history."
+            )
+            summary_msgs = to_compact + [{"role": "user", "content": compact_prompt}]
+
+            if profile_name:
+                # use external model via profile
+                workers = _load_profile(profile_name)
+                if not workers:
+                    print(f"[ctx compact] profile '{profile_name}' not found")
+                    return
+                host, model, _ = workers[0]
+                url, prov = parse_host(host)
+                print(f"[ctx compact] summarizing {scope_label} via {model}...")
+                try:
+                    if prov == "openai":
+                        resp = requests.post(f"{url}/v1/chat/completions",
+                                             json={"model": model, "messages": summary_msgs, "stream": False},
+                                             timeout=300)
+                        resp.raise_for_status()
+                        summary = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    else:
+                        resp = requests.post(f"{url}/api/chat",
+                                             json={"model": model, "messages": summary_msgs,
+                                                   "stream": False, "options": {"num_ctx": self.num_ctx}},
+                                             timeout=300)
+                        resp.raise_for_status()
+                        summary = resp.json().get("message", {}).get("content", "")
+                except Exception as e:
+                    print(f"[ctx compact] error calling {model}: {e}")
+                    return
+            else:
+                print(f"[ctx compact] summarizing {scope_label}...")
+                self._sep("AI")
+                summary = self._stream_chat(summary_msgs)
+
             if not summary:
                 print("[ctx compact] failed — context unchanged")
                 return
-            self.messages.clear()
-            self.messages.append({"role": "user", "content": f"[session summary]\n{summary}"})
-            _ok(f"[ctx compact] context replaced with summary ({len(summary)} chars)")
+
+            if use_savepoint:
+                del self.messages[self._savepoint:]
+                self.messages.append({"role": "user", "content": f"[summary since savepoint]\n{summary}"})
+                self._savepoint = None
+                _ok(f"[ctx compact] {len(to_compact)} message(s) → summary ({scope_label})")
+            else:
+                self.messages.clear()
+                self.messages.append({"role": "user", "content": f"[session summary]\n{summary}"})
+                _ok(f"[ctx compact] context replaced with summary ({len(summary)} chars)")
+            self._last_output = summary
+            return
+        if parts[1] == "list":
+            if not os.path.isdir(CTX_DIR):
+                print(f"[ctx] no ctx folder found — create .1bcoder/ctx/ and save context files there")
+                return
+            files = sorted(f for f in os.listdir(CTX_DIR)
+                           if os.path.isfile(os.path.join(CTX_DIR, f)))
+            if not files:
+                print(f"[ctx] .1bcoder/ctx/ is empty")
+                return
+            print(f"[ctx] .1bcoder/ctx/  ({len(files)} file(s)):")
+            for fname in files:
+                size = os.path.getsize(os.path.join(CTX_DIR, fname))
+                print(f"  {fname}  ({size:,} bytes)")
             return
         try:
             self.num_ctx = int(parts[1])
@@ -2511,10 +2835,61 @@ advanced_tools =
         except ValueError:
             print("usage: /ctx <number> | cut | compact | save <file> | load <file>")
 
+    def _cmd_tempctx(self, user_input: str):
+        """Manage the agent's internal context limit and message history."""
+        parts = user_input.split()
+        sub   = parts[1] if len(parts) > 1 else ""
+
+        # /tempctx N — set agent context limit (works outside agent too)
+        if sub.isdigit():
+            self._agent_ctx = int(sub)
+            _ok(f"[tempctx] agent context limit set to {self._agent_ctx:,} tokens")
+            return
+
+        if not self._in_agent:
+            limit = self._agent_ctx or self.num_ctx
+            src   = f"set to {self._agent_ctx:,}" if self._agent_ctx else f"default ({self.num_ctx:,})"
+            print(f"[tempctx] agent context limit: {src} tokens")
+            print("usage: /tempctx N | cut | clear | show")
+            return
+
+        limit = self._agent_ctx or self.num_ctx
+        if sub == "cut":
+            before = len(self._agent_msgs)
+            while (sum(len(m["content"]) for m in self._agent_msgs) // 4 > limit
+                   and len(self._agent_msgs) > 2):
+                self._agent_msgs.pop(1)   # keep index 0 (system msg)
+            removed = before - len(self._agent_msgs)
+            est = sum(len(m["content"]) for m in self._agent_msgs) // 4
+            print(f"[tempctx cut] removed {removed} message(s) — ~{est:,}/{limit:,} tokens remaining")
+        elif sub == "clear":
+            del self._agent_msgs[2:]      # keep system msg + initial task
+            est = sum(len(m["content"]) for m in self._agent_msgs) // 4
+            print(f"[tempctx clear] reset to system+task — ~{est:,} tokens")
+        elif sub == "show":
+            est = sum(len(m["content"]) for m in self._agent_msgs) // 4
+            pct = est * 100 // limit
+            src = f"set" if self._agent_ctx else "= num_ctx"
+            print(f"[tempctx] {len(self._agent_msgs)} messages  ~{est:,}/{limit:,} tokens ({pct}%)  limit {src}")
+        else:
+            print("usage: /tempctx N | cut | clear | show")
+            print("  N     — set agent context limit to N tokens (persists across agents)")
+            print("  cut   — remove oldest messages until context fits within limit")
+            print("  clear — reset to system prompt + task only")
+            print("  show  — display agent context usage vs limit")
+
     def _cmd_model(self, user_input: str = ""):
         tokens = user_input.split()
         save_ctx = "-sc" in tokens or "save-context" in tokens
         args = [t for t in tokens[1:] if t not in ("-sc", "save-context")]
+
+        # refresh model list from server
+        try:
+            refreshed = list_models(self.base_url, self.provider)
+            if refreshed:
+                self.models = refreshed
+        except Exception:
+            pass
 
         if args:
             # /model <name> — set directly by name
@@ -3091,6 +3466,152 @@ advanced_tools =
         else:
             print("[skipped]")
 
+    # ── hook support ──────────────────────────────────────────────────────────
+
+    def _extract_hook_args(self, user_input: str) -> dict:
+        """Extract file and range from a command string for hook variable injection."""
+        tokens = user_input.split()
+        file = tokens[1] if len(tokens) > 1 else ""
+        range_str = ""
+        if len(tokens) > 2:
+            if re.match(r'^\d+(?:-\d+)?$', tokens[2]):
+                range_str = tokens[2]
+        return {"file": file, "range": range_str}
+
+    def _run_hook(self, event: str, args: dict) -> bool:
+        """Run hook script for event. Returns False to cancel the command.
+        .py files are run as guard subprocesses (stdin=trigger text, stdout parsed for BLOCK:/ALERT:).
+        .txt files are run as 1bcoder scripts (existing behaviour).
+        args (file, range, ...) are injected as session variables for .txt scripts,
+        and passed as env vars BCODER_<KEY> for .py guards."""
+        script_name = self._hooks.get(event)
+        if not script_name:
+            return True
+
+        # resolve: proc dirs first (for .py guards), then scripts dirs, then absolute
+        script_path = None
+        if os.path.isabs(script_name):
+            script_path = script_name if os.path.isfile(script_name) else None
+        else:
+            search_dirs = (LOCAL_PROC_DIR, PROC_DIR, SCRIPTS_DIR, GLOBAL_SCRIPTS_DIR)
+            for d in search_dirs:
+                p = os.path.join(d, script_name)
+                if os.path.isfile(p):
+                    script_path = p
+                    break
+
+        if not script_path:
+            _warn(f"[hook:{event}] script not found: {script_name}")
+            return event.startswith("after")
+
+        # ── .py guard: run as subprocess, parse BLOCK:/ALERT: ─────────────────
+        if script_path.endswith(".py"):
+            stdin_text = args.get("content") or args.get("file") or ""
+            env = dict(os.environ)
+            env["BCODER_EVENT"] = event
+            ctx_used = sum(len(m.get("content", "")) // 4 for m in self.messages)
+            ctx_max  = getattr(self, "num_ctx", NUM_CTX)
+            env["BCODER_CTX_USED"] = str(ctx_used)
+            env["BCODER_CTX_MAX"]  = str(ctx_max)
+            env["BCODER_CTX_PCT"]  = str(int(ctx_used * 100 / ctx_max) if ctx_max else 0)
+            for k, v in args.items():
+                if v:
+                    env[f"BCODER_{k.upper()}"] = str(v)
+            try:
+                result = subprocess.run(
+                    [sys.executable, script_path],
+                    input=stdin_text, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=15, env=env,
+                )
+            except subprocess.TimeoutExpired:
+                _warn(f"[hook:{event}] guard timeout: {script_name}")
+                return True
+            except Exception as e:
+                _warn(f"[hook:{event}] guard error: {e}")
+                return True
+
+            stdout = (result.stdout or "").strip()
+            for line in stdout.splitlines():
+                if line.startswith("BLOCK:"):
+                    reason = line[len("BLOCK:"):].strip()
+                    print(f"{_RED}[guard:{event}] blocked — {reason}{_R}")
+                    return False
+                if line.startswith("ALERT:"):
+                    reason = line[len("ALERT:"):].strip()
+                    print(f"{_YELL}[guard:{event}] alert — {reason}{_R}")
+                elif line.startswith("ACTION:"):
+                    cmd = line[len("ACTION:"):].strip()
+                    self._route(cmd, auto=True)
+            if result.returncode != 0:
+                _warn(f"[hook:{event}] guard exited {result.returncode}")
+            return True
+
+        # ── .txt script: original behaviour ───────────────────────────────────
+        saved_vars = dict(self._vars)
+        self._vars.update({k: v for k, v in args.items() if v})
+        try:
+            lines = _load_script(script_path)
+            for line in lines:
+                line = line.rstrip("\n")
+                if not line or line.strip().startswith("#") or line.startswith("[v]"):
+                    continue
+                self._route(_apply_params(line, self._vars), auto=True)
+        finally:
+            self._vars = saved_vars
+        return True
+
+    def _cmd_hook(self, user_input: str):
+        """Define, list, or clear before/after hooks on commands.
+
+        /hook before|after <cmd> <script>   Set hook (script in scripts dir or absolute path).
+        /hook list                           Show all active hooks.
+        /hook clear                          Remove all hooks.
+        /hook clear before|after [<cmd>]     Remove specific hook(s).
+        """
+        parts = user_input.split(None, 3)
+        sub = parts[1] if len(parts) > 1 else ""
+
+        if sub == "list":
+            if not self._hooks:
+                print("[no hooks defined]")
+                return
+            for event, script in sorted(self._hooks.items()):
+                timing, cmd = event.split("_", 1)
+                print(f"  {timing:6} {cmd:12} → {script}")
+            return
+
+        if sub == "clear":
+            if len(parts) == 2:
+                self._hooks.clear()
+                _ok("[hook] all hooks cleared")
+            elif len(parts) == 3:
+                timing = parts[2]
+                removed = [k for k in list(self._hooks) if k.startswith(timing + "_")]
+                for k in removed:
+                    del self._hooks[k]
+                _ok(f"[hook] cleared all {timing} hooks ({len(removed)} removed)")
+            else:
+                event = f"{parts[2]}_{parts[3]}"
+                if self._hooks.pop(event, None) is not None:
+                    _ok(f"[hook] cleared {event}")
+                else:
+                    print(f"[hook] not found: {event}")
+            return
+
+        if sub in ("before", "after"):
+            if len(parts) < 4:
+                print("usage: /hook before|after <cmd> <script>")
+                return
+            cmd    = parts[2]
+            script = parts[3]
+            event  = f"{sub}_{cmd}"
+            self._hooks[event] = script
+            _ok(f"[hook] {sub} {cmd} → {script}")
+            return
+
+        print("usage: /hook before|after <cmd> <script>  |  /hook list  |  /hook clear [before|after [cmd]]")
+
     def _cmd_bkup(self, user_input: str):
         parts = user_input.split(None, 2)
         if len(parts) < 3:
@@ -3497,7 +4018,14 @@ advanced_tools =
         elif sub == "apply":
             auto_yes, filename, params = _parse_script_apply_args(rest)
             if filename:
-                path = filename if os.path.isabs(filename) else os.path.join(SCRIPTS_DIR, filename)
+                if os.path.isabs(filename):
+                    path = filename
+                else:
+                    path = next(
+                        (os.path.join(d, filename) for d in (SCRIPTS_DIR, GLOBAL_SCRIPTS_DIR)
+                         if os.path.isfile(os.path.join(d, filename))),
+                        os.path.join(SCRIPTS_DIR, filename)
+                    )
                 if not os.path.exists(path):
                     print(f"script file not found: {path}")
                     return
@@ -3546,6 +4074,10 @@ advanced_tools =
                 self._confirm = original_confirm
                 self._auto_apply = False
             print("script complete")
+            # auto-reset: remove [v] markers so script is ready to reuse
+            _done = _load_script(self._script_file)
+            _reset = [l[4:] if l.startswith("[v] ") else l for l in _done]
+            _save_script(_reset, self._script_file)
 
         else:
             print("usage: /script list | open | create | show | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
@@ -3701,10 +4233,30 @@ advanced_tools =
         parts = name.split()
         name_only = parts[0]
         extra_args = parts[1:]
-        path = os.path.join(PROC_DIR, name_only if name_only.endswith(".py") else name_only + ".py")
-        if not os.path.isfile(path):
-            print(f"[proc] not found: {path}")
+        fname = name_only if name_only.endswith(".py") else name_only + ".py"
+        path = None
+        for d in (PROC_DIR, LOCAL_PROC_DIR):
+            p = os.path.join(d, fname)
+            if os.path.isfile(p):
+                path = p
+                break
+        if not path:
+            print(f"[proc] not found: {fname}")
             return ""
+        ctx_used = sum(len(m.get("content", "")) // 4 for m in self.messages)
+        ctx_max  = getattr(self, "num_ctx", NUM_CTX)
+        proc_env = dict(os.environ)
+        proc_env["BCODER_CTX_USED"] = str(ctx_used)
+        proc_env["BCODER_CTX_MAX"]  = str(ctx_max)
+        proc_env["BCODER_CTX_PCT"]  = str(int(ctx_used * 100 / ctx_max) if ctx_max else 0)
+        proc_env["BCODER_WORKDIR"]  = WORKDIR
+        if self._current_task:
+            proc_env["BCODER_TASK"] = self._current_task
+        if self._in_agent and self._agent_msgs:
+            agent_used  = sum(len(m.get("content", "")) // 4 for m in self._agent_msgs)
+            agent_limit = self._agent_ctx or ctx_max
+            proc_env["BCODER_AGENT_CTX_USED"] = str(agent_used)
+            proc_env["BCODER_AGENT_CTX_PCT"]  = str(int(agent_used * 100 / agent_limit) if agent_limit else 0)
         try:
             result = subprocess.run(
                 [sys.executable, path] + extra_args,
@@ -3714,6 +4266,7 @@ advanced_tools =
                 encoding="utf-8",
                 errors="replace",
                 timeout=30,
+                env=proc_env,
             )
         except subprocess.TimeoutExpired:
             print(f"[proc] timeout: {name}")
@@ -3740,10 +4293,21 @@ advanced_tools =
                 print(f"[proc] {name}: (no output)")
             return ""
 
+        # ── BLOCK / ALERT lines ─────────────────────────────────────────────────
+        for line in stdout.splitlines():
+            if line.startswith("BLOCK:"):
+                reason = line[len("BLOCK:"):].strip()
+                print(f"{_RED}[guard:{name}] blocked — {reason}{_R}")
+                return "BLOCK"
+            if line.startswith("ALERT:"):
+                reason = line[len("ALERT:"):].strip()
+                print(f"{_YELL}[guard:{name}] alert — {reason}{_R}")
+
         # ── display result ──────────────────────────────────────────────────────
         print(f"\n{_DIM}[proc:{name}]{_R}")
         for line in stdout.splitlines():
-            print(f"  {line}")
+            if not line.startswith(("BLOCK:", "ALERT:", "ACTION:")):
+                print(f"  {line}")
         if stderr:
             print(f"  {_DIM}{stderr}{_R}")
 
@@ -3784,17 +4348,18 @@ advanced_tools =
         rest  = parts[2].strip() if len(parts) > 2 else ""
 
         if sub == "list":
-            if not os.path.isdir(PROC_DIR):
+            active_names = {p.split()[0] for p in self._proc_active}
+            all_files = set()
+            for d in (PROC_DIR, LOCAL_PROC_DIR):
+                if os.path.isdir(d):
+                    all_files.update(f for f in os.listdir(d) if f.endswith(".py"))
+            if not all_files:
                 print("[proc] no processors found — use /proc new <name> to create one")
                 return
-            files = sorted(f for f in os.listdir(PROC_DIR) if f.endswith(".py"))
-            if not files:
-                print("[proc] no processors found")
-                return
-            active_names = {p.split()[0] for p in self._proc_active}
-            for f in files:
-                marker = " *" if f[:-3] in active_names or f in active_names else ""
-                print(f"  {f[:-3]}{marker}")
+            for f in sorted(all_files):
+                name_no_ext = f[:-3]
+                marker = " *" if name_no_ext in active_names or f in active_names else ""
+                print(f"  {name_no_ext}{marker}")
 
         elif sub == "run":
             if not rest:
@@ -3818,37 +4383,57 @@ advanced_tools =
                     rest = " ".join(tokens)
             self._run_proc(rest, auto=False, input_text=file_input)
 
-        elif sub == "on":
-            if not rest:
-                print("usage: /proc on <name> [args...]")
-                return
+        elif sub in ("on", "before", "gate"):
+            # /proc on <name>      — after each reply
+            # /proc before on <name> — before each LLM call
+            # /proc gate on <name>   — PASS/FAIL gate after each reply
+            if sub in ("before", "gate"):
+                # expect: /proc before on <name> or /proc gate on <name>
+                rest_parts = rest.split(None, 1)
+                if rest_parts[0] != "on" or len(rest_parts) < 2:
+                    print(f"usage: /proc {sub} on <name> [args...]")
+                    return
+                rest = rest_parts[1]
+            target_list = (self._proc_before if sub == "before"
+                           else self._proc_gates if sub == "gate"
+                           else self._proc_active)
+            label_str   = ("before each LLM call" if sub == "before"
+                           else "gate (PASS/FAIL after reply)" if sub == "gate"
+                           else "after every reply")
             name_part = rest.split()[0]
             extra_args = rest.split()[1:]
-            path = os.path.join(PROC_DIR, name_part if name_part.endswith(".py") else name_part + ".py")
-            if not os.path.isfile(path):
-                print(f"[proc] not found: {path}")
+            fname = name_part if name_part.endswith(".py") else name_part + ".py"
+            path = next((os.path.join(d, fname) for d in (PROC_DIR, LOCAL_PROC_DIR)
+                         if os.path.isfile(os.path.join(d, fname))), None)
+            if not path:
+                print(f"[proc] not found: {fname}")
                 return
-            if rest not in self._proc_active:
-                self._proc_active.append(rest)
+            if rest not in target_list:
+                target_list.append(rest)
             suffix = f" {' '.join(extra_args)}" if extra_args else ""
-            print(f"[proc] persistent: {name_part}{suffix} (runs after every reply)")
+            print(f"[proc] persistent: {name_part}{suffix} ({label_str})")
 
         elif sub == "off":
-            if not self._proc_active:
-                print("[proc] no persistent processor active")
+            all_lists = [self._proc_active, self._proc_before, self._proc_gates]
+            if not any(all_lists):
+                print("[proc] no persistent processors active")
             elif rest:
-                # /proc off <name> — remove specific proc
-                to_remove = [p for p in self._proc_active if p.split()[0] == rest]
-                if to_remove:
+                removed = []
+                for lst in all_lists:
+                    to_remove = [p for p in lst if p.split()[0] == rest]
                     for p in to_remove:
-                        self._proc_active.remove(p)
+                        lst.remove(p)
+                        removed.append(p)
+                if removed:
                     print(f"[proc] stopped: {rest}")
                 else:
                     print(f"[proc] not active: {rest}")
             else:
-                # /proc off — stop all
-                print(f"[proc] stopped: {', '.join(p.split()[0] for p in self._proc_active)}")
+                names = [p.split()[0] for lst in all_lists for p in lst]
+                print(f"[proc] stopped: {', '.join(names)}")
                 self._proc_active = []
+                self._proc_before = []
+                self._proc_gates  = []
 
         elif sub == "new":
             name = rest or self._prompt_input("  processor name:")
@@ -3989,6 +4574,13 @@ advanced_tools =
                 _ok(f"[var] {name} = {value}")
 
         elif sub == "get":
+            if arg2:
+                name = arg2.strip("{} ")
+                if name in self._vars:
+                    print(self._vars[name])
+                else:
+                    print(f"[var] not set: {name}")
+                return
             if not self._vars:
                 print("[var] no variables set")
                 return
@@ -4189,7 +4781,7 @@ advanced_tools =
                     continue
                 k, _, v = line.partition(':')
                 k, v = k.strip(), v.strip()
-                if k in ('params', 'vars', 'procs'):
+                if k in ('params', 'vars', 'procs', 'hooks'):
                     section = k
                 elif k == 'auto':
                     cfg['auto'] = v.lower() in ('true', '1', 'yes')
@@ -4212,7 +4804,7 @@ advanced_tools =
                 lines.append(f"{k}: {cfg[k]}")
         if cfg.get('ctx'):
             lines.append(f"ctx: {cfg['ctx']}")
-        for section in ('params', 'vars'):
+        for section in ('params', 'vars', 'hooks'):
             d = cfg.get(section)
             if d:
                 lines.append(f"{section}:")
@@ -4249,6 +4841,7 @@ advanced_tools =
         for p in cfg.get("procs", []):
             if p not in self._proc_active:
                 self._proc_active.append(p)
+        self._hooks.update(cfg.get("hooks", {}))
 
     def _cmd_config(self, user_input: str):
         """Project-level session config saved in .1bcoder/config.yml.
@@ -4271,9 +4864,19 @@ advanced_tools =
         arg3 = parts[3] if len(parts) > 3 else ""
 
         if sub == "save":
-            _SAVE_FIELDS = {"host", "model", "ctx", "params", "vars", "procs"}
-            field = arg2 if arg2 in _SAVE_FIELDS else None
-            cfg_path = CONFIG_FILE if (not arg2 or field) else arg2
+            _SAVE_FIELDS = {"host", "model", "ctx", "params", "vars", "procs", "hooks"}
+            if arg2 == "global":
+                cfg_path = GLOBAL_CONFIG_FILE
+                field = arg3 if arg3 in _SAVE_FIELDS else None
+            elif arg2 in _SAVE_FIELDS:
+                cfg_path = CONFIG_FILE
+                field = arg2
+            elif arg2:
+                cfg_path = arg2
+                field = None
+            else:
+                cfg_path = CONFIG_FILE
+                field = None
             # load existing to merge into (preserve what's already there)
             cfg = self._load_config_file(cfg_path)
             host_str = (self.base_url.replace("http://", "openai://")
@@ -4295,8 +4898,11 @@ advanced_tools =
             if field is None or field == "procs":
                 if self._proc_active:
                     cfg["procs"] = list(self._proc_active)
+            if field is None or field == "hooks":
+                if self._hooks:
+                    cfg["hooks"] = dict(self._hooks)
             try:
-                os.makedirs(BCODER_DIR, exist_ok=True)
+                os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
                 with open(cfg_path, "w", encoding="utf-8") as f:
                     f.write(self._write_config_yml(cfg))
                 saved = field or "all"
@@ -4305,7 +4911,7 @@ advanced_tools =
                 print(f"[config] cannot write: {e}")
 
         elif sub == "load":
-            cfg_path = arg2 if arg2 else CONFIG_FILE
+            cfg_path = GLOBAL_CONFIG_FILE if arg2 == "global" else (arg2 if arg2 else CONFIG_FILE)
             cfg = self._load_config_file(cfg_path)
             if not cfg:
                 print(f"[config] not found or empty: {cfg_path}")
@@ -4314,7 +4920,7 @@ advanced_tools =
             _ok(f"[config] loaded ← {cfg_path}")
 
         elif sub == "show":
-            cfg_path = arg2 if arg2 else CONFIG_FILE
+            cfg_path = GLOBAL_CONFIG_FILE if arg2 == "global" else (arg2 if arg2 else CONFIG_FILE)
             if not os.path.isfile(cfg_path):
                 print(f"[config] no config file: {cfg_path}")
                 return
@@ -4322,16 +4928,19 @@ advanced_tools =
                 print(f.read())
 
         elif sub == "auto":
-            if arg2 not in ("on", "off"):
-                print("usage: /config auto on | off")
+            use_global = arg3 == "global" or arg2 == "global"
+            onoff = arg3 if arg2 == "global" else arg2
+            if onoff not in ("on", "off"):
+                print("usage: /config auto on|off [global]")
                 return
-            cfg = self._load_config_file()
-            cfg["auto"] = (arg2 == "on")
+            cfg_path = GLOBAL_CONFIG_FILE if use_global else CONFIG_FILE
+            cfg = self._load_config_file(cfg_path)
+            cfg["auto"] = (onoff == "on")
             try:
-                os.makedirs(BCODER_DIR, exist_ok=True)
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+                with open(cfg_path, "w", encoding="utf-8") as f:
                     f.write(self._write_config_yml(cfg))
-                _ok(f"[config] auto {'on' if cfg['auto'] else 'off'}")
+                _ok(f"[config] auto {'on' if cfg['auto'] else 'off'} → {cfg_path}")
             except OSError as e:
                 print(f"[config] cannot write: {e}")
 
@@ -4388,32 +4997,42 @@ advanced_tools =
 
     def _cmd_doc(self, user_input: str):
         """List or display documentation articles from the doc/ folder."""
-        DOC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".1bcoder", "doc")
+        LOCAL_DOC_DIR  = os.path.join(BCODER_DIR, "doc")
+        GLOBAL_DOC_DIR = os.path.join(HOME_BCODER_DIR, "doc")
+        DOC_DIRS = [d for d in (LOCAL_DOC_DIR, GLOBAL_DOC_DIR) if os.path.isdir(d)]
         tokens = user_input.split(None, 2)
         sub = tokens[1].lower() if len(tokens) >= 2 else "list"
 
         if sub == "list" or sub == "ls":
-            if not os.path.isdir(DOC_DIR):
+            if not DOC_DIRS:
                 _err("doc/ folder not found")
                 return
-            files = sorted(f for f in os.listdir(DOC_DIR) if f.lower().endswith(".md"))
+            seen = set()
+            files = []
+            for d in DOC_DIRS:
+                for f in os.listdir(d):
+                    if f.lower().endswith(".md") and f.lower() not in seen:
+                        seen.add(f.lower())
+                        files.append(f)
+            files.sort()
             if not files:
                 print("  (no articles in doc/)")
                 return
             print("  Available articles (use /doc <name> to read):")
             for f in files:
-                name = f[:-3]  # strip .md
-                print(f"  {name}")
+                print(f"  {f[:-3]}")
             return
 
-        # find article — case-insensitive, .md optional
+        # find article — local overrides global, case-insensitive, .md optional
         name = sub if sub.endswith(".md") else sub + ".md"
         path = None
-        if os.path.isdir(DOC_DIR):
-            for f in os.listdir(DOC_DIR):
+        for d in DOC_DIRS:
+            for f in os.listdir(d):
                 if f.lower() == name.lower():
-                    path = os.path.join(DOC_DIR, f)
+                    path = os.path.join(d, f)
                     break
+            if path:
+                break
         if path is None:
             _err(f"doc not found: {sub}  (try /doc list)")
             return
@@ -4425,12 +5044,16 @@ advanced_tools =
             _err(f"cannot read {path}: {e}")
             return
 
-        add_ctx = len(tokens) >= 3 and tokens[2].lower() == "ctx"
-        if add_ctx:
+        qualifier = tokens[2].lower() if len(tokens) >= 3 else ""
+        if qualifier == "ctx":
             self.messages.append({"role": "user", "content": f"[doc/{sub.upper()}.md]\n{text}"})
             _ok(f"[doc] {sub.upper()}.md added to context ({len(text):,} chars)")
-        else:
+        elif qualifier == "raw":
             print(text)
+        else:
+            from rich.console import Console
+            from rich.markdown import Markdown
+            Console().print(Markdown(text))
 
     def _cmd_team(self, user_input: str):
         import shlex, concurrent.futures
@@ -4691,185 +5314,409 @@ advanced_tools =
 
     def _cmd_parallel(self, user_input: str):
         import concurrent.futures
-        import shlex
-        try:
-            tokens = shlex.split(user_input)[1:]
-        except ValueError as e:
-            print(f"[parallel] parse error: {e}")
-            return
 
-        # ── profile subcommands ────────────────────────────────────────────────
-        if tokens and tokens[0] == "profile":
-            sub = tokens[1] if len(tokens) > 1 else ""
+        # ── tokenizer: no shlex required ──────────────────────────────────────
+        # Handles quoted strings, $/$~, commas as list separators, key: values.
+        def _tok(raw: str) -> list[str]:
+            tokens: list[str] = []
+            buf = ""
+            in_q = None
+            for ch in raw:
+                if in_q:
+                    if ch == in_q:
+                        in_q = None
+                        tokens.append(buf)
+                        buf = ""
+                    else:
+                        buf += ch
+                elif ch in ('"', "'"):
+                    if buf.strip():
+                        tokens.append(buf.strip())
+                    buf = ""
+                    in_q = ch
+                elif ch == ",":
+                    if buf.strip():
+                        tokens.append(buf.strip())
+                    buf = ""
+                    tokens.append(",")
+                elif ch in (" ", "\t"):
+                    if buf.strip():
+                        tokens.append(buf.strip())
+                    buf = ""
+                else:
+                    buf += ch
+            if buf.strip():
+                tokens.append(buf.strip())
+            return tokens
+
+        raw_args = user_input.split(None, 1)[1].strip() if " " in user_input else ""
+
+        # ── profile subcommands — detect before main parse ─────────────────────
+        _first = raw_args.split()
+        _sub0  = _first[0].rstrip(":") if _first else ""
+        _sub1  = _first[1] if len(_first) > 1 else ""
+        if _sub0 == "profile" and _sub1 in ("list", "show", "create", "add"):
+            words = raw_args.split()
+            sub   = words[1]
 
             if sub == "list":
                 profiles = _list_profiles()
                 if not profiles:
                     print("[parallel] no profiles found")
                     return
-                for pname, workers, comment, source in profiles:
+                for pname, wlist, comment, source in profiles:
                     tag = f"  [{source}]" if source == "global" else ""
                     print(f"\n{pname}:{tag}" + (f"  # {comment}" if comment else ""))
-                    for h, m, fn in workers:
+                    for h, m, fn in wlist:
                         print(f"    {h}  |  {m}  →  {fn}")
                 return
 
             if sub == "show":
-                pname = tokens[2] if len(tokens) > 2 else ""
+                pname = words[2] if len(words) > 2 else ""
                 if not pname:
                     print("usage: /parallel profile show <name>")
                     return
-                for profiles_file, source in ((PROFILES_FILE, "local"), (GLOBAL_PROFILES_FILE, "global")):
-                    if not os.path.exists(profiles_file):
+                for pf, source in ((PROFILES_FILE, "local"), (GLOBAL_PROFILES_FILE, "global")):
+                    if not os.path.exists(pf):
                         continue
-                    with open(profiles_file, "r", encoding="utf-8") as f:
+                    with open(pf, "r", encoding="utf-8") as f:
                         for line in f:
-                            stripped = line.strip()
-                            if stripped and not stripped.startswith("#"):
-                                n, _, _ = stripped.partition(":")
+                            s = line.strip()
+                            if s and not s.startswith("#"):
+                                n, _, _ = s.partition(":")
                                 if n.strip() == pname:
-                                    print(f"[{source}] {stripped}")
+                                    print(f"[{source}] {s}")
                                     return
                 print(f"[parallel] profile '{pname}' not found")
                 return
 
             if sub == "create":
-                name = tokens[2] if len(tokens) > 2 else ""
+                name = words[2] if len(words) > 2 else ""
                 if not name:
                     name = self._prompt_input("profile name:").strip()
                 if not name:
                     return
-                # inline mode: /parallel profile create <name> host|model|file ...
-                inline_specs = [t for t in tokens[3:] if "|" in t]
+                inline_specs = [t for t in words[3:] if "|" in t]
                 if inline_specs:
-                    workers = []
+                    wlist = []
                     for spec in inline_specs:
-                        parts = spec.split("|", 2)
-                        if len(parts) == 3:
-                            workers.append(tuple(parts))
+                        p = spec.split("|", 2)
+                        if len(p) == 3:
+                            wlist.append(tuple(p))
                         else:
                             _err(f"[parallel] bad worker spec '{spec}' — expected host|model|file")
                             return
-                    if not workers:
+                    if not wlist:
                         print("[parallel] no valid workers parsed")
                         return
                 else:
-                    workers = []
+                    wlist = []
                     print(f"[parallel] creating profile '{name}' — add workers (blank host to finish)")
                     while True:
-                        host = self._prompt_input("  host (e.g. localhost:11434):").strip()
-                        if not host:
-                            break
-                        model = self._prompt_input("  model:").strip()
-                        if not model:
-                            break
+                        host    = self._prompt_input("  host (e.g. localhost:11434):").strip()
+                        if not host: break
+                        model   = self._prompt_input("  model:").strip()
+                        if not model: break
                         outfile = self._prompt_input("  output file (e.g. ans/model.txt):").strip()
-                        if not outfile:
-                            break
-                        workers.append((host, model, outfile))
+                        if not outfile: break
+                        wlist.append((host, model, outfile))
                         print(f"  added: {host}|{model}|{outfile}")
-                    if not workers:
+                    if not wlist:
                         print("[parallel] no workers added, profile not saved")
                         return
-                comment = self._prompt_input("  comment (optional):").strip()
-                replaced = _save_profile(name, workers, comment)
+                comment  = self._prompt_input("  comment (optional):").strip()
+                replaced = _save_profile(name, wlist, comment)
                 print(f"[parallel] profile '{name}' {'updated' if replaced else 'saved'} "
-                      f"({len(workers)} worker(s)) → .1bcoder/profiles.txt")
+                      f"({len(wlist)} worker(s)) → .1bcoder/profiles.txt")
                 return
 
             if sub == "add":
-                pname = tokens[2] if len(tokens) > 2 else ""
+                pname = words[2] if len(words) > 2 else ""
                 if not pname:
                     print("usage: /parallel profile add <name>")
                     return
-                existing = _load_profile(pname) or []
-                safe_model = self.model.replace(":", "-").replace("/", "-")
+                existing    = _load_profile(pname) or []
+                safe_model  = self.model.replace(":", "-").replace("/", "-")
                 default_file = f"ans/{safe_model}.txt"
-                outfile = self._prompt_input(f"  output file [{default_file}]:").strip() or default_file
+                outfile     = self._prompt_input(f"  output file [{default_file}]:").strip() or default_file
                 existing.append((self.host, self.model, outfile))
                 replaced = _save_profile(pname, existing)
                 print(f"[parallel] added {self.host}|{self.model}|{outfile} to profile '{pname}' "
                       f"({'updated' if replaced else 'created'})")
                 return
 
-        # ── send prompts to workers ────────────────────────────────────────────
-        prompts = []
-        workers = []
+        # ── expand $ and ~ before tokenizing (no shell-quoting needed) ────────
+        raw_args = raw_args.replace("$", self._last_output or "")
+        raw_args = raw_args.replace("~", self._last_input  or "")
+
+        # ── parse main args ────────────────────────────────────────────────────
+        tokens       = _tok(raw_args)
+        prompts: list[str] = []
+        workers: list[tuple] = []
+        ctx_mode     = "last"   # default: send last message only
+        file_path    = None
+        file_n       = None     # number of chunks (None = no file:)
+        collect      = None     # 'compact'
+        collect_prof = None
+        sequential   = False
+
         i = 0
+        prompt_buf: list[str] = []
+        aspects:    list[str] = []   # items from list: — distributed one per worker
+        in_list     = False          # True after list: keyword seen
+        main_prompt = ""             # text before list:
+
+        def _flush_buf():
+            text = " ".join(prompt_buf).strip()
+            prompt_buf.clear()
+            if not text:
+                return
+            if in_list:
+                aspects.append(text)
+            else:
+                prompts.append(text)
+
+        def _next_val(default=""):
+            nonlocal i
+            i += 1
+            return tokens[i] if i < len(tokens) else default
+
         while i < len(tokens):
-            token = tokens[i]
-            if token == "profile":
+            tok = tokens[i]
+
+            # comma → flush current buffer as one item (prompt or aspect)
+            if tok == ",":
+                _flush_buf()
                 i += 1
-                if i >= len(tokens):
-                    print("[parallel] 'profile' requires a name")
-                    return
-                loaded = _load_profile(tokens[i])
+                continue
+
+            # ctx: full|last|none  and  legacy --ctx / --last / --no-ctx
+            _ctx_map = {
+                "ctx:full": "full",  "ctx:last": "last",  "ctx:none": "none",
+                "--ctx":    "full",  "--last":   "last",   "--no-ctx": "none",
+            }
+            if tok in _ctx_map:
+                _flush_buf()
+                ctx_mode = _ctx_map[tok]
+                i += 1
+                continue
+            if tok == "ctx:":
+                _flush_buf()
+                ctx_mode = {"full": "full", "last": "last", "none": "none"}.get(_next_val(), "last")
+                i += 1
+                continue
+
+            # --seq
+            if tok == "--seq":
+                sequential = True
+                i += 1
+                continue
+
+            # profile: name  (also bare 'profile name' for backward compat)
+            _pname = None
+            if tok.startswith("profile:") and len(tok) > 8:
+                _pname = tok[8:]
+            elif tok in ("profile:", "profile"):
+                _pname = _next_val()
+            if _pname is not None:
+                _flush_buf()
+                loaded = _load_profile(_pname)
                 if loaded is None:
-                    print(f"[parallel] profile '{tokens[i]}' not found")
+                    print(f"[parallel] profile '{_pname}' not found")
                     return
                 workers.extend(loaded)
-            elif "|" in token:
-                parts = token.split("|", 2)
-                if len(parts) == 3:
-                    workers.append(tuple(parts))
+                i += 1
+                continue
+
+            # file: path [-n N|auto]
+            _fpath = None
+            if tok.startswith("file:") and len(tok) > 5:
+                _fpath = tok[5:]
+            elif tok == "file:":
+                _fpath = _next_val()
+            if _fpath is not None:
+                _flush_buf()
+                file_path = _fpath
+                # peek for -n N
+                if i + 1 < len(tokens) and tokens[i + 1] == "-n":
+                    i += 2
+                    _nv = tokens[i] if i < len(tokens) else ""
+                    file_n = _nv if _nv == "auto" else (int(_nv) if _nv.isdigit() else None)
+                i += 1
+                continue
+
+            # collect: compact [profile: name]
+            _cval = None
+            if tok.startswith("collect:") and len(tok) > 8:
+                _cval = tok[8:]
+            elif tok == "collect:":
+                _cval = _next_val()
+            if _cval is not None:
+                _flush_buf()
+                collect = _cval
+                # peek for profile: name
+                if i + 1 < len(tokens) and tokens[i + 1].rstrip(":") == "profile":
+                    i += 1 if tokens[i + 1] == "profile:" else 1
+                    collect_prof = _next_val()
+                i += 1
+                continue
+
+            # list: — everything after this (until next keyword) are aspects
+            if tok in ("list:", "list"):
+                _flush_buf()
+                # flush prompts accumulated so far as the main_prompt
+                if prompts:
+                    main_prompt = " ".join(prompts)
+                    prompts.clear()
+                in_list = True
+                i += 1
+                continue
+
+            # worker spec host|model|file
+            if "|" in tok:
+                _flush_buf()
+                p = tok.split("|", 2)
+                if len(p) == 3:
+                    workers.append(tuple(p))
                 else:
-                    print(f"[parallel] bad spec (need host|model|file): {token}")
+                    print(f"[parallel] bad worker spec (need host|model|file): {tok}")
                     return
-            else:
-                prompts.append(token)
+                i += 1
+                continue
+
+            # everything else → prompt/aspect text
+            prompt_buf.append(tok)
             i += 1
+
+        _flush_buf()
+
+        # if list: was used, build per-worker prompts: main_prompt + "\n\nAspect: aspect_i"
+        if aspects:
+            if not main_prompt and prompts:
+                main_prompt = " ".join(prompts)
+                prompts.clear()
+            prompts = [
+                f"{main_prompt}\n\nAspect: {a}" if main_prompt else a
+                for a in aspects
+            ]
+
         if not workers:
-            print('usage: /parallel ["prompt"] [profile <name>] [host|model|file ...]')
+            print("usage: /parallel [list: p1, p2]  profile: name  [ctx: last|full|none]")
+            print("                 [file: path [-n N]]  [collect: compact [profile: name]]")
             return
-        base_messages = list(self.messages)
+
+        # ── file: chunking ─────────────────────────────────────────────────────
+        if file_path:
+            try:
+                content = open(file_path, encoding="utf-8", errors="ignore").read()
+            except OSError as e:
+                print(f"[parallel] cannot read file '{file_path}': {e}")
+                return
+            # split by === separator if present, else by equal line chunks
+            if re.search(r"^===\s*$", content, re.MULTILINE):
+                chunks = [c.strip() for c in re.split(r"^===\s*$", content, flags=re.MULTILINE) if c.strip()]
+            else:
+                n_chunks = len(workers) if file_n == "auto" or file_n is None else file_n
+                lines = content.splitlines()
+                size  = max(1, len(lines) // n_chunks)
+                chunks = ["\n".join(lines[k:k + size]) for k in range(0, len(lines), size)]
+                if len(chunks) > n_chunks:          # merge last overflow chunk
+                    chunks[-2] = chunks[-2] + "\n" + chunks[-1]
+                    chunks = chunks[:-1]
+            prompts = chunks[:len(workers)]         # one chunk per worker
+
+        # ── build base context ─────────────────────────────────────────────────
+        if ctx_mode == "none":
+            base_messages = []
+        elif ctx_mode == "last":
+            base_messages = self.messages[-1:] if self.messages else []
+        else:
+            base_messages = list(self.messages)
+
         if not prompts and not base_messages:
             print("[parallel] no prompt and no context — nothing to send")
             return
-        def get_prompt(idx):
+
+        # ── if collect: compact, set savepoint before workers run ─────────────
+        if collect == "compact":
+            self._savepoint = len(self.messages)
+
+        def get_prompt(idx: int):
             if not prompts:
                 return None
             return prompts[idx] if idx < len(prompts) else prompts[-1]
-        print(f"[parallel] {len(workers)} worker(s)...")
+
+        print(f"[parallel] {len(workers)} worker(s), ctx:{ctx_mode}"
+              + (f", file:{os.path.basename(file_path)}" if file_path else "")
+              + (f", {'seq' if sequential else 'parallel'}")
+              + "...")
+
         def call_one(idx, host, model, filename):
             prompt = get_prompt(idx)
-            msgs = base_messages + ([{"role": "user", "content": prompt}] if prompt else [])
+            msgs   = base_messages + ([{"role": "user", "content": prompt}] if prompt else [])
             url, prov = parse_host(host)
             try:
                 if prov == "openai":
-                    resp = requests.post(
-                        f"{url}/v1/chat/completions",
-                        json={"model": model, "messages": msgs, "stream": False},
-                        timeout=300,
-                    )
+                    resp = requests.post(f"{url}/v1/chat/completions",
+                                         json={"model": model, "messages": msgs, "stream": False},
+                                         timeout=300)
                     resp.raise_for_status()
                     reply = (resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
                 else:
-                    resp = requests.post(
-                        f"{url}/api/chat",
-                        json={"model": model, "messages": msgs, "stream": False,
-                              "options": {"num_ctx": self.num_ctx}},
-                        timeout=300,
-                    )
+                    resp = requests.post(f"{url}/api/chat",
+                                         json={"model": model, "messages": msgs, "stream": False,
+                                               "options": {"num_ctx": self.num_ctx}},
+                                         timeout=300)
                     resp.raise_for_status()
                     reply = resp.json().get("message", {}).get("content", "")
             except Exception as e:
                 return host, model, filename, None, str(e)
-            dirpart = os.path.dirname(filename)
-            if dirpart:
-                os.makedirs(dirpart, exist_ok=True)
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(reply)
+            if filename != "ctx":
+                dirpart = os.path.dirname(filename)
+                if dirpart:
+                    os.makedirs(dirpart, exist_ok=True)
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(reply)
             return host, model, filename, reply, None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(workers)) as pool:
-            futures = {pool.submit(call_one, i, h, m, f): (h, m, f)
-                       for i, (h, m, f) in enumerate(workers)}
-            for future in concurrent.futures.as_completed(futures):
-                host, model, filename, reply, err = future.result()
-                if err:
-                    print(f"[parallel] {model}@{host} — error: {err}")
-                else:
-                    print(f"[parallel] {model}@{host} → {filename} ({len(reply)} chars)")
-        print("[parallel] done — use /read <file> to load answers into context")
+
+        # ── execute workers ────────────────────────────────────────────────────
+        ctx_replies: list[tuple] = []
+        if sequential:
+            results = [call_one(idx, h, m, f) for idx, (h, m, f) in enumerate(workers)]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(workers)) as pool:
+                futures = {pool.submit(call_one, idx, h, m, f): (h, m, f)
+                           for idx, (h, m, f) in enumerate(workers)}
+                results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+        for host, model, filename, reply, err in results:
+            if err:
+                print(f"[parallel] {model}@{host} — error: {err}")
+            elif filename == "ctx":
+                ctx_replies.append((model, reply))
+                print(f"[parallel] {model}@{host} → context ({len(reply)} chars)")
+            else:
+                print(f"[parallel] {model}@{host} → {filename} ({len(reply)} chars)")
+
+        # inject ctx replies into main context
+        for model, reply in ctx_replies:
+            self.messages.append({"role": "assistant", "content": f"[{model}]\n{reply}"})
+            label = f" [{model}] "
+            line  = f"{_CYAN}{'─' * 4}{label}{'─' * max(0, 60 - len(label))}{_R}"
+            print(f"\n{line}\n{reply}")
+
+        has_files = any(f != "ctx" for _, _, f in workers)
+        if has_files:
+            print("[parallel] done — use /read <file> to load answers into context")
+        else:
+            print("[parallel] done")
+
+        # ── collect: compact — run after workers ───────────────────────────────
+        if collect == "compact":
+            cp_cmd = "/ctx compact savepoint"
+            if collect_prof:
+                cp_cmd += f" profile: {collect_prof}"
+            self._route(cp_cmd, auto=True)
 
     def _cmd_about(self):
         print(f"""
@@ -5608,7 +6455,13 @@ advanced_tools =
         if template is None:
             return user_input
         if "{{args}}" in template:
-            expanded = template.replace("{{args}}", args)
+            # Extract --flags separately; pass remaining args verbatim to preserve
+            # quoted segments and keywords like file: / plan: intact.
+            flags = re.findall(r'--\S+', args)
+            text  = re.sub(r'\s*--\S+', '', args).strip()
+            expanded = template.replace("{{args}}", text)
+            if flags:
+                expanded = expanded + " " + " ".join(flags)
         else:
             expanded = (template + (" " + args if args else "")).strip()
         return self._expand_alias(expanded, depth + 1)
@@ -5711,7 +6564,8 @@ advanced_tools =
             agent_msgs.append({"role": "user", "content": f"[plan context]\n{plan_context}"})
             plan_context = ""
         msgs_offset = 1 + len(self.messages)   # stable: self.messages not modified during loop
-        self._in_agent = True
+        self._in_agent   = True
+        self._agent_msgs = agent_msgs          # expose to /tempctx
         try:
             for turn in range(1, max_turns + 1):
                 est_tokens = sum(len(m["content"]) for m in agent_msgs) // 4
@@ -5730,6 +6584,42 @@ advanced_tools =
                     hint     = f"[plan step {step_num}/{total_plan}: {step}]"
                     agent_msgs.append({"role": "user", "content": hint})
                     print(f"{_DIM}  {hint}{_R}")
+
+                # before procs — run before LLM call, inject output into agent context
+                if use_procs and self._proc_before:
+                    last_reply = next((m["content"] for m in reversed(agent_msgs)
+                                       if m["role"] == "assistant"), "")
+                    for _bp in self._proc_before:
+                        bp_out = self._run_proc(_bp, auto=True, input_text=last_reply)
+                        if bp_out:
+                            # CAPTURE: line — set self._last_output so $ expands to it in ACTION
+                            for _line in bp_out.splitlines():
+                                if _line.startswith("CAPTURE:"):
+                                    self._last_output = _line[8:].strip()
+                                    break
+                            # Execute ACTION lines: run command, capture LLM reply into agent context
+                            # (result is removed from self.messages so main context stays clean)
+                            for _line in bp_out.splitlines():
+                                if _line.startswith("ACTION:"):
+                                    _action_cmd = _line[7:].strip()
+                                    _n = len(self.messages)
+                                    self._route(_action_cmd, auto=True)
+                                    _new = self.messages[_n:]
+                                    self.messages = self.messages[:_n]   # don't pollute main ctx
+                                    for _m in _new:
+                                        if _m.get("role") == "assistant":
+                                            _hint = _m["content"].strip()
+                                            agent_msgs.append({"role": "user",
+                                                               "content": f"[context] {_hint}"})
+                                            print(f"{_DIM}  [before] {_hint[:80]}{'...' if len(_hint) > 80 else ''}{_R}")
+                            # inject plain text output (non-protocol lines) as context too
+                            _SKIP = ("ACTION:", "BLOCK:", "FAIL:", "PASS", "CAPTURE:")
+                            ctx_lines = [l for l in bp_out.splitlines()
+                                         if not any(l.startswith(k) for k in _SKIP)]
+                            ctx_text = "\n".join(ctx_lines).strip()
+                            if ctx_text:
+                                agent_msgs.append({"role": "user", "content": f"[context] {ctx_text}"})
+                                print(f"{_DIM}  [before] {ctx_text[:80]}{'...' if len(ctx_text) > 80 else ''}{_R}")
 
                 self._sep("AI")
                 reply = self._stream_chat(agent_msgs)
@@ -5770,17 +6660,71 @@ advanced_tools =
                 agent_msgs.append({"role": "assistant", "content": reply})
 
                 proc_actions: list[str] = []
+                proc_failures: list[str] = []
                 if use_procs:
                     for _proc in self._proc_active:
                         proc_out = self._run_proc(_proc, auto=True)
                         if proc_out:
                             proc_actions += ACTION_RE.findall(proc_out)
+                            for _line in proc_out.splitlines():
+                                if _line.startswith("FAIL:"):
+                                    proc_failures.append(_line[5:].strip())
 
-                actions = ACTION_RE.findall(reply) + proc_actions
+                # gate procs — PASS/FAIL validators (also merged with proc_failures)
+                if use_procs and self._proc_gates:
+                    for _gp in self._proc_gates:
+                        gp_out = self._run_proc(_gp, auto=True)
+                        if gp_out:
+                            proc_actions += ACTION_RE.findall(gp_out)
+                            for line in gp_out.splitlines():
+                                if line.startswith("FAIL:"):
+                                    proc_failures.append(line[5:].strip())
+                failures = proc_failures
+                if failures:
+                        feedback = ("[gate failures — fix before continuing]\n"
+                                    + "\n".join(f"- {f}" for f in failures)
+                                    + "\nUse ACTION: to fix the issues above.")
+                        print(f"{_DIM}[{label}] gates: {len(failures)} failure(s) — retrying{_R}")
+                        # restore current plan step so agent retries it
+                        if step is not None:
+                            plan_steps.insert(0, step)
+                            # remove the [plan step N/M: ...] hint already in context
+                            for i in range(len(agent_msgs) - 1, -1, -1):
+                                if agent_msgs[i]["role"] == "user" and agent_msgs[i]["content"].startswith("[plan step"):
+                                    agent_msgs.pop(i)
+                                    break
+                        agent_msgs.append({"role": "user", "content": feedback})
+                        continue  # force next turn regardless of actions
+
+                model_actions = ACTION_RE.findall(reply)
+                actions       = model_actions + proc_actions
                 if not actions:
                     if plan_steps:
                         print(f"{_DIM}[{label}] no ACTION — {len(plan_steps)} plan step(s) remaining, continuing{_R}")
                         continue
+                    print(f"{_DIM}[{label}] no ACTION and no plan steps remaining — done{_R}")
+                    if on_done:
+                        self._route(on_done)
+                    break
+                # only proc actions fired (model said nothing actionable) and no steps left → done
+                if not model_actions and not plan_steps and proc_actions:
+                    print(f"{_DIM}[{label}] proc-only actions, no plan steps remaining — finishing{_R}")
+                    for _pa in proc_actions:
+                        self._route(_pa, auto=True)
+                    if on_done:
+                        self._route(on_done)
+                    ans = input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                    if ans == "a":
+                        self.messages.extend(agent_msgs[msgs_offset:])
+                        _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
+                    elif ans == "s":
+                        last = next((m for m in reversed(agent_msgs) if m["role"] == "assistant"), None)
+                        if last:
+                            self.messages.append({"role": "user", "content": f"[{label} result]\n{last['content']}"})
+                            _ok(f"[{label}] last reply added to context")
+                    else:
+                        print(f"[{label}] nothing added to context")
+                    break
                     print(f"\n{_GREEN}[{label}] done{_R}{_DIM} (no more ACTIONs){_R}")
                     if on_done:
                         print(f"{_DIM}[{label}] on_done: {on_done}{_R}")
@@ -5836,16 +6780,20 @@ advanced_tools =
                 combined = "\n\n".join(tool_results) if tool_results else "[all tools skipped]"
                 agent_msgs.append({"role": "user", "content": combined})
 
-                est_tokens = sum(len(m["content"]) for m in agent_msgs) // 4
-                ctx_pct    = est_tokens * 100 // self.num_ctx
-                if est_tokens >= int(self.num_ctx * 0.85):
+                agent_limit = self._agent_ctx or self.num_ctx
+                est_tokens  = sum(len(m["content"]) for m in agent_msgs) // 4
+                ctx_pct     = est_tokens * 100 // agent_limit
+                _CTX_CLEAR  = ("/tempctx", "/ctx cut", "/ctx clear", "/ctx compact", "/clear")
+                ctx_cleared = any(a.strip().startswith(_CTX_CLEAR) for a in actions)
+                if est_tokens >= int(agent_limit * 0.85) and not ctx_cleared:
                     _warn(f"[{label}] context {ctx_pct}% full after tool results — stopping")
                     break
 
             else:
                 print(f"\n[{label}] reached max_turns ({max_turns}), stopping")
         finally:
-            self._in_agent = False
+            self._in_agent    = False
+            self._agent_msgs  = []
 
     # ── named agents ───────────────────────────────────────────────────────────
 
@@ -5867,10 +6815,18 @@ advanced_tools =
             "auto_exec":   False,
             "tools":       None,   # None = use default from agent.txt
             "aliases":     {},
+            "procs":       [],     # procs activated after each reply
+            "before":      [],     # procs activated before each LLM call
+            "gates":       [],     # procs that gate exit: must return PASS
+            "vars":        {},     # session vars set for duration of agent run; {{task}} = task string
             "on_done":     "",     # slash command executed once on natural loop termination
+            "params":      {},     # model params overrides for duration of agent run (num_predict, temperature…)
         }
-        tools, aliases, system_lines = [], {}, []
-        in_tools = in_aliases = in_system = False
+        tools, aliases, procs, before, gates = [], {}, [], [], []
+        agent_vars, agent_params, system_lines = {}, {}, []
+        in_tools = in_aliases = in_procs = in_before = in_gates = False
+        in_vars = in_params = in_system = False
+        tools_declared = False  # True if tools = section was seen (even empty)
         for raw in open(path, encoding="utf-8"):
             line = raw.rstrip("\n")
             stripped = line.strip()
@@ -5879,7 +6835,7 @@ advanced_tools =
                 if in_system:
                     system_lines.append("")
                 else:
-                    in_tools = in_aliases = False
+                    in_tools = in_aliases = in_procs = in_vars = False
                 continue
             if stripped.startswith("#"):
                 continue   # comments don't break blocks
@@ -5888,6 +6844,28 @@ advanced_tools =
                     system_lines.append(stripped)
                 elif in_tools:
                     tools.append(stripped)
+                elif in_procs:
+                    procs.append(stripped)
+                elif in_before:
+                    before.append(stripped)
+                elif in_gates:
+                    gates.append(stripped)
+                elif in_vars and "=" in stripped:
+                    k, _, v = stripped.partition("=")
+                    agent_vars[k.strip()] = v.strip()
+                elif in_params and "=" in stripped:
+                    k, _, v = stripped.partition("=")
+                    k, v = k.strip(), v.strip()
+                    if v.lower() in ("true", "false"):
+                        agent_params[k] = v.lower() == "true"
+                    else:
+                        try:
+                            agent_params[k] = int(v)
+                        except ValueError:
+                            try:
+                                agent_params[k] = float(v)
+                            except ValueError:
+                                agent_params[k] = v
                 elif in_aliases and "=" in stripped:
                     k, _, v = stripped.partition("=")
                     k = k.strip()
@@ -5896,7 +6874,8 @@ advanced_tools =
                     aliases[k] = v.strip()
                 continue
             # top-level key = value line — ends any open block
-            in_tools = in_aliases = in_system = False
+            in_tools = in_aliases = in_procs = in_before = in_gates = False
+            in_vars = in_params = in_system = False
             if "=" not in stripped:
                 continue
             key, _, val = stripped.partition("=")
@@ -5917,14 +6896,35 @@ advanced_tools =
                 cfg["on_done"] = val
             elif key == "tools":
                 in_tools = True
+                tools_declared = True
             elif key == "aliases":
                 in_aliases = True
+            elif key == "procs":
+                in_procs = True
+            elif key == "before":
+                in_before = True
+            elif key == "gates":
+                in_gates = True
+            elif key == "vars":
+                in_vars = True
+            elif key == "params":
+                in_params = True
         if system_lines:
             cfg["system"] = "\n".join(system_lines)
-        if tools:
-            cfg["tools"] = tools
+        if tools_declared:
+            cfg["tools"] = tools  # empty list = explicitly no tools
         if aliases:
             cfg["aliases"] = aliases
+        if procs:
+            cfg["procs"] = procs
+        if before:
+            cfg["before"] = before
+        if gates:
+            cfg["gates"] = gates
+        if agent_vars:
+            cfg["vars"] = agent_vars
+        if agent_params:
+            cfg["params"] = agent_params
         return cfg
 
     def _parse_agent_flags(self, task: str, cfg: dict):
@@ -5944,6 +6944,47 @@ advanced_tools =
             break
         return task, max_turns, auto_exec, auto_apply
 
+    def _make_chunk_steps(self, filepath: str, n_arg: str, theme: str) -> list[str]:
+        """Pre-compute plan steps for chunked file scanning.
+
+        Reads the file and embeds actual content into each step — no /read needed.
+        Chunk size is based on real character density, not estimated lines.
+        """
+        abs_path = filepath if os.path.isabs(filepath) else os.path.join(WORKDIR, filepath)
+        try:
+            with open(abs_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError as e:
+            _err(f"[scan] cannot read {filepath}: {e}")
+            return []
+
+        total       = len(lines)
+        total_chars = sum(len(l) for l in lines)
+
+        if not n_arg or n_arg.lower() == "auto":
+            # target ~25% of ctx per chunk (chars); compute proportional line count
+            chars_per_chunk = max(400, int(self.num_ctx * 0.25 * 4))
+            lines_per_chunk = max(10, round(total * chars_per_chunk / max(1, total_chars)))
+            n_chunks = max(1, -(-total // lines_per_chunk))   # ceil div
+        else:
+            n_chunks        = max(1, int(n_arg))
+            lines_per_chunk = max(1, -(-total // n_chunks))
+
+        overlap = max(1, lines_per_chunk // 10)
+        print(f"[scan] {filepath}: {total} lines / {total_chars} chars → "
+              f"{n_chunks} chunks (~{lines_per_chunk} lines each, overlap {overlap})")
+
+        steps = []
+        for i in range(n_chunks):
+            start = max(0,      i     * lines_per_chunk - overlap)
+            end   = min(total, (i+1)  * lines_per_chunk + overlap)
+            chunk_text = "".join(lines[start:end])
+            steps.append(
+                f"[chunk {i+1}/{n_chunks} of {filepath}]\n"
+                f"{chunk_text}"
+            )
+        return steps
+
     def _run_named_agent(self, name: str, task: str, path: str):
         """Load agent def from path and run it."""
         cfg  = self._load_agent_def(path)
@@ -5957,20 +6998,36 @@ advanced_tools =
             if end_q != -1:
                 rest = task[end_q + 1:].strip()
                 task = task[1:end_q]
-                pm = re.match(r'^plan:\s*(.*)', rest, re.IGNORECASE | re.DOTALL)
+                pm = re.match(r'^(plan|file):\s*(.*)', rest, re.IGNORECASE | re.DOTALL)
                 if pm:
-                    plan_steps, plan_context = _parse_plan_arg(pm.group(1).strip())
+                    kw, arg = pm.group(1).lower(), pm.group(2).strip()
+                    if kw == "file":
+                        cm = re.match(r'^(\S+)\s+-n\s*(\d+|auto)?\s*$', arg, re.IGNORECASE)
+                        if cm:
+                            plan_steps = self._make_chunk_steps(cm.group(1), cm.group(2) or "auto", task)
+                        else:
+                            plan_steps, plan_context = _parse_file_arg(arg)
+                    else:
+                        plan_steps, plan_context = _parse_plan_arg(arg)
         else:
-            pm = re.search(r'\bplan:\s*(.*)', task, re.IGNORECASE | re.DOTALL)
+            pm = re.search(r'\b(plan|file):\s*(.*)', task, re.IGNORECASE | re.DOTALL)
             if pm:
-                plan_steps, plan_context = _parse_plan_arg(pm.group(1).strip())
-                task = task[:pm.start()].strip()
+                kw, arg = pm.group(1).lower(), pm.group(2).strip()
+                task     = task[:pm.start()].strip()
+                if kw == "file":
+                    cm = re.match(r'^(\S+)\s+-n\s*(\d+|auto)?\s*$', arg, re.IGNORECASE)
+                    if cm:
+                        plan_steps = self._make_chunk_steps(cm.group(1), cm.group(2) or "auto", task)
+                    else:
+                        plan_steps, plan_context = _parse_file_arg(arg)
+                else:
+                    plan_steps, plan_context = _parse_plan_arg(arg)
         if self._vars and plan_steps:
             plan_steps = [_apply_params(s, self._vars) for s in plan_steps]
         if len(plan_steps) > max_turns:
             max_turns = len(plan_steps)
 
-        tools = cfg["tools"] or self._load_agent_config().get("tools", DEFAULT_AGENT_TOOLS)
+        tools = cfg["tools"] if cfg["tools"] is not None else self._load_agent_config().get("tools", DEFAULT_AGENT_TOOLS)
         tpl   = cfg["system"]
         tool_list     = get_help_list(tools)
         system_prompt = tpl.format(tool_list=tool_list) if "{tool_list}" in tpl else tpl
@@ -5986,15 +7043,58 @@ advanced_tools =
 
         agent_msgs = [system_msg] + list(self.messages) + [{"role": "user", "content": task}]
 
-        # apply agent-scoped aliases for the duration of this run
+        # apply agent-scoped vars, aliases, and procs for the duration of this run
+        saved_vars    = dict(self._vars)
         saved_aliases = dict(self._aliases)
+        saved_procs   = list(self._proc_active)
+        saved_before  = list(self._proc_before)
+        saved_gates   = list(self._proc_gates)
+        saved_params  = dict(self.params)
+        # resolve vars: {{task}} → task string, other {{name}} → existing session vars
+        for k, v in cfg["vars"].items():
+            resolved = v.replace("{{task}}", task)
+            resolved = _apply_params(resolved, self._vars) if self._vars else resolved
+            self._vars[k] = resolved
         self._aliases.update(cfg["aliases"])
+        # apply agent-scoped model params (num_predict, temperature, …)
+        saved_agent_ctx = self._agent_ctx
+        if cfg["params"]:
+            p = dict(cfg["params"])
+            # agent_ctx sets the tempctx limit for this agent run
+            if "agent_ctx" in p:
+                self._agent_ctx = int(p.pop("agent_ctx"))
+            # map num_predict → max_tokens for OpenAI-compatible providers
+            if self.provider == "openai" and "num_predict" in p:
+                p["max_tokens"] = p.pop("num_predict")
+            self.params.update(p)
+        # activate procs / before / gates — substitute vars into proc spec
+        for p in cfg["procs"]:
+            p_resolved = _apply_params(p, self._vars) if self._vars else p
+            if p_resolved not in self._proc_active:
+                self._proc_active.append(p_resolved)
+        for p in cfg["before"]:
+            p_resolved = _apply_params(p, self._vars) if self._vars else p
+            if p_resolved not in self._proc_before:
+                self._proc_before.append(p_resolved)
+        for p in cfg["gates"]:
+            p_resolved = _apply_params(p, self._vars) if self._vars else p
+            if p_resolved not in self._proc_gates:
+                self._proc_gates.append(p_resolved)
+        on_done = _apply_params(cfg["on_done"], self._vars) if self._vars else cfg["on_done"]
+        self._current_task = task
         try:
             self._run_agent_loop(name, agent_msgs, max_turns, auto_exec, auto_apply,
                                  plan_steps=plan_steps, plan_context=plan_context,
-                                 on_done=cfg["on_done"])
+                                 on_done=on_done, use_procs=True)
         finally:
-            self._aliases = saved_aliases
+            self._current_task = ""
+            self._vars        = saved_vars
+            self._aliases     = saved_aliases
+            self._proc_active = saved_procs
+            self._proc_before = saved_before
+            self._proc_gates  = saved_gates
+            self.params       = saved_params
+            self._agent_ctx   = saved_agent_ctx
 
     # ── /ask ───────────────────────────────────────────────────────────────────
 
@@ -6022,8 +7122,12 @@ advanced_tools =
         print(f"[ask] max_turns: {max_turns}  (read-only, auto-exec)")
         print(f"[ask] question: {task}\n")
         agent_msgs = [system_msg] + list(self.messages) + [{"role": "user", "content": task}]
-        self._run_agent_loop("ask", agent_msgs, max_turns,
-                             auto_exec=True, auto_apply=True)
+        self._current_task = task
+        try:
+            self._run_agent_loop("ask", agent_msgs, max_turns,
+                                 auto_exec=True, auto_apply=True)
+        finally:
+            self._current_task = ""
 
     def _cmd_agent(self, user_input: str):
         task = user_input[6:].strip()
@@ -6072,9 +7176,10 @@ advanced_tools =
                 continue
             break
 
-        # parse: /agent task description plan step1, step2, step3
-        # also accepts: /agent "task description" plan step1, step2, step3
-        # also accepts: /agent task script steps.md  (load steps from file)
+        # parse: /agent task description plan: step1, step2, step3
+        # also accepts: /agent "task description" plan: step1, step2, step3
+        # also accepts: /agent task file: steps.md  (load steps from file)
+        # also accepts: /agent task file: large.md -n 10  (chunked scan)
         plan_steps = []
         plan_context = ""
         if task.startswith('"'):
@@ -6082,14 +7187,30 @@ advanced_tools =
             if end_q != -1:
                 rest = task[end_q + 1:].strip()
                 task = task[1:end_q]
-                pm = re.match(r'^plan:\s*(.*)', rest, re.IGNORECASE | re.DOTALL)
+                pm = re.match(r'^(plan|file):\s*(.*)', rest, re.IGNORECASE | re.DOTALL)
                 if pm:
-                    plan_steps, plan_context = _parse_plan_arg(pm.group(1).strip())
+                    kw, arg = pm.group(1).lower(), pm.group(2).strip()
+                    if kw == "file":
+                        cm = re.match(r'^(\S+)\s+-n\s*(\d+|auto)?\s*$', arg, re.IGNORECASE)
+                        if cm:
+                            plan_steps = self._make_chunk_steps(cm.group(1), cm.group(2) or "auto", task)
+                        else:
+                            plan_steps, plan_context = _parse_file_arg(arg)
+                    else:
+                        plan_steps, plan_context = _parse_plan_arg(arg)
         else:
-            pm = re.search(r'\bplan:\s*(.*)', task, re.IGNORECASE | re.DOTALL)
+            pm = re.search(r'\b(plan|file):\s*(.*)', task, re.IGNORECASE | re.DOTALL)
             if pm:
-                plan_steps, plan_context = _parse_plan_arg(pm.group(1).strip())
+                kw, arg = pm.group(1).lower(), pm.group(2).strip()
                 task = task[:pm.start()].strip()
+                if kw == "file":
+                    cm = re.match(r'^(\S+)\s+-n\s*(\d+|auto)?\s*$', arg, re.IGNORECASE)
+                    if cm:
+                        plan_steps = self._make_chunk_steps(cm.group(1), cm.group(2) or "auto", task)
+                    else:
+                        plan_steps, plan_context = _parse_file_arg(arg)
+                else:
+                    plan_steps, plan_context = _parse_plan_arg(arg)
         if self._vars and plan_steps:
             plan_steps = [_apply_params(s, self._vars) for s in plan_steps]
         if len(plan_steps) > max_turns:
@@ -6117,17 +7238,49 @@ advanced_tools =
         print(f"[agent] task: {task}\n")
 
         agent_msgs = [system_msg] + list(self.messages) + [{"role": "user", "content": task}]
-        self._run_agent_loop("agent", agent_msgs, max_turns, auto_exec, auto_apply,
-                             plan_steps=plan_steps, use_procs=True, plan_context=plan_context)
+        self._current_task = task
+        try:
+            self._run_agent_loop("agent", agent_msgs, max_turns, auto_exec, auto_apply,
+                                 plan_steps=plan_steps, use_procs=True, plan_context=plan_context)
+        finally:
+            self._current_task = ""
 
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
 
+def _load_startup_config() -> tuple[dict, str]:
+    """Load the first config with auto: true (local → global).
+    Returns (cfg_dict, config_path), or ({}, '') if none have auto: true."""
+    for cfg_path in (CONFIG_FILE, GLOBAL_CONFIG_FILE):
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = CoderCLI._parse_config_yml(f.read())
+                if cfg.get("auto"):
+                    return cfg, cfg_path
+            except OSError:
+                pass
+    return {}, ""
+
+
+def _pick_model(models: list) -> str:
+    """Interactively prompt user to pick a model by number. Exits on Ctrl+C."""
+    while True:
+        try:
+            raw = input("Pick [1]: ").strip() or "1"
+            idx = int(raw) - 1
+            if 0 <= idx < len(models):
+                return models[idx]
+        except (ValueError, KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="1bcoder — AI coder for 1B models")
-    parser.add_argument("--host", default="http://localhost:11434",
-                        help="Ollama host (default: http://localhost:11434)")
+    parser.add_argument("--host", default=None,
+                        help="Ollama host (default: from config.yml or http://localhost:11434)")
     parser.add_argument("--model",
                         help="Model name to use (skips selection prompt)")
     parser.add_argument("--init", action="store_true",
@@ -6150,6 +7303,9 @@ def main():
         else:
             print(f"Initialized .1bcoder/scripts/ in {WORKDIR}")
 
+    explicit_host  = args.host  is not None
+    explicit_model = args.model is not None
+
     if args.scriptapply:
         script = args.scriptapply
         if not os.path.isabs(script):
@@ -6164,8 +7320,10 @@ def main():
         if not os.path.exists(script):
             print(f"Script not found: {script}")
             sys.exit(1)
-        base_url, provider = parse_host(args.host)
-        model  = args.model or ""
+        cfg, _ = ({}, "") if (explicit_host and explicit_model) else _load_startup_config()
+        host_str = args.host if explicit_host else (cfg.get("host") or "http://localhost:11434")
+        base_url, provider = parse_host(host_str)
+        model = args.model or cfg.get("model") or ""
         models = []
         if not model:
             try:
@@ -6191,7 +7349,14 @@ def main():
         cli._cmd_script(f"/script apply -y {script_fwd} {param_tokens}".strip())
         sys.exit(0)
 
-    base_url, provider = parse_host(args.host)
+    # ── load config unless both host and model were explicitly given ──────────
+    cfg, cfg_path = ({}, "") if (explicit_host and explicit_model) else _load_startup_config()
+
+    # ── resolve host ──────────────────────────────────────────────────────────
+    host_str = args.host if explicit_host else (cfg.get("host") or "http://localhost:11434")
+    base_url, provider = parse_host(host_str)
+
+    # ── connect ───────────────────────────────────────────────────────────────
     try:
         models = list_models(base_url, provider)
     except requests.exceptions.ConnectionError:
@@ -6205,8 +7370,16 @@ def main():
         print("No models available. Run: ollama pull <model>")
         sys.exit(1)
 
-    if args.model and args.model in models:
-        model = args.model
+    # ── resolve model ─────────────────────────────────────────────────────────
+    desired = args.model if explicit_model else cfg.get("model")
+    if desired and desired in models:
+        model = desired
+    elif desired:
+        print(f"Model '{desired}' not available on {base_url}.")
+        print("Available models:")
+        for i, m in enumerate(models, 1):
+            print(f"  {i}. {m}")
+        model = _pick_model(models)
     elif len(models) == 1:
         model = models[0]
         print(f"Model: {model}")
@@ -6214,16 +7387,7 @@ def main():
         print("Available models:")
         for i, m in enumerate(models, 1):
             print(f"  {i}. {m}")
-        while True:
-            try:
-                raw = input("Pick [1]: ").strip() or "1"
-                idx = int(raw) - 1
-                if 0 <= idx < len(models):
-                    model = models[idx]
-                    break
-            except (ValueError, KeyboardInterrupt, EOFError):
-                print()
-                sys.exit(0)
+        model = _pick_model(models)
 
     CoderCLI(base_url, model, models, provider).run()
 

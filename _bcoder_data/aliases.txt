@@ -1,8 +1,16 @@
 # Global aliases — loaded at startup, override with local .1bcoder/aliases.txt
 # Format:  /name = expansion  (use {{args}} for argument substitution)
 
-/ask     = /agent ask
-/advance = /agent advance
-/sqlite  = /agent sqlite
-/plan    = /agent planning
-/fill    = /agent fill
+/ask      = /agent ask
+/advance  = /agent advance
+/concepts = /agent concepts {{args}}
+/sqlite   = /agent sqlite
+/plan     = /agent planning
+/fill     = /agent fill
+/scan     = /agent scan {{args}}
+/compact  = /agent compact {{args}}
+
+/small    = /parallel {{args}}  profile: small
+/explain  = /parallel {{args}}  profile: explain
+/thinking = /parallel {{args}}  profile: thinking
+/short    = /parallel {{args}}  profile: short

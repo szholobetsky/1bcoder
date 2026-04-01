@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "1bcoder"
-version = "0.1.2"
-description = "Offline-first AI coding assistant for 1B–7B local models (Ollama, LMStudio, llama.cpp). Terminal REPL with file editing, project map, agents, scripts, and parallel multi-model queries."
+version = "0.1.4"
+description = "AI coding assistant agent for 1B–7B local models (Ollama, LMStudio, llama.cpp). Terminal REPL with file editing, project map, agents, scripts, and parallel multi-model queries."
 requires-python = ">=3.10"
 readme = {file = "README.md", content-type = "text/markdown"}
 dependencies = [
@@ -14,6 +14,10 @@ dependencies = [
     "tqdm>=4.64",
     "rich>=13.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/szholobetsky/1bcoder"
+Repository = "https://github.com/szholobetsky/1bcoder"
 
 [project.scripts]
 1bcoder = "chat:main"

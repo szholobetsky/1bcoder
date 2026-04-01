@@ -1,0 +1,4 @@
+# auto-bkup — backup file before /patch or /edit
+# Usage: /hook before patch auto-bkup.txt
+#        /hook before edit  auto-bkup.txt
+/bkup save {{file}}

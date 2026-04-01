@@ -1,6 +1,6 @@
 # 1bcoder
 
-AI-assisted code editor designed for small (1B parameter) language models running locally via [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), or [LiteLLM](https://litellm.ai).
+AI coding assistant agent for 1B–7B local models running locally via [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), or [LiteLLM](https://litellm.ai).
 
 ---
 
@@ -63,21 +63,25 @@ Tasks that require the model to decide *what to look at* — refactoring across 
 - **`<think>` tag support** — reasoning blocks shown in terminal by default; `/think hide` suppresses terminal display; `/think include` keeps reasoning in context for chained turns
 - Run shell commands and inject their output with `/run`
 - Save AI replies to files with `/save` (code-fence stripping, multiple files, append modes)
-- **Session persistence** — `/ctx save` / `/ctx load` dump and restore full conversations; `/ctx compact` summarizes and compresses the context via AI; `/ctx savepoint` marks a position for rollback or selective compaction; `/ctx clear N` drops the last N messages
+- **Session persistence** — `/ctx save` / `/ctx load` dump and restore full conversations; `/ctx list` browses the `.1bcoder/ctx/` project context library; `/ctx compact` summarizes and compresses the context via AI; `/ctx savepoint` marks a position for rollback or selective compaction; `/ctx clear N` drops the last N messages
 - **Scripts** — reusable sequences of commands stored as `.txt` files, run step-by-step or fully automated
 - **Script from history** — `/script create ctx` captures this session's commands into a reusable script automatically
 - **Project map** — scan any codebase into a searchable index (`/map index`), query it (`/map find`), trace call chains (`/map trace`), and diff changes (`/map idiff`) — now includes `ORPHAN_DRIFT` alert (dead code delta) and `GHOST ALERT` (deleted file that other files depended on)
 - **Ask mode** — `/ask <question>` is an alias for `/agent ask`: a read-only research loop for 4B models that explores the project with tree/find/map tools, never edits files, auto-truncates large results to protect context
 - **Agent mode** — `/agent <task>` runs an autonomous loop; stops when the model outputs plain text with no ACTION; after the loop a `[s]ummary / [a]ll / [n]one` prompt lets you pull agent results into main context
-- **Named agents** — define custom agents in `.1bcoder/agents/<name>.txt` (system prompt, tools, max_turns, aliases, `on_done`); call with `/agent <name> task` or `/<name> task` directly; agent-scoped aliases active only during that run
-- **`/plan <goal>`** — planning agent: researches the project, writes a natural-language step-by-step plan to `plan.txt`; run `/agent <task> plan plan.txt` to execute it step by step
+- **Named agents** — define custom agents in `.1bcoder/agents/<name>.txt` (system prompt, tools, max_turns, aliases, `on_done`, `params`, `before`, `gates`); call with `/agent <name> task` or `/<name> task` directly; agent-scoped aliases active only during that run
+- **`/plan <goal>`** — planning agent: researches the project, writes a natural-language step-by-step plan to `plan.txt`; run `/agent <task> file: plan.txt` to execute it step by step
 - **`/fill`** — fill agent: reads NaN session variables, scans project for `.var` files and config files, sets each value automatically
 - **Session variables** — `{{name}}` placeholders substituted in any command; save/load from `.var` files for offline reuse without loading files into context
-- **Project config** — `/config save` persists session state (host, model, ctx, params, vars, procs) to `.1bcoder/config.yml`; auto-loaded on startup when `auto: true`
+- **Project config** — `/config save` persists session state (host, model, ctx, params, vars, procs) to `.1bcoder/config.yml`; `/config save global` saves to `~/.1bcoder/config.yml`; on startup, the first config with `auto: true` (local → global) is applied automatically
 - **Aliases** — define command shortcuts with `/alias /name = expansion` (supports `{{args}}`); persisted in `aliases.txt`; loaded from global then project directory at startup and survive `/clear`
 - **Backup/restore** — `/bkup save` rotates existing backups (`file.bkup` → `file.bkup(1)`, `file.bkup(2)`…) so no snapshot is ever overwritten; `/bkup restore` always restores the latest
+- **`/tempctx`** — agent-internal context control: `/tempctx N` sets a private token budget, `/tempctx cut` removes oldest messages, `/tempctx clear` resets to system+task, `/tempctx show` prints size; only active inside an agent loop so agents can't touch the main context; also settable via `params = agent_ctx = N` in agent files
+- **Agent proc hooks** — `before =` (runs before every LLM call, injects output as `[context]`) and `gates =` (runs after every reply, `FAIL:` retries the current plan step); enables supervised loops, convention enforcement, and hallucination checks without changing the model
+- **`/scan <file> <theme>`** — named agent that reads any file chunk by chunk, extracts info relevant to a theme, and builds a summary in `.1bcoder/scan_result.txt`; uses `/tempctx cut` between chunks so the agent context never overflows; result is injected into main context at the end
 - **MCP support** — connect external tool servers (filesystem, web, git, database, browser…) via the Model Context Protocol
-- **Parallel queries** — send prompts to multiple models simultaneously with `/parallel`, with saved profiles
+- **Parallel queries** — send prompts to multiple models simultaneously with `/parallel`; control context sent (`--ctx`/`--last`/`--no-ctx`) and route replies back into main context (`ctx` output) for sub-agent workflows
+- **Command hooks** — `/hook before|after <cmd> <script>` runs a script before or after edit/patch/fix/insert; `before` hook cancels the command if the script is missing; `{{file}}` and `{{range}}` injected automatically
 - Switch model or host at runtime without restarting (`/model gemma3:1b`, `/host openai://localhost:1234`)
 - **Model parameters** — `/param temperature 0.2`, `/param enable_thinking false` — sent with every request, auto-cast to correct type
 - **Multi-provider** — connect to Ollama, LMStudio, or LiteLLM using `ollama://` / `openai://` URL scheme; plain host defaults to Ollama
@@ -92,7 +96,7 @@ Tasks that require the model to decide *what to look at* — refactoring across 
 pip install 1bcoder
 ```
 
-On first launch, default agents, procs, and scripts are copied to `~/.1bcoder/` automatically.
+On first launch, default agents, procs, scripts, profiles, and aliases are copied to `~/.1bcoder/` automatically. On upgrade (`pip install --upgrade 1bcoder`), new entries in `aliases.txt` and `profiles.txt` are merged in without overwriting your customisations.
 
 ### Option 2 — Clone and install locally
 
@@ -101,6 +105,16 @@ git clone https://github.com/szholobetsky/1bcoder.git
 cd 1bcoder
 pip install -e .
 ```
+
+When installed from source with `pip install -e .`, the default data files are not copied automatically. Run the included script once to populate `~/.1bcoder/`:
+
+```bat
+deploy_bcoder_data.bat
+```
+
+This copies everything from `_bcoder_data\` (agents, procs, aliases, profiles, scripts) to `%USERPROFILE%\.1bcoder\`. Re-run after pulling updates to sync new defaults.
+
+> **Warning:** This will overwrite any files you have customised in `~/.1bcoder\`. Back up your changes before running.
 
 ### Option 3 — Install directly from GitHub
 
@@ -164,15 +178,15 @@ pip install -e .
 python chat.py
 ```
 
-On startup a numbered list of available Ollama models is shown — type the number to select one. Use `--model` to skip the prompt.
+On startup, 1bcoder checks for a config with `auto: true` (local `.1bcoder/config.yml` first, then `~/.1bcoder/config.yml`) and connects to the host and model stored there. If no config is found, it connects to local Ollama and prompts for a model. Use `--model` or `--host` to override.
 
 ### CLI options
 
 ```
 1bcoder [--host URL] [--model NAME] [--init] [--scriptapply SCRIPT] [--param KEY=VALUE]
 
---host URL              Host URL — supports ollama:// and openai:// schemes (default: http://localhost:11434)
---model NAME            Skip model selection, use this model directly
+--host URL              Host URL — supports ollama:// and openai:// schemes (default: from config or http://localhost:11434)
+--model NAME            Model to use; overrides config (shows list if not available on host)
 --init                  Create .1bcoder/ scaffold in the current directory
 --scriptapply SCRIPT        Run a script file non-interactively, then exit
 --param KEY=VALUE       Plan parameter substitution (repeatable)
@@ -536,8 +550,8 @@ When the loop finishes you are prompted: **`[s]ummary / [a]ll / [n]one`** — ch
 | `f` | Send feedback to the AI and skip the action (redirect the model mid-loop) |
 | `q` | Stop the agent |
 
-- **`plan step1, step2, ...`** — optional comma-separated list of items injected as hints one per turn
-- **`plan <file.txt>`** — load steps from a `.txt` or `.md` file; numbered/bulleted list items become steps; `### Example` / `### Summary` sections are injected as context before step 1; `max_turns` is raised automatically if the file has more steps than the default limit
+- **`plan: step1, step2, ...`** — optional comma-separated list of items injected as hints one per turn
+- **`file: <steps.txt>`** — load steps from a `.txt` or `.md` file; numbered/bulleted list items become steps; `### Example` / `### Summary` sections are injected as context before step 1; `max_turns` is raised automatically if the file has more steps than the default limit; gate FAIL on a step retries it
 
 When the loop finishes you are prompted: **`[s]ummary / [a]ll / [n]one`** — choose how much of the agent's conversation to pull into your main context.
 
@@ -545,8 +559,8 @@ When the loop finishes you are prompted: **`[s]ummary / [a]ll / [n]one`** — ch
 /agent find and fix the divide by zero bug in calc.py
 /agent -t 1 read models.py and explain the User class
 /agent -y -t 5 refactor utils.py
-/agent read file plan models.py, views.py, urls.py
-/agent implement the changes plan plan.txt    # load steps from plan.txt
+/agent read files plan: models.py, views.py, urls.py
+/agent implement the changes file: plan.txt    # load steps from plan.txt
 ```
 
 Configure the default agent in `.1bcoder/agent.txt`:
@@ -594,17 +608,47 @@ tools =
 aliases =
     /search = /map find {{args}}
     /sql    = /run python db.py "{{args}}"
+
+params =
+    num_predict = 150
+    agent_ctx = 4000
+    temperature = 0.2
+
+before =
+    assist /short
+
+gates =
+    action-required
+    pattern-gate "@Query" "use CriteriaBuilder only"
 ```
 
 - **`system =`** — inline multiline system prompt; indented lines continue the block; `{tool_list}` is substituted automatically from the `tools =` list
-- **`tools =`** — one tool name per indented line; controls what the agent knows about and what gets shown in its system prompt
+- **`tools =`** — one tool name per indented line; controls what the agent knows about and what gets shown in its system prompt; empty `tools =` line means no tools (pure text agent)
 - **`aliases =`** — agent-scoped aliases; active only during this agent's run, restored to global state after; `{{args}}` is replaced by everything after the alias name
-- **`on_done = <command>`** — slash command executed once when the agent finishes naturally (no more ACTIONs); use to save the agent's final reply to a file (e.g. `on_done = /save plan.txt -w`)
+- **`params =`** — model and agent parameters set for this run; `agent_ctx` sets the agent's private context limit (equivalent to `/tempctx N`); `num_predict`, `temperature`, etc. are forwarded to the model
+- **`before =`** — one proc per indented line; runs before every LLM call; all stdout injected as `[context]` into the agent's message list; useful for injecting a hint or parallel sub-query result each turn
+- **`gates =`** — one proc per indented line (with optional args); runs after each reply; if any proc prints `FAIL:`, the current plan step is retried and the FAIL reason is shown to the model as feedback
+- **`on_done = <command>`** — slash command executed once when the agent finishes naturally (no more ACTIONs); use to save the agent's final reply to a file (e.g. `on_done = /ctx compact scan_result`)
 
 ```ini
 # Example: planning agent saves its output automatically
 on_done = /save plan.txt -w
 ```
+
+**Gate procs** — built-in procs designed for use in `gates =`:
+
+| Proc | What it checks | FAIL condition |
+|---|---|---|
+| `action-required` | Agent reply contains `ACTION:` or a completion phrase | Neither found — suggests the bare command if one appears anywhere in the reply |
+| `pattern-gate "regexp" "msg"` | Reply matches the given regular expression | Match found — prints `msg` as the FAIL reason |
+| `grounding-check` | Identifiers in reply exist in `map.txt` | Grounding score < 50% (prints warning; does not FAIL by default) |
+
+**Before procs** — built-in procs designed for use in `before =`:
+
+| Proc | What it does |
+|---|---|
+| `assist /short` | Reads last reply, asks the LLM for a one-sentence next-step hint, injects as `[context]` |
+| `assist /parallel profile <name>` | Same but uses a parallel profile to query the hint model |
 
 Built-in named agents (global install):
 
@@ -614,6 +658,7 @@ Built-in named agents (global install):
 | `advance` | `/advance <task>` or `/agent advance` | Full toolset for 7B+ models |
 | `planning` | `/plan <goal>` | Researches project, writes natural-language plan to `plan.txt` |
 | `fill` | `/fill` | Reads NaN vars, finds `.var` files, sets missing values from project files |
+| `scan` | `/scan <file> <theme>` | Reads large file chunk by chunk, extracts themed info, saves to `.1bcoder/scan_result.txt` |
 
 **`/agent advance`** — named agent from `agents/advance.txt`, full toolset for larger models (7B+), includes `run`, `diff`, `map`, `bkup`, and all edit tools. Shortcut: `/advance`:
 
@@ -621,6 +666,63 @@ Built-in named agents (global install):
 /agent advance refactor the auth module
 /advance read and summarise plan models.py, views.py
 ```
+
+**`/concepts <topic>`** — alias for `/agent concepts`. Pure brainstorm agent: no tools, no files. Iterates through a list of concept seeds injected via `plan:`, produces a synthesis paragraph per turn. Useful for exploring design ideas, academic framing, or philosophical grounding without polluting the tool context.
+
+```
+/concepts symbol grounding in software engineering
+```
+
+---
+
+### Agent procs: before and gates
+
+`before =` and `gates =` turn an agent into a supervised loop — useful when the model is small or the task requires strict compliance.
+
+**`before =`** fires before every LLM call. All stdout is injected as a `[context]` message so the model sees it before generating its reply. Use cases:
+- `assist /short` — ask a second model for a one-sentence hint based on the last reply
+- `assist /parallel profile ten_experts` — poll multiple models for the next search direction
+
+**`gates =`** fires after every reply. Each proc receives the reply on stdin. If any prints `FAIL:`, the agent:
+1. Re-injects the current plan step (so the model sees the hint again)
+2. Feeds the FAIL reason as user feedback
+3. Retries the turn (does not advance to the next plan step)
+
+This is the key difference from a regular proc: a gate can hold the agent on a step until it produces a compliant reply.
+
+**Combined example** — agent that must always emit an ACTION:
+
+```ini
+# agents/strict.txt
+tools =
+    read
+    patch
+    tempctx
+
+gates =
+    action-required
+
+params =
+    agent_ctx = 6000
+    num_predict = 200
+```
+
+```
+/agent strict fix the authentication bug file: plan.txt
+```
+
+If the model reasons without acting, `action-required` prints `FAIL:` and the step is retried with the failure reason visible.
+
+**Pattern gate** — enforce coding conventions across all turns:
+
+```ini
+gates =
+    pattern-gate "from dual" "no FROM DUAL allowed"
+    pattern-gate "select \*" "use explicit columns"
+    action-required
+```
+
+Multiple gates can be stacked. All run after each reply; a single FAIL from any of them retries the step.
 
 ---
 
@@ -662,7 +764,7 @@ Lines starting with `[v]` are already done and skipped. Lines starting with `#` 
 | `/script show` | Display steps of the current script |
 | `/script add <command>` | Append a step to the current script |
 | `/script clear` | Wipe current script completely |
-| `/script reset` | Unmark all done steps |
+| `/script reset` | Unmark all done steps (also happens automatically when a script runs to completion) |
 | `/script reapply [key=value ...]` | Reset all done steps then apply automatically; prompts for any NaN `{{variables}}` before running |
 | `/script refresh` | Reload script from disk and show contents |
 | `/script apply [file] [key=value ...]` | Run steps one by one (Y/n/q per step) |
@@ -712,6 +814,7 @@ Session variables store named values that are substituted as `{{name}}` in any c
 /var set name =MyService         literal value
 /var def port db host            declare multiple NaN variables (skips if already set)
 /var get                         list all variables (NaN = unset)
+/var get port                    print value of a single variable (useful with ->)
 /var del port                    remove a variable
 ```
 
@@ -757,9 +860,12 @@ Any `{{key}}` found but not yet set is registered as NaN — `/script reapply` w
 
 ---
 
-### Output capture (`->` and `$`)
+### Output capture (`->`, `$` and `~`)
 
-Any command — LLM reply, tool output, or proc result — can be captured into a session variable using the `->` suffix. The special token `$` expands to the last captured output anywhere in a command or message.
+Any command — LLM reply, tool output, or proc result — can be captured into a session variable using the `->` suffix. Two special tokens expand anywhere in a command or message:
+
+- `$` — last captured output (last AI reply or tool result)
+- `~` — last user input (last message or command you typed)
 
 ```
 /map keyword extract auth.py -> keywords      # capture tool output into variable
@@ -775,23 +881,43 @@ summarize this for me -> myplan              # capture LLM reply
 /var set port result                         # also works: grab key from proc output
 ```
 
+**`~` — repeat or redirect the last question:**
+```
+як працює цей метод?                         # ask main model
+/small ~                                     # same question → small model
+/ask ~                                       # same question → agent mode
+/explain "$"                                 # ask small model to explain the reply
+поясни: $                                    # ask main model to explain its own reply
+```
+
 `->` stores the full text (including ANSI-stripped terminal output) and also updates `$` for immediate reuse. Variables captured with `->` appear in `/var get` like any other session variable.
 
 ---
 
 ### Project config (`/config`)
 
-Save and restore session state (host, model, ctx, params, vars, procs) to `.1bcoder/config.yml` in the current working directory. Useful for project-specific presets that are too large to fit in model context.
+Save and restore session state (host, model, ctx, params, vars, procs). Two config locations are supported:
+
+- **Local** — `.1bcoder/config.yml` in the current working directory (project-specific)
+- **Global** — `~/.1bcoder/config.yml` (user-wide default for all projects)
+
+**Startup priority:** on launch without `--host`/`--model`, 1bcoder checks local config first, then global. The first one with `auto: true` wins. If neither has `auto: true`, connects to local Ollama and prompts for a model.
 
 ```
-/config save                     # save all current state
-/config save host                # save only host
-/config save model               # save only model
-/config save vars                # save only vars
-/config load                     # restore from config.yml
-/config show                     # print config.yml contents
-/config auto on                  # auto-load on every startup in this directory
-/config auto off                 # disable auto-load
+/config save                     # save all current state to local config
+/config save global              # save all current state to global config
+/config save host                # save only host to local config
+/config save global host         # save only host to global config
+/config save model               # save only model to local config
+/config save global model        # save only model to global config
+/config save vars                # save only vars to local config
+/config load                     # restore from local config
+/config load global              # restore from global config
+/config show                     # print local config contents
+/config show global              # print global config contents
+/config auto on                  # enable auto-load in local config
+/config auto on global           # enable auto-load in global config
+/config auto off                 # disable auto-load in local config
 ```
 
 **Selective delete:**
@@ -804,7 +930,7 @@ Save and restore session state (host, model, ctx, params, vars, procs) to `.1bco
 /config del proc collect-files   # remove one proc
 ```
 
-**Config file format** (`.1bcoder/config.yml`):
+**Config file format** (`.1bcoder/config.yml` or `~/.1bcoder/config.yml`):
 ```yaml
 auto: true
 host: ollama://localhost:11434
@@ -820,7 +946,7 @@ procs:
   - collect-files output.txt
 ```
 
-When `auto: true`, the config is applied automatically after the startup banner — host, model, ctx, params, vars, and procs are restored without any command.
+When `auto: true`, host and model are used at startup to connect; ctx, params, vars, and procs are also restored.
 
 ---
 
@@ -843,23 +969,66 @@ Connect external tool servers to give the AI access to filesystems, databases, w
 /mcp disconnect fs
 ```
 
-See [MCP.md](MCP.md) for a full list of ready-to-use servers.
+See `/doc MCP` for a full list of ready-to-use servers.
 
 ---
 
 ### Parallel queries
 
-Send prompts to multiple models at the same time. Each answer is saved to its own file.
+Send a prompt to multiple models at the same time. No quoting required.
 
 ```
-/parallel ["prompt"] [profile <name>] [host:port|model|file ...]
+/parallel [main question]  [list: a1, a2, a3]  profile: name
+          [ctx: full|last|none]  [file: path [-n N]]
+          [collect: compact [profile: name]]  [--seq]
 ```
 
+**Prompt modes**
+
+| Mode | Behaviour |
+|---|---|
+| plain text | Same prompt sent to all workers |
+| `list: a1, a2, a3` | Aspects distributed one per worker; combined with the main question as `{main question}\n\nAspect: {aspect_i}` |
+| comma-separated prompts | Matched 1:1 to workers (last reused for remaining) |
+
+Use `list:` when you want to explore a single question from multiple angles simultaneously — each model gets the full question plus one specific aspect to focus on:
+
 ```
-/parallel "review this for bugs" \
-    localhost:11434|llama3.2:1b|answers/llm1.txt \
-    localhost:11435|qwen2.5:1b|answers/llm2.txt
+/parallel Hegel philosophy  list: axiology, epistemology, ethics, logic  profile: four-models
 ```
+
+**Context modes** (default: `ctx: last`)
+
+| Keyword | Context sent to workers |
+|---|---|
+| `ctx: full` | Full conversation context |
+| `ctx: last` | Last message only (default) |
+| `ctx: none` | No context — prompt only |
+
+**`$` and `~` expansion** — `$` expands to the last AI reply, `~` to your last input:
+
+```
+/parallel $  profile: short          # ask short model to summarise last reply
+/parallel ~  list: pros, cons  profile: two-models  # weigh your last question from two angles
+```
+
+**File chunking** — split a file across workers:
+
+```
+/parallel file: bigfile.txt -n auto  profile: cluster  # -n auto = one chunk per worker
+/parallel file: notes.md             profile: small     # === separator used if present
+```
+
+**Collect** — compact all worker replies into the context after they finish:
+
+```
+/parallel list: q1, q2  profile: small1  collect: compact
+/parallel list: q1, q2  profile: small1  collect: compact profile: short
+```
+
+`collect: compact` sets a savepoint automatically before workers run, then calls `/ctx compact savepoint` (optionally with an external model) once all workers finish. The result is available as `$`.
+
+**Sequential mode** — `--seq` runs workers one after another instead of in parallel.
 
 **Profiles** — save a set of workers for reuse:
 
@@ -869,7 +1038,6 @@ Send prompts to multiple models at the same time. Each answer is saved to its ow
 /parallel profile list                                # show all profiles (local + global)
 /parallel profile show <name>                         # print raw profile string
 /parallel profile add <name>                          # append current host+model to a profile
-/parallel "explain this" profile review
 ```
 
 Profiles stored in `~/.1bcoder/profiles.txt` (global) or `.1bcoder/profiles.txt` (project-local):
@@ -877,6 +1045,58 @@ Profiles stored in `~/.1bcoder/profiles.txt` (global) or `.1bcoder/profiles.txt`
 review: localhost:11434|ministral3:3b|ans/review.txt localhost:11435|cogito:3b|ans/tests.txt  # code review + unit tests
 fast:   localhost:11434|qwen2.5-coder:0.6b|ans/q.txt                                          # quick sanity check
 ```
+
+**Sub-agent profiles** — built-in profiles that return answers directly to the main context:
+
+```
+small:    localhost:11434|qwen3:0.6b|ctx
+explain:  localhost:11434|gemma3:1b|ctx
+thinking: localhost:11434|lfm2.5-thinking:1.2b|ctx
+short:    localhost:11434|llama3.2:1b|ctx
+```
+
+These are aliased as `/small`, `/explain`, `/thinking`, `/short`:
+
+```
+/small what does this function return?     # ask tiny model, last message as context
+/explain $                                 # ask gemma to explain last reply
+/short ~  ctx: none                        # repeat last question with no context
+```
+
+---
+
+### Hooks (`/hook`)
+
+Run a script automatically **before** or **after** a command. Useful for backups before edits, linting after patches, or any pre/post workflow step.
+
+```
+/hook before <cmd> <script>   # run script before every <cmd>
+/hook after  <cmd> <script>   # run script after  every <cmd>
+/hook list                    # show active hooks
+/hook clear <cmd>             # remove hooks for <cmd>
+/hook clear                   # remove all hooks
+```
+
+`<cmd>` is the command name without the slash: `edit`, `patch`, `fix`, `insert`, `run`.
+
+**Two script types:**
+- `.txt` — 1bcoder script (sequence of commands). `{{file}}` and `{{range}}` are injected as session variables.
+- `.py` — Python guard subprocess. Receives trigger content on `stdin`, outputs `BLOCK:`/`ALERT:`/`ACTION:` lines.
+
+**Auto-injected for `.txt` scripts:**
+
+| Variable | Value |
+|---|---|
+| `{{file}}` | file argument of the triggering command |
+| `{{range}}` | line range (if specified), e.g. `10-25` |
+
+**Examples:**
+```
+/hook before edit /bkup {{file}}              # backup before every edit (.txt script)
+/hook before run sql_readonly_guard.py        # block dangerous SQL (.py guard)
+```
+
+Missing `.txt` script cancels a `before` hook. `.py` guard cancels only if it prints `BLOCK:`. Step errors inside `.txt` scripts do not cancel the command.
 
 ---
 
@@ -903,22 +1123,51 @@ Run a Python script against the last LLM reply. Useful for extracting filenames,
 /proc run <name> -f <file>         # run against an external file instead of last reply
 /proc on grounding-check           # persistent: run after every reply automatically
 /proc off                          # stop persistent processor
+/proc before on assist /short      # before-proc: run BEFORE every LLM call, inject output as [context]
+/proc before off                   # stop before processor
+/proc gate on action-required      # gate: run after reply; FAIL retries current plan step
+/proc gate on pattern-gate "regexp" "message"   # gate with regexp
+/proc gate off                     # stop gate processor
 /proc new my-proc                  # create a new processor from template
 ```
 
-**Processor protocol:** `stdin` = last LLM reply · `stdout` = result · `key=value` lines = extracted params · `ACTION: /command` = confirmed and executed (run mode only) · exit 1 = failure.
+**Processor protocol:**
+- `stdin` = last LLM reply
+- `stdout` = result (injected into context)
+- `key=value` lines = extracted params
+- `ACTION: /command` = confirmed and executed (run mode only)
+- `ALERT: message` = warning printed, continues
+- `BLOCK: reason` = cancels the triggering command (hook mode only)
+- `FAIL: reason` = gate mode: retries plan step and feeds reason to model; proc mode: prints warning
+- exit 1 = show stderr as warning, skip ACTION
+- `BCODER_WORKDIR` env var is set to the current working directory in all proc subprocesses (use to find `map.txt`, project files, etc.)
 
-Built-in processors in `<install>/.1bcoder/proc/`:
+Built-in processors in `~/.1bcoder/proc/`:
 
 | Processor | Purpose | Best mode |
 |---|---|---|
 | `extract-files` | Extract filenames, `ACTION: /read` if one found | one-shot |
 | `extract-code` | Extract code blocks; `ACTION: /save <file>` if one block + filename detected | one-shot |
 | `extract-list` | Convert first bullet/numbered list in reply to comma-separated line | one-shot |
-| `grounding-check` | Score identifiers against `map.txt`, warn if <50% | persistent |
+| `grounding-check` | Score identifiers against `map.txt`, warn if <50% | persistent / gate |
 | `collect-files` | Accumulate filenames to `.1bcoder/collected-files.txt` | persistent |
-| `md` | Render last reply as formatted Markdown in terminal (`pip install rich`) | one-shot |
+| `md` | Render last reply as formatted Markdown in terminal | one-shot |
 | `mdx` | Render last reply as Markdown + LaTeX (KaTeX) + Mermaid diagrams in browser | one-shot |
+| `ctx_cut` | Auto `/ctx cut` when context exceeds threshold (default 90%) | persistent |
+| `rude_words` | Alert if reply contains profanity (`ua` arg adds Ukrainian list) | persistent |
+| `secret_check` | Alert if reply contains sensitive names (google, anthropic…) | persistent |
+| `sql_readonly_guard` | Alert (proc) or block (hook) on write SQL statements | both |
+| `action-required` | FAIL if agent reply has no `ACTION:` and no completion phrase | gate |
+| `pattern-gate` | FAIL if reply matches given regexp (`argv[1]` = pattern, `argv[2]` = message) | gate |
+| `assist` | Before-proc: reads last reply, asks LLM for one-sentence next-step hint | before |
+
+**Guard usage examples:**
+```
+/proc on ctx_cut 80                          # auto cut at 80%
+/proc on rude_words ua                       # profanity check + Ukrainian
+/proc on secret_check client=acme            # + custom keyword
+/hook before run sql_readonly_guard.py       # block /run with DELETE/DROP/UPDATE
+```
 
 See `/doc PROC` for the full protocol, built-in processor reference, and guide to writing your own.
 
@@ -988,11 +1237,16 @@ Built-in team scripts in `<install>/.1bcoder/scripts/`:
 | `/ctx cut` | Remove oldest messages until context fits |
 | `/ctx compact` | Ask AI to summarize the conversation, replace context with summary |
 | `/ctx save <file>` | Save full conversation to file |
-| `/ctx load <file>` | Restore a saved conversation |
+| `/ctx load <file>` | Restore a saved conversation (bare name resolved from `.1bcoder/ctx/`) |
+| `/ctx list` | List files in `.1bcoder/ctx/` project context library |
 | `/ctx savepoint set` | Mark current position as a savepoint |
 | `/ctx savepoint rollback` | Remove all messages added since the savepoint |
 | `/ctx savepoint compact` | Summarize messages since savepoint, replace with summary |
 | `/ctx savepoint show` | Show savepoint info and messages added since |
+| `/tempctx <N>` | Set agent context limit to N tokens for this run (also settable via `params = agent_ctx = N` in agent file) |
+| `/tempctx show` | Show agent context size — only available inside an agent loop |
+| `/tempctx cut` | Remove oldest messages from agent context until it fits |
+| `/tempctx clear` | Reset agent context to system prompt + task only |
 | `/think exclude` | Strip `<think>` blocks from context (default) |
 | `/think include` | Keep `<think>` blocks in context (pass model reasoning to next turn) |
 | `/think show` | Show `<think>` blocks in terminal (default) |
