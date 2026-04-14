@@ -1,0 +1,3 @@
+# Index code files in the current directory
+# Usage: /script run simargl-cli_index_files.txt
+/run simargl index files .

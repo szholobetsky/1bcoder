@@ -1,14 +1,69 @@
 # 1bcoder
 
-AI coding assistant agent for 1B–7B local models running locally via [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), or [LiteLLM](https://litellm.ai).
+AI coding assistant for small local models (0.5B–4B) — runs via [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), or any OpenAI-compatible backend.
 
 ---
 
-**Core idea:** 1B models hallucinate badly when asked to rewrite large blocks of code. 1bcoder works around this by keeping changes small and structured — the model outputs a single-line fix (`LINE N: content`) or a minimal SEARCH/REPLACE block, which the tool then applies with a diff preview before writing to disk.
+## The problem
 
-Planning and navigation are externalized: plans live in `.txt` files, project structure is indexed into a searchable map — so the model never has to hold the whole codebase in its head.
+Small local models are widely available. Most users interact with them through a chat UI — and that works well for quick questions. But chat has hard limits: you cannot feed it a 2000-line log file, cannot ask it to run the tests and read the output, cannot have it walk through a large codebase one chunk at a time. For that kind of work you need an agentic system.
 
-**Target:** programmers running `qwen2.5-coder:0.6b` or `llama3.2:1b` on a 4 GB machine — offline, no cloud, no subscription. The tool does the heavy lifting so the model doesn't have to.
+The problem is that every existing agentic system assumes a capable model underneath — typically 8B+ with native tool-calling support. Their system prompts alone consume more tokens than a 1B model's entire context window. Their tool-calling protocols are complex enough that small models hallucinate the format, miss instructions, or loop. So small models are treated as unusable and left out entirely.
+
+This is wrong. Small and very small models are genuinely useful — they just require a different kind of tool.
+
+## Privacy and security
+
+Every prompt you send to a cloud-based AI assistant leaves your machine. Your code, your architecture decisions, your internal API names, your database schemas, your business logic — all of it travels to a third-party server, is logged, may be used for training, and is subject to the data retention policies of a company you don't control.
+
+For personal projects this is an acceptable tradeoff. For professional work it rarely is. Most employment contracts prohibit sending proprietary code to external services. Many industries (finance, healthcare, defense, government) have regulatory requirements that make cloud AI assistance legally problematic or outright forbidden. Even where there is no explicit rule, leaking internal architecture to a vendor is a security risk that most engineering teams would not accept from any other tool.
+
+1bcoder runs entirely on your hardware. The model runs locally. No prompt leaves your machine. No API key, no telemetry, no network connection required. Your code stays where it is — in your editor, on your filesystem, behind your firewall.
+
+This is not a niche concern. It is the default requirement for any serious professional environment.
+
+## What different model sizes can actually do
+
+| Size | Reliable in 1bcoder |
+|---|---|
+| 0.5b | Explain a 10–20 line function; identify a known technology from a file name; write a standard construct in an unfamiliar language |
+| 1b | Explain a full module; recognize a tech stack from a directory tree; answer questions about error messages and short log excerpts |
+| 1b thinking | Explain whole-file logic; identify design patterns across a module — still unreliable for editing |
+| 2b–4b | Edit files under instruction; write new functions; follow SEARCH/REPLACE format consistently |
+
+Every tier is useful. Each requires a different approach to context preparation. 1bcoder provides the tools to do that preparation with surgical precision.
+
+## How 1bcoder works
+
+1bcoder does not depend on the model for navigation or file selection. The programmer controls what goes into context — using a command system to read files, inject logs, run shell commands, and prepare input before asking the model a question. The model's job is a single bounded subtask on pre-prepared input, not autonomous exploration.
+
+This is **human-directed** work: the programmer covers what the small model cannot do, and the model handles what it actually does well.
+
+Key design decisions:
+
+- **Short agent system prompts, at most 5 tools per agent, one function per agent** — `ask`, `edit`, `fill`, `scan`, `compact`. Not universal agents with bloated skill sets.
+- **Tolerant of long and malformed output** — post-processing is automatic; the programmer does not teach the model JSON syntax.
+- **`/parallel`** — send the same context to several models simultaneously and combine results; a 0.5b and a 1b model working together often outperform either alone; designed to coordinate small models running on multiple machines or phones.
+- **`/map`** — project structure index with structural diff; lets the model navigate a codebase without loading it into context.
+- **`/ctx`** — surgical context management: savepoints, selective compaction, named context library, multi-turn rollback. Small models cannot afford wasted tokens.
+- **`/scan`** — reads any large file chunk by chunk and builds a themed summary without overflowing context.
+- **`/proc`** — parameterized command scripts for repeatable preparation workflows.
+
+The combination is what matters: commands to build context precisely, agents scoped to one task, and parallel queries to cover what any single small model misses.
+
+## The autonomy tradeoff
+
+Most agent system developers aim for full autonomy: the agent reads the task, explores the codebase, writes the code, runs the tests, and ships — without human involvement. Full autonomy is a legitimate goal. It also requires the largest possible models: GPT-4-class or 70B+ locally, with long context, reliable tool-calling, and robust reasoning under uncertainty. Below that threshold, fully autonomous agents fail in ways that are hard to predict and slow to debug.
+
+1bcoder takes the opposite side of this tradeoff deliberately.
+
+We accept that the agent will only be partly autonomous. With a 4B model you can run `/agent ask` safely — it explores, reads, and reports, but does not edit. With a 1.5B model the agent loop is unreliable; use it for single bounded tasks with a clear success criterion. With a 0.5B model there is no autonomous loop at all — but the model is still useful for explaining a function, identifying a pattern, or generating a boilerplate construct when you hand it the exact 15 lines it needs.
+
+**Partial autonomy is not a failure mode. It is the design.**
+
+The programmer stays in the loop — confirming actions, choosing which files to load, deciding when the model is confused and needs a narrower question. This is not a weakness to be engineered away. It is the honest recognition that small models are precise tools, not general reasoners, and that the programmer's judgment is part of the system.
+
+The payoff: 1bcoder works offline, on a laptop, on a phone, on hardware you already own. No subscription. No API key. No 30-second round trips. The model that runs on your machine right now — however small — is enough to start.
 
 ---
 
@@ -54,32 +109,34 @@ Tasks that require the model to decide *what to look at* — refactoring across 
 ## Features
 
 - Plain terminal REPL — works in any shell, IDE terminal, or SSH session; status line before each prompt shows active model, disk size, quantization, native context limit, and context fill %
-- **`/read`** injects files without line numbers (clean text, ideal for `notes.txt` and structured data); **`/readln`** injects with line numbers (use before `/fix` or `/patch` when line references matter)
+- **`/read`** injects files without line numbers (clean text, ideal for `notes.txt` and structured data); **`/readln`** injects with line numbers (use before `/fix` or `/patch` when line references matter); both accept comma- or space-separated file lists — use directly with `{{find_files}}` or `{{map_files}}` captured from `/find` or `/map find`
 - **Command autocorrection** — typos in command names, file paths, and keywords are detected and fixed automatically before execution, for both human input and agent actions
 - **`/tree [path]`** — display directory tree of the whole project or any subtree; ask to inject into context (or pass `ctx` to skip the prompt)
-- **`/find <pattern>`** — search filenames and file content with regex; supports `-f`/`-c`/`-i`/`--ext` flags; highlights matches, asks to inject results into context
+- **`/find <pattern>`** — search filenames and file content with regex; supports `-f`/`-c`/`-i`/`--ext` flags; highlights matches, asks to inject results into context; sets `{{find_files}}` after every search; **`/find <terms> -r`** ranked BM25 mode returns top-10 files by relevance; hidden directories (`.git`, `.venv`, etc.) excluded automatically
 - AI proposes a **one-line fix** (`/fix`) or a **SEARCH/REPLACE patch** (`/patch`) — always shows a diff before applying
 - **Apply AI code blocks directly** with `/edit <file> code` (new/full file) or `/patch <file> code` (SEARCH/REPLACE from reply, no line numbers needed) — preferred for agent mode
 - **`<think>` tag support** — reasoning blocks shown in terminal by default; `/think hide` suppresses terminal display; `/think include` keeps reasoning in context for chained turns
 - Run shell commands and inject their output with `/run`
 - Save AI replies to files with `/save` (code-fence stripping, multiple files, append modes)
-- **Session persistence** — `/ctx save` / `/ctx load` dump and restore full conversations; `/ctx list` browses the `.1bcoder/ctx/` project context library; `/ctx compact` summarizes and compresses the context via AI; `/ctx savepoint` marks a position for rollback or selective compaction; `/ctx clear N` drops the last N messages
-- **Scripts** — reusable sequences of commands stored as `.txt` files, run step-by-step or fully automated
+- **Session persistence** — `/ctx save` / `/ctx load` dump and restore full conversations; `/ctx list` browses the `.1bcoder/ctx/` project context library; `/ctx compact` summarizes and compresses the context via AI; `/ctx compact N` compacts last N messages in place; `/ctx savepoint` marks a position for rollback or selective compaction; `/ctx clear N` drops the last N messages
+- **Context composer** — `/ctx compose` builds a merged context from multiple saved ctx files with content-level dedup (identical message blocks appear once); workflow: `/proj find` → numbered results → `/ctx compose add N,M` → `/ctx compose run task.ctx` → `/ctx load task.ctx`
+- **Scripts** — reusable sequences of commands stored as `.txt` files; `/script run <file> [key=value ...]` runs all steps automatically; `/script apply` runs step-by-step with Y/n confirmation
 - **Script from history** — `/script create ctx` captures this session's commands into a reusable script automatically
-- **Project map** — scan any codebase into a searchable index (`/map index`), query it (`/map find`), trace call chains (`/map trace`), and diff changes (`/map idiff`) — now includes `ORPHAN_DRIFT` alert (dead code delta) and `GHOST ALERT` (deleted file that other files depended on)
+- **Project map** — scan any codebase into a searchable index (`/map index`), query it (`/map find`), trace call chains (`/map trace`), and diff changes (`/map idiff`) — now includes `ORPHAN_DRIFT` alert (dead code delta) and `GHOST ALERT` (deleted file that other files depended on); `/map find` sets `{{map_files}}` after every hit; hidden directories excluded from indexing
 - **Ask mode** — `/ask <question>` is an alias for `/agent ask`: a read-only research loop for 4B models that explores the project with tree/find/map tools, never edits files, auto-truncates large results to protect context
 - **Agent mode** — `/agent <task>` runs an autonomous loop; stops when the model outputs plain text with no ACTION; after the loop a `[s]ummary / [a]ll / [n]one` prompt lets you pull agent results into main context
 - **Named agents** — define custom agents in `.1bcoder/agents/<name>.txt` (system prompt, tools, max_turns, aliases, `on_done`, `params`, `before`, `gates`); call with `/agent <name> task` or `/<name> task` directly; agent-scoped aliases active only during that run
 - **`/plan <goal>`** — planning agent: researches the project, writes a natural-language step-by-step plan to `plan.txt`; run `/agent <task> file: plan.txt` to execute it step by step
 - **`/fill`** — fill agent: reads NaN session variables, scans project for `.var` files and config files, sets each value automatically
 - **Session variables** — `{{name}}` placeholders substituted in any command; save/load from `.var` files for offline reuse without loading files into context
-- **Project config** — `/config save` persists session state (host, model, ctx, params, vars, procs) to `.1bcoder/config.yml`; `/config save global` saves to `~/.1bcoder/config.yml`; on startup, the first config with `auto: true` (local → global) is applied automatically
+- **Project context** — `/proj set <key>` creates `.1bcoder/projects/<key>/` with `project.txt` (description, keywords, file list); `/proj save`, `/proj find`, `/proj keyword add`, `/proj file add`, `/proj index` (regex-extracts file paths from saved ctx files); active project saved in config and auto-restored on next startup
+- **Project config** — `/config save` persists session state (host, model, ctx, params, vars, procs, active project) to `.1bcoder/config.yml`; `/config save global` saves to `~/.1bcoder/config.yml`; on startup, the first config with `auto: true` (local → global) is applied automatically
 - **Aliases** — define command shortcuts with `/alias /name = expansion` (supports `{{args}}`); persisted in `aliases.txt`; loaded from global then project directory at startup and survive `/clear`
 - **Backup/restore** — `/bkup save` rotates existing backups (`file.bkup` → `file.bkup(1)`, `file.bkup(2)`…) so no snapshot is ever overwritten; `/bkup restore` always restores the latest
 - **`/tempctx`** — agent-internal context control: `/tempctx N` sets a private token budget, `/tempctx cut` removes oldest messages, `/tempctx clear` resets to system+task, `/tempctx show` prints size; only active inside an agent loop so agents can't touch the main context; also settable via `params = agent_ctx = N` in agent files
 - **Agent proc hooks** — `before =` (runs before every LLM call, injects output as `[context]`) and `gates =` (runs after every reply, `FAIL:` retries the current plan step); enables supervised loops, convention enforcement, and hallucination checks without changing the model
 - **`/scan <file> <theme>`** — named agent that reads any file chunk by chunk, extracts info relevant to a theme, and builds a summary in `.1bcoder/scan_result.txt`; uses `/tempctx cut` between chunks so the agent context never overflows; result is injected into main context at the end
-- **MCP support** — connect external tool servers (filesystem, web, git, database, browser…) via the Model Context Protocol
+- **MCP support** — connect external tool servers (filesystem, web, git, database, browser…) via the Model Context Protocol; `/mcp connect <name> <command> [--cwd <dir>]` launches the server subprocess with an optional working directory override
 - **Parallel queries** — send prompts to multiple models simultaneously with `/parallel`; control context sent (`--ctx`/`--last`/`--no-ctx`) and route replies back into main context (`ctx` output) for sub-agent workflows
 - **Command hooks** — `/hook before|after <cmd> <script>` runs a script before or after edit/patch/fix/insert; `before` hook cancels the command if the script is missing; `{{file}}` and `{{range}}` injected automatically
 - Switch model or host at runtime without restarting (`/model gemma3:1b`, `/host openai://localhost:1234`)
@@ -580,7 +637,7 @@ tools =
 
 ### Named agents
 
-Custom agents are defined in `.1bcoder/agents/<name>.txt` (project-local) or `<install>/.1bcoder/agents/<name>.txt` (global). Local files override global ones. Call them with `/agent <name> task` or directly as `/<name> task`.
+Custom agents are defined in `.1bcoder/agents/<name>.txt` (project-local) or `~/.1bcoder/agents/<name>.txt` (global). Local files override global ones. Call them with `/agent <name> task` or directly as `/<name> task`.
 
 **Agent file format:**
 
@@ -767,6 +824,7 @@ Lines starting with `[v]` are already done and skipped. Lines starting with `#` 
 | `/script reset` | Unmark all done steps (also happens automatically when a script runs to completion) |
 | `/script reapply [key=value ...]` | Reset all done steps then apply automatically; prompts for any NaN `{{variables}}` before running |
 | `/script refresh` | Reload script from disk and show contents |
+| `/script run <file> [key=value ...]` | **Run all steps automatically** — shorthand for `apply -y` |
 | `/script apply [file] [key=value ...]` | Run steps one by one (Y/n/q per step) |
 | `/script apply -y [file] [key=value ...]` | Run all pending steps automatically |
 
@@ -792,7 +850,8 @@ what is wrong in lines {{range}}?
 ```
 
 ```
-/script apply fix-fn.txt file=calc.py range=1-4 hint="wrong operator"
+/script run fix-fn.txt file=calc.py range=1-4 hint="wrong operator"
+/script apply fix-fn.txt file=calc.py range=1-4   # same but asks Y/n per step
 ```
 
 Run a script non-interactively from the command line:
@@ -946,7 +1005,119 @@ procs:
   - collect-files output.txt
 ```
 
-When `auto: true`, host and model are used at startup to connect; ctx, params, vars, and procs are also restored.
+When `auto: true`, host and model are used at startup to connect; ctx, params, vars, procs, and active project are also restored.
+
+---
+
+### Project management (`/proj`)
+
+Track ctx files and notes per project ticket, feature branch, or work item — stored locally in `.1bcoder/projects/` relative to the working directory. Each project has a human-editable `project.txt` with description, keywords, and file list.
+
+```
+/proj set ABC-123           # activate project (creates .1bcoder/projects/ABC-123/)
+/proj set role-impl         # any valid folder name works
+/proj status                # show active project and project.txt
+/proj list                  # all projects, newest first (* = active)
+```
+
+**Save and browse ctx files:**
+```
+/proj save session1.txt     # save current ctx to .1bcoder/projects/ABC-123/session1.txt
+/proj show                  # list ctx files in active project (newest first)
+/proj load session1.txt     # load ctx file from active project (path resolved automatically)
+```
+
+**Annotate with keywords and files:**
+```
+/proj keyword add ppcon, payment, legacy
+/proj file add models.py, views.py, finance/amort.py
+```
+
+**Index file paths from saved ctx files** (extracts from `/read`, `/edit`, `/patch`, `/save`, `/insert` command args):
+```
+/proj index
+```
+
+**Search across all projects** in current working directory:
+```
+/proj find payment          # fast: search project.txt + ctx filenames (default)
+/proj find payment -f       # same as above (explicit)
+/proj find payment -c       # content: also grep inside ctx files with line numbers
+```
+
+`-f` output (compact):
+```
+  ABC-123 — keywords: payment | role-impl — ctx: payment_flow.txt
+```
+
+`-c` output (with content):
+```
+  ABC-123 — keywords: payment
+  [project: role-impl]
+    [ctx: user_action_flow.txt]
+     1021: system highlight current payment in the grid
+     1122: when user request payment
+```
+
+**Persist active project** — included in `/config save`, auto-restored on next startup:
+```
+/proj set ABC-123
+/config save
+# next startup: [proj] ABC-123
+```
+
+**`project.txt` format** (human-editable):
+```
+Description: Fix amortization calculation in legacy Oracle module
+Keywords: ppcon, payment, legacy
+Files:
+models.py
+finance/amort.py
+views.py
+```
+
+---
+
+### Context composer (`/ctx compose`)
+
+Build a merged context from multiple saved ctx files. Identical message blocks appear only once (content-level dedup) — shared tree/read results from different ctx files are merged into one root, then unique branches are appended.
+
+**Workflow with `/proj find`:**
+```
+/proj find isbn             # search projects — results numbered [1], [2], ...
+/ctx compose add 1,3     # add result #1 and #3 to queue
+/ctx compose add all     # or add all results
+/ctx compose list           # review: filename, size, accumulated total
+/ctx compose run task.ctx   # merge → task.ctx  (dedup applied)
+/ctx load task.ctx          # load — LLM wakes up knowing all branches
+```
+
+**Direct compose (no queue):**
+```
+/ctx compose book-html.txt models.txt requirements.txt
+```
+If no output file given with `run`, merges directly into current context.
+
+**Path resolution** — bare filename is resolved automatically:
+1. `.1bcoder/ctx/<name>`
+2. `.1bcoder/projects/<active_key>/<name>`
+3. full path as-is
+
+**Queue commands:**
+```
+/ctx compose add <file>    add file to queue
+/ctx compose add 1,2,3     add by number from last /proj find
+/ctx compose add all       add all /proj find results
+/ctx compose list             show queue with sizes and running total
+/ctx compose clear            clear queue
+/ctx compose run [out.txt]    merge and write (or load into context)
+```
+
+**`/ctx compact N`** — compact last N messages in place without touching the rest:
+```
+/ctx compact 1     # the LLM wrote 800 tokens — compress that one reply
+/ctx compact 3     # compress last 3 messages into one block
+```
 
 ---
 
@@ -955,11 +1126,13 @@ When `auto: true`, host and model are used at startup to connect; ctx, params, v
 Connect external tool servers to give the AI access to filesystems, databases, web pages, and more.
 
 ```
-/mcp connect <name> <command>
+/mcp connect <name> <command> [--cwd <dir>]
 /mcp tools [name]
-/mcp call <server/tool> [json_args]
+/mcp call <server/tool> {json_args}
 /mcp disconnect <name>
 ```
+
+`--cwd <dir>` sets the working directory for the subprocess — useful when the MCP server needs to find files relative to a specific project root.
 
 ```
 /mcp connect fs npx -y @modelcontextprotocol/server-filesystem .
@@ -967,6 +1140,30 @@ Connect external tool servers to give the AI access to filesystems, databases, w
 /mcp call web/fetch {"url": "https://docs.python.org/3/"}
 /mcp tools
 /mcp disconnect fs
+```
+
+**simargl** — semantic file search via task/commit history (see [simargl](https://github.com/szholobetsky/simargl)):
+
+```bash
+pip install simargl
+cd C:/Project/my-app
+simargl index files .
+```
+
+```
+# connect once per session (model loads here, ~30-60s first time)
+/mcp connect simargl simargl-mcp
+
+# search — instant after connect
+/mcp call simargl/find {"query": "add author field to book class", "mode": "file"}
+
+# or use the built-in script
+/script run simargl-find.txt query="add author field to book class" mode=file
+```
+
+If you used a custom `--project` at index time, pass it at connect:
+```
+/mcp connect simargl simargl-mcp --project-id bookcrossing
 ```
 
 See `/doc MCP` for a full list of ready-to-use servers.
@@ -1107,9 +1304,10 @@ Save any useful message as a reusable template and load it later with `{{param}}
 ```
 /prompt save ConvertJavaToPy     # saves last user message as ConvertJavaToPy.txt
 /prompt load                     # numbered list, select by number, fill {{params}} interactively
+/prompt load 2                   # load prompt #2 directly, skipping the selection prompt
 ```
 
-Templates stored in `<install>/.1bcoder/prompts/`. Use `{{keyword}}` placeholders — values are prompted on load.
+Templates stored in `~/.1bcoder/prompts.txt` (one entry per line: `name: text`). Use `{{keyword}}` placeholders — values are prompted interactively on load.
 
 ---
 
@@ -1212,7 +1410,7 @@ workers:
 /script apply team-summarize.txt --param keyword=auth --param task="404 on login"
 ```
 
-Built-in team scripts in `<install>/.1bcoder/scripts/`:
+Built-in team scripts in `~/.1bcoder/scripts/`:
 
 | Script | Worker role |
 |---|---|
@@ -1236,7 +1434,8 @@ Built-in team scripts in `<install>/.1bcoder/scripts/`:
 | `/ctx clear <n>` | Remove last N messages from context |
 | `/ctx cut` | Remove oldest messages until context fits |
 | `/ctx compact` | Ask AI to summarize the conversation, replace context with summary |
-| `/ctx save <file>` | Save full conversation to file |
+| `/ctx compact <N>` | Summarize last N messages in place, replace with one compact block |
+| `/ctx save <file>` | Save full conversation to file (global ctx folder) |
 | `/ctx load <file>` | Restore a saved conversation (bare name resolved from `.1bcoder/ctx/`) |
 | `/ctx list` | List files in `.1bcoder/ctx/` project context library |
 | `/ctx savepoint set` | Mark current position as a savepoint |

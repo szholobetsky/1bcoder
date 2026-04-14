@@ -20,3 +20,10 @@ lm-ol: localhost:11434|qwen3:1.7b|ans/w1.txt openai://localhost:1234|qwen/qwen3-
 
 # mining rig — 3 workers on separate GPUs (different ports)
 rig3: 192.168.0.229:11434|rnj-1:8b|ans/rig1.txt localhost:11434|lfm2.5-thinking:1.2b|ans/rig2.txt openai://localhost:1234|qwen/qwen3-1.7b|ans/rig3.txt
+
+# cluster 4 phones ollama
+ph4f: 192.168.0.201:11434|qwen3.5:2b|ans/ph1.txt 192.168.0.168:11434|gemma3:1b|ans/ph2.txt 192.168.0.124|lfm2.5-thinking:1.2b|ans/ph3.txt 192.168.0.169:11434|nemotron-3-nano:4b|ans/pf4.txt  
+
+ph4c: 192.168.0.201:11434|qwen3.5:2b|ctx 192.168.0.168:11434|gemma3:1b|ctx 192.168.0.124|lfm2.5-thinking:1.2b|ctx 192.168.0.169:11434|nemotron-3-nano:4b|ctx
+
+phsm2c: 192.168.0.201:11434|gemma3:270m|ctx 192.168.0.212:11434|gemma3:270m|ctx 

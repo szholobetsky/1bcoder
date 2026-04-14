@@ -127,7 +127,7 @@ def classify_ref(name: str, text: str) -> str:
 def collect_files(root: str) -> list:
     files = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.')]
         for fname in filenames:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in SCAN_EXTENSIONS:

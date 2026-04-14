@@ -38,7 +38,17 @@ def fix_mermaid(text):
     return re.sub(r'```mermaid\n(.*?)```', fix_block, text, flags=re.DOTALL)
 
 
-text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+if len(sys.argv) > 1 and sys.argv[1]:
+    import os
+    fpath = sys.argv[1]
+    try:
+        with open(fpath, encoding="utf-8") as _f:
+            text = _f.read()
+    except OSError as e:
+        print(f"[mdx] cannot read {fpath}: {e}", file=sys.stderr)
+        sys.exit(1)
+else:
+    text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 text = text.replace('\r\n', '\n')
 text = fix_mermaid(text)
 

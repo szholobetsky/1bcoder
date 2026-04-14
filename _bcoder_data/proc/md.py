@@ -6,7 +6,15 @@ Usage:    /proc run md
 """
 import sys
 
-reply = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+if len(sys.argv) > 1 and sys.argv[1]:
+    try:
+        with open(sys.argv[1], encoding="utf-8") as _f:
+            reply = _f.read()
+    except OSError as e:
+        print(f"[md] cannot read {sys.argv[1]}: {e}", file=sys.stderr)
+        sys.exit(1)
+else:
+    reply = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 
 from rich.console import Console
 from rich.markdown import Markdown

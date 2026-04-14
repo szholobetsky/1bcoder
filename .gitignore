@@ -13,9 +13,19 @@ env/
 dist/
 build/
 *.egg-info/
+old/
 
 # 1bcoder project-local data
 .1bcoder/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
 
 # Logs and debug
 *.log

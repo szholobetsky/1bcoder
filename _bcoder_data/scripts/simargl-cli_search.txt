@@ -1,0 +1,4 @@
+# Search the simargl index
+# Usage: /script run simargl-cli_search.txt mode=task query="your query here"
+# mode: task | file | aggr
+/run simargl search --mode {{mode}} {{query}}

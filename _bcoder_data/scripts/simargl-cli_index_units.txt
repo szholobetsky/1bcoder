@@ -1,0 +1,3 @@
+# Index tasks/commits from SQLite database
+# Usage: /script run simargl-cli_index_units.txt
+/run simargl index units units.db

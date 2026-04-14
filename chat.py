@@ -42,6 +42,30 @@ def _info(msg: str): print(f"{_CYAN}{msg}{_R}")
 def _warn(msg: str): print(f"{_YELL}{msg}{_R}")
 
 
+def _fts_rank(terms: list, file_contents: dict, top_k: int = 10) -> list:
+    """Rank files by BM25 using in-memory FTS5.
+
+    Args:
+        terms: list of search terms
+        file_contents: {rel_path: text} — only pre-filtered candidates
+        top_k: max results to return
+
+    Returns:
+        list of (rel_path, score) sorted best-first (score is raw FTS5 rank, negative)
+    """
+    import sqlite3 as _sqlite3
+    db = _sqlite3.connect(":memory:")
+    db.execute("CREATE VIRTUAL TABLE t USING fts5(path UNINDEXED, content)")
+    db.executemany("INSERT INTO t VALUES (?, ?)", file_contents.items())
+    fts_query = " OR ".join(f'"{t}"' for t in terms)
+    rows = db.execute(
+        "SELECT path, rank FROM t WHERE t MATCH ? ORDER BY rank LIMIT ?",
+        (fts_query, top_k)
+    ).fetchall()
+    db.close()
+    return rows
+
+
 class _Tee:
     """Tee stdout to both terminal and an internal buffer."""
     def __init__(self):
@@ -99,6 +123,7 @@ INSTALL_BCODER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_
 
 SCRIPTS_DIR        = os.path.join(BCODER_DIR, "scripts")
 CTX_DIR            = os.path.join(BCODER_DIR, "ctx")
+PROJECTS_DIR       = os.path.join(BCODER_DIR, "projects")
 GLOBAL_SCRIPTS_DIR = os.path.join(HOME_BCODER_DIR, "scripts")
 PROMPTS_FILE       = os.path.join(HOME_BCODER_DIR, "prompts.txt")
 PROC_DIR           = os.path.join(HOME_BCODER_DIR, "proc")
@@ -121,7 +146,7 @@ PROFILES_FILE        = os.path.join(BCODER_DIR, "profiles.txt")
 GLOBAL_PROFILES_FILE = os.path.join(HOME_BCODER_DIR, "profiles.txt")
 
 DEFAULT_AGENT_TOOLS = [
-    "read", "insert", "save", "patch",
+    "read", "tree", "find", "insert", "save", "patch",
 ]
 
 DEFAULT_AGENT_TOOLS_ADVANCED = [
@@ -168,6 +193,7 @@ new lines
 >>>>>>> REPLACE
 
 Rules:
+- If you don't know the project structure, start with ACTION: /tree
 - Always /read a file before inserting or patching it.
 
 Available tools:
@@ -268,24 +294,37 @@ Commands
     Search filenames and file content for <pattern> (regex supported).
     After showing results, asks "Add results to context?" (Y/n).
     Pass ctx to skip the prompt and inject automatically.
+    Sets {{find_files}} to a comma-separated list of matched file paths.
     Flags: -f filenames only · -c content only · -i case-insensitive
            --ext py  filter by file extension (no dot needed)
+    Directories starting with . are excluded automatically.
     e.g.  /find MyClass
           /find user_id -c -i
           /find config --ext py ctx
           /find \.connect\( -c
+/find <term1> [term2 ...] -r [--ext <ext>]
+    Ranked search using BM25 (in-memory FTS5). Returns top-10 files by relevance.
+    Terms are space- or comma-separated. No regex — plain keyword matching.
+    Sets {{find_files}} to a comma-separated list of matched file paths.
+    e.g.  /find login auth -r
+          /find UserService,register -r
+          /find migration schema -r --ext py
 
 /read <file> [file2 ...] [start-end]
     Inject file(s) into AI context without line numbers (clean text).
     Range (start-end) only applies when reading a single file.
+    Files can be space- or comma-separated (e.g. /read {{find_files}} or /read {{map_files}}).
     e.g.  /read main.py
           /read main.py 10-30
           /read instruction.txt README.md main.py
+          /read {{find_files}}
 
 /readln <file> [file2 ...] [start-end]
     Same as /read but includes line numbers (useful for /patch and /fix).
+    Files can be space- or comma-separated.
     e.g.  /readln main.py
           /readln models.py 40-60
+          /readln {{find_files}}
 
 /edit <file> <line>
     Manually replace a line. Type new content when prompted.
@@ -337,6 +376,7 @@ Commands
 
 /save <file> [file2 ...] [code] [mode]
     Save last AI reply to file(s). Keywords can appear in any order.
+    Files can be space- or comma-separated.
     /save <file>                     — full reply, overwrite
     /save <file> code                — extract first ```...``` block
     /save f1 f2 code                 — extract block 1 → f1, block 2 → f2
@@ -361,27 +401,29 @@ Commands
           /script create fix-bug.txt
           /script create ctx
           /script create ctx my-workflow.txt
-/script show              Display steps of the current script.
+/script show [N]          Display steps of the current script. If N given, open script N from list first.
 /script add <command>     Append a step to the current script.
     e.g.  /script add /fix main.py 2-2 fix indentation
 /script clear             Wipe current script completely.
 /script reset             Unmark all done steps.
 /script reapply [key=value ...]   Reset all done steps then apply the plan automatically.
 /script refresh           Reload script from disk and show contents.
-/script apply [file] [key=value ...]   Run steps one by one (Y/n/q per step).
-/script apply -y [file] [key=value ...]   Run all pending steps automatically.
+/script run <file> [key=value ...]        Run all steps automatically (shorthand for apply -y).
+/script apply [file] [key=value ...]     Run steps one by one (Y/n/q per step).
+/script apply -y [file] [key=value ...]  Run all pending steps automatically.
     Parameters substitute {{key}} placeholders in script steps.
     Missing parameters are prompted interactively.
-    e.g.  /script apply -y collect.txt
+    e.g.  /script run simargl-find.txt query="add author field" mode=file
+          /script apply -y collect.txt
           /script apply fix-fn.txt file=calc.py range=1-4
-          /script apply fix-fn.txt file=calc.py range=1-4 hint="wrong operator"
 
 /prompt save <name>   Save the last user message as a reusable prompt template.
                       Name becomes the filename (no spaces, .txt added automatically).
-/prompt load          Show numbered list of saved prompts, select by number.
+/prompt load [N]      Show numbered list of saved prompts; select by number inline or interactively.
                       {{param}} placeholders are prompted interactively before injecting.
     e.g.  /prompt save ConvertJavaToPy
           /prompt load
+          /prompt load 2
 
 /proc list              List available post-processors (.py files in proc dir).
 /proc run <name> [-f <file>]  Run processor against last LLM reply (or file with -f).
@@ -539,6 +581,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /ctx clear <n>           Remove last N messages from context.
 /ctx cut                 Remove oldest messages until context fits within the limit.
 /ctx compact             Ask AI to summarize the conversation, then replace context with the summary.
+/ctx compact <N>         Summarize last N messages in place, replace them with one compact block.
 /ctx compact savepoint   Summarize only messages since the savepoint, replace them with summary.
 /ctx compact profile: <name>            Use external model (from profile) for summarization.
 /ctx compact savepoint profile: <name>  External model + savepoint scope.
@@ -549,13 +592,26 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /ctx savepoint set       Mark current context position as a savepoint.
 /ctx savepoint rollback  Remove all messages added since the savepoint.
 /ctx savepoint show      Show savepoint position and how many messages have been added since.
-    e.g.  /ctx 16384
-          /ctx clear
-          /ctx clear 3
-          /ctx save ctx.txt
-          /ctx load ctx.txt
-          /ctx savepoint set
-          /ctx savepoint rollback
+
+/ctx compose add <file>       Add ctx file to compose queue (bare name resolved from ctx/ or projects/<key>/).
+/ctx compose add <N,M>        Add by number from last /proj find results.
+/ctx compose add all          Add all /proj find results to queue.
+/ctx compose list                Show compose queue with sizes and accumulated total.
+/ctx compose clear               Clear the compose queue.
+/ctx compose run [output.txt]    Merge queue into one file (or load into context if no output given).
+                                 Deduplication: identical message blocks appear only once in output.
+/ctx compose <f1> <f2> ...       Direct compose without queue — merge files immediately.
+    Files are resolved: bare name → .1bcoder/ctx/ → .1bcoder/projects/<key>/
+    Workflow:
+      /proj find isbn              search projects, results are numbered [1], [2], ...
+      /ctx compose add 1,3      add result #1 and #3 to queue
+      /ctx compose list            review queue
+      /ctx compose run task.ctx    merge → task.ctx
+      /ctx load task.ctx           load into context — LLM wakes up knowing all three files
+    e.g.  /ctx compact 1
+          /ctx compact 3
+          /ctx compose add book-html.txt
+          /ctx compose run task.ctx
 
 /tempctx <N>               Set agent context limit to N tokens (overrides num_ctx for this agent run).
 /tempctx show              Show agent context size (messages + token estimate).
@@ -574,6 +630,8 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /think show         Show <think> blocks in terminal (default).
 /think hide         Hide <think> blocks in terminal.
     include/exclude and show/hide are independent — any combination works.
+    To persist across sessions use /param: /param think_exclude false (include) | true (exclude)
+    then /config save — params are saved and restored automatically.
 
 /param <key> <value>    Set a model parameter sent with every request. Overwrites if already set.
 /param                  Show current params (includes timeout).
@@ -611,9 +669,10 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /host openai://localhost:4000            (LiteLLM)
           /host openai://localhost:1234 -sc
 
-/mcp connect <name> <command>
-    Start an MCP server and connect to it.
+/mcp connect <name> <command> [--cwd <dir>]
+    Start an MCP server and connect to it. --cwd sets the working directory for the subprocess.
     e.g.  /mcp connect fs npx -y @modelcontextprotocol/server-filesystem .
+          /mcp connect simargl simargl-mcp --cwd C:/Project/my-app --project-id default
 /mcp tools [name]
     List tools from all connected servers (or one named server).
 /mcp call <server/tool> [json_args]
@@ -667,6 +726,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /map index [path] [depth]
     Scan project and extract definitions, cross-references into a searchable map.
     Saves to .1bcoder/map.txt. Does NOT inject into context. Run once per session (or after big changes).
+    Directories starting with . are excluded automatically.
     depth 2 (default) — classes, functions, endpoints, tables
     depth 3           — also variables, function parameters, module assignments
     Partial indexing: if path is a subfolder, saves a segment file
@@ -680,6 +740,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
     No query → inject full map (asks confirmation).
     -d 1  filenames only   -d 2  filenames + defines/vars   -d 3  full (default)
     -y skips the "add to context?" prompt (useful in scripts).
+    Sets {{map_files}} to a comma-separated list of matched file paths.
     Token syntax:
       term    filename contains term
       !term   exclude if filename contains term
@@ -827,6 +888,32 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /agent read files plan: models.py, views.py, urls.py
           /agent fix the book model file: steps.md
           /agent implement sharepoint file: plan.md
+
+/proj set <key>              Set active project — creates .1bcoder/projects/<key>/ with project.txt.
+/proj status                 Show active project name and project.txt contents.
+/proj list                   List all projects (newest first). Active project marked with *.
+/proj save <file>            Save current ctx to .1bcoder/projects/<key>/<file>.
+/proj load <file>            Load ctx file from active project (resolves path automatically).
+/proj show                   List ctx files in active project (newest first).
+/proj find <term> [-f|-c]    Search all projects. -f fast: project.txt + filenames (default).
+                             -c content: also grep inside ctx files with line numbers.
+/proj keyword add <k1,k2>    Add keywords to project.txt of active project.
+/proj file add <f1,f2>       Add file paths to project.txt of active project.
+/proj index                  Extract file paths from /read /edit /patch etc. in ctx files → project.txt.
+    project.txt format:
+      Description: <text>
+      Keywords: k1, k2, k3
+      Files:
+      path/to/file.py
+      path/to/other.py
+    Active project is saved in config via /config save and auto-restored on next startup.
+    e.g.  /proj set ABC-123
+          /proj keyword add ppcon, payment, legacy
+          /proj file add models.py, views.py
+          /proj save session1.txt
+          /proj find payment -f
+          /proj find payment -c
+          /config save
 
 /init           Create .1bcoder/ scaffold in current directory (safe to re-run).
 
@@ -1578,11 +1665,12 @@ def _parse_file_arg(raw: str):
 class MCPClient:
     """Minimal MCP client over stdio using LSP-style Content-Length framing."""
 
-    def __init__(self, cmd: str):
+    def __init__(self, cmd: str, cwd: str | None = None):
         self.proc = subprocess.Popen(
             cmd, shell=True,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=cwd,
         )
         self._id = 0
         self._lock = threading.Lock()
@@ -1767,7 +1855,7 @@ _KNOWN_CMDS = [
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
-    "/doc", "/tempctx",
+    "/doc", "/tempctx", "/proj",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -1785,18 +1873,19 @@ _CMD_SPEC = {
     "/bkup":     dict(file_idx=2, kw_idx=1,    keywords=["save", "restore"]),
     "/diff":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/agent":    dict(file_idx=None, kw_idx=1, keywords=["advance", "ask", "fill", "planning"]),
-    "/ctx":      dict(file_idx=None, kw_idx=1, keywords=["clear", "cut", "compact", "save", "load", "savepoint"]),
+    "/ctx":      dict(file_idx=None, kw_idx=1, keywords=["clear", "cut", "compact", "save", "load", "savepoint", "compose", "list"]),
     "/tempctx":      dict(file_idx=None, kw_idx=1, keywords=["clear", "cut", "compact"]),    
     "/think":    dict(file_idx=None, kw_idx=1, keywords=["include", "exclude", "show", "hide"]),
     "/script":     dict(file_idx=None, kw_idx=1, keywords=[
-                      "list", "open", "create", "show", "add",
+                      "list", "open", "create", "show", "run", "add",
                       "clear", "reset", "reapply", "refresh", "apply"]),
     "/map":      dict(file_idx=None, kw_idx=1, keywords=["index", "find", "trace", "deps", "diff", "idiff", "keyword"]),
-    "/prompt":   dict(file_idx=None, kw_idx=1, keywords=["save", "load"]),
+    "/prompt":   dict(file_idx=None, kw_idx=1, keywords=["save", "load", "list", "delete"]),
     "/proc":     dict(file_idx=None, kw_idx=1, keywords=["list", "run", "on", "off", "new"]),
     "/team":     dict(file_idx=None, kw_idx=1, keywords=["list", "show", "new", "run"]),
     "/var":      dict(file_idx=None, kw_idx=1, keywords=["set", "get", "del", "def", "extract", "save", "load"]),
     "/config":   dict(file_idx=None, kw_idx=1, keywords=["save", "load", "show", "auto", "del"]),
+    "/proj":     dict(file_idx=None, kw_idx=1, keywords=["set", "status", "list", "save", "load", "show", "find", "keyword", "file", "index"]),
     "/alias":    dict(file_idx=None, kw_idx=1, keywords=["save", "clear"]),
     "/doc":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
 }
@@ -2069,6 +2158,9 @@ class CoderCLI:
         self._last_input:  str = ""        # last user message or command — ~ expansion
         self._hooks: dict = {}             # /hook — before/after command triggers
         self._mcp: dict = {}
+        self._proj_key: str = ""       # active project key (/proj set)
+        self._compose_queue: list = [] # /ctx compose queue (full resolved paths)
+        self._last_find_results: list = []  # numbered results from last /proj find
         self._history: list[str] = []
         self.cmd_history: list[str] = []   # all /commands typed this session
         # enable readline history if available
@@ -2235,7 +2327,6 @@ class CoderCLI:
     # ── REPL ──────────────────────────────────────────────────────────────────
 
     def run(self):
-        os.system("cls" if sys.platform == "win32" else "clear")
         print()
         print(BANNER)
         print()
@@ -2247,6 +2338,7 @@ class CoderCLI:
         print("  /help for all commands   /init to create .1bcoder/ folder")
         print("  Ctrl+C interrupts stream   /exit to quit")
         print("  <cmd> -> var  capture output into variable   $ = last output")
+        print("  tip: /agent ask <question> to analyze code   /read <file> to load   /tree to explore")
         print()
         _auto_cfg = {}
         for _cfg_path in (CONFIG_FILE, GLOBAL_CONFIG_FILE):
@@ -2459,6 +2551,8 @@ class CoderCLI:
             self._cmd_role(user_input)
         elif user_input.startswith("/config"):
             self._cmd_config(user_input)
+        elif user_input.startswith("/proj"):
+            self._cmd_proj(user_input)
         elif user_input.startswith("/doc"):
             self._cmd_doc(user_input)
         elif user_input.startswith("/"):
@@ -2731,7 +2825,33 @@ advanced_tools =
             self.last_reply = ""
             print(f"[context cleared — params and num_ctx ({self.num_ctx}) preserved]")
             return
+        if parts[1] == "compose":
+            self._ctx_compose(user_input)
+            return
         if parts[1] == "compact":
+            # /ctx compact N — compact last N messages in place
+            if len(parts) > 2 and parts[2].isdigit():
+                n = int(parts[2])
+                if n <= 0 or n > len(self.messages):
+                    print(f"[ctx compact] N must be 1..{len(self.messages)}")
+                    return
+                to_compact = self.messages[-n:]
+                compact_prompt = (
+                    f"Summarize these {n} message(s) into a concise context block. "
+                    "Include: files read, changes made, decisions, key findings. "
+                    "Plain text only. No code fences."
+                )
+                print(f"[ctx compact] summarizing last {n} message(s)...")
+                summary = self._stream_chat(to_compact + [{"role": "user", "content": compact_prompt}])
+                print()
+                if not summary:
+                    print("[ctx compact] failed — context unchanged")
+                    return
+                del self.messages[-n:]
+                self.messages.append({"role": "assistant", "content": f"[compact of {n} message(s)]\n{summary}"})
+                _ok(f"[ctx compact] {n} message(s) → 1 summary")
+                self._last_output = summary
+                return
             # parse: /ctx compact [savepoint] [profile: <name>]
             rest_parts  = parts[2:]
             use_savepoint = "savepoint" in rest_parts
@@ -2833,7 +2953,185 @@ advanced_tools =
             self.num_ctx = int(parts[1])
             print(f"[ctx set to {self.num_ctx} tokens]")
         except ValueError:
-            print("usage: /ctx <number> | cut | compact | save <file> | load <file>")
+            print("usage: /ctx <number> | cut | compact [N] | save <f> | load <f> | compose ...")
+
+    def _resolve_ctx_path(self, fname: str) -> str:
+        """Resolve ctx file path: full path → as-is; bare name → ctx/ then projects/<key>/;
+        prefix/name → projects/prefix/name."""
+        if os.path.isfile(fname):
+            return fname
+        # bare filename — no directory component
+        if not os.path.dirname(fname):
+            candidate = os.path.join(CTX_DIR, fname)
+            if os.path.isfile(candidate):
+                return candidate
+            if self._proj_key:
+                candidate = os.path.join(PROJECTS_DIR, self._proj_key, fname)
+                if os.path.isfile(candidate):
+                    return candidate
+            return fname  # not found — return as-is, caller handles error
+        # has directory component like ABC-123/file.txt
+        candidate = os.path.join(PROJECTS_DIR, fname)
+        if os.path.isfile(candidate):
+            return candidate
+        return fname
+
+    def _ctx_compose(self, user_input: str):
+        """Compose ctx files with content-level dedup.
+
+        /ctx compose add <file|N,M,N-M|all>   add to queue (N refs last /proj find)
+        /ctx compose list                          show queue with sizes
+        /ctx compose clear                         clear queue
+        /ctx compose run [output.txt]              merge queue → file (dedup by content)
+        /ctx compose <f1> <f2> ...                 direct compose → print or load
+        """
+        tokens = user_input.split(None, 2)  # ["/ctx", "compose", rest]
+        rest   = tokens[2].strip() if len(tokens) > 2 else ""
+        sub    = rest.split()[0] if rest else ""
+
+        def _parse_ctx_file(path: str) -> list:
+            """Parse ctx file → list of {role, content} dicts."""
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                _err(f"cannot read {path}: {e}")
+                return []
+            msgs = []
+            current_role = "user"
+            for block in re.split(r'=== (user|assistant|system) ===\n', text):
+                block = block.strip()
+                if not block:
+                    continue
+                if block in ("user", "assistant", "system"):
+                    current_role = block
+                else:
+                    msgs.append({"role": current_role, "content": block})
+            return msgs
+
+        def _queue_size_info():
+            total = sum(os.path.getsize(p) for p in self._compose_queue if os.path.isfile(p))
+            return f"{len(self._compose_queue)} file(s)  /  {total:,} bytes total"
+
+        def _do_append(path: str):
+            resolved = self._resolve_ctx_path(path)
+            if not os.path.isfile(resolved):
+                _err(f"file not found: {path}")
+                return
+            size = os.path.getsize(resolved)
+            self._compose_queue.append(resolved)
+            _ok(f"[compose] + {os.path.basename(resolved)}  ({size:,} bytes)")
+            print(f"[compose] queue: {_queue_size_info()}")
+
+        if sub == "add":
+            arg = rest.split(None, 1)[1].strip() if len(rest.split(None, 1)) > 1 else ""
+            if not arg:
+                print("usage: /ctx compose add <file|N,M|all>")
+                return
+            if arg == "all":
+                if not self._last_find_results:
+                    print("[compose] no /proj find results — run /proj find first")
+                    return
+                for p in self._last_find_results:
+                    _do_append(p)
+            elif re.match(r'^[\d,\s]+$', arg):
+                # comma-separated numbers
+                indices = [int(x.strip()) - 1 for x in arg.split(",") if x.strip().isdigit()]
+                for idx in indices:
+                    if 0 <= idx < len(self._last_find_results):
+                        _do_append(self._last_find_results[idx])
+                    else:
+                        _warn(f"[compose] no result #{idx + 1}")
+            else:
+                _do_append(arg)
+
+        elif sub == "list":
+            if not self._compose_queue:
+                print("[compose] queue is empty")
+                return
+            running = 0
+            for i, p in enumerate(self._compose_queue, 1):
+                size = os.path.getsize(p) if os.path.isfile(p) else 0
+                running += size
+                print(f"  {i}. {os.path.basename(p)}  ({size:,} bytes)  [total: {running:,}]")
+
+        elif sub == "clear":
+            self._compose_queue.clear()
+            _ok("[compose] queue cleared")
+
+        elif sub == "run":
+            run_args = rest.split(None, 1)
+            output = run_args[1].strip() if len(run_args) > 1 else ""
+            if not self._compose_queue:
+                print("[compose] queue is empty — use /ctx compose add first")
+                return
+            self._ctx_compose_merge(self._compose_queue, output)
+
+        elif rest and not sub.startswith(".") and not os.path.sep in sub and sub not in ("add", "list", "clear", "run"):
+            # treat whole rest as space-separated file list (direct mode)
+            files = rest.split()
+            if not files:
+                print("usage: /ctx compose <f1> <f2> ... | append | list | clear | run")
+                return
+            self._ctx_compose_merge(files, "")
+
+        else:
+            print("usage: /ctx compose add <file|N,M|all> | list | clear | run [output.txt]")
+            print("       /ctx compose <f1> <f2> ...   (direct mode)")
+
+    def _ctx_compose_merge(self, file_list: list, output: str):
+        """Merge ctx files with content-level dedup, write to output or load into context."""
+        all_msgs = []
+        seen = set()
+        for path in file_list:
+            resolved = self._resolve_ctx_path(path)
+            if not os.path.isfile(resolved):
+                _warn(f"[compose] skipping missing: {path}")
+                continue
+            msgs = []
+            current_role = "user"
+            try:
+                with open(resolved, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                _err(f"cannot read {resolved}: {e}")
+                continue
+            for block in re.split(r'=== (user|assistant|system) ===\n', text):
+                block = block.strip()
+                if not block:
+                    continue
+                if block in ("user", "assistant", "system"):
+                    current_role = block
+                else:
+                    msgs.append({"role": current_role, "content": block})
+            added = 0
+            for msg in msgs:
+                key = msg["content"]
+                if key not in seen:
+                    seen.add(key)
+                    all_msgs.append(msg)
+                    added += 1
+            skipped = len(msgs) - added
+            print(f"  {os.path.basename(resolved)}: {added} messages added, {skipped} duplicates skipped")
+
+        if not all_msgs:
+            print("[compose] nothing to write")
+            return
+
+        total_chars = sum(len(m["content"]) for m in all_msgs)
+        if output:
+            try:
+                with open(output, "w", encoding="utf-8") as f:
+                    for msg in all_msgs:
+                        f.write(f"=== {msg['role']} ===\n{msg['content']}\n\n")
+                _ok(f"[compose] {len(all_msgs)} messages → {output}  (~{total_chars // 4:,} tokens)")
+                _info(f"  Load with: /ctx load {output}")
+            except OSError as e:
+                _err(f"cannot write {output}: {e}")
+        else:
+            # no output file — load directly into context
+            self.messages.extend(all_msgs)
+            _ok(f"[compose] {len(all_msgs)} messages loaded into context  (~{total_chars // 4:,} tokens)")
 
     def _cmd_tempctx(self, user_input: str):
         """Manage the agent's internal context limit and message history."""
@@ -3073,25 +3371,43 @@ advanced_tools =
 
     def _cmd_find(self, user_input: str):
         tokens = user_input.split()
-        if len(tokens) < 2 or tokens[1] in ("-f", "-c", "-i", "--ext", "ctx"):
-            print("usage: /find <pattern> [-f] [-c] [-i] [--ext <ext>] [ctx]")
+        FLAGS = {"-f", "-c", "-i", "-r", "--ext", "ctx"}
+        if len(tokens) < 2 or tokens[1] in FLAGS:
+            print("usage: /find <pattern> [-f] [-c] [-i] [-r] [--ext <ext>] [ctx]")
             print("  -f   filenames only   -c   content only   -i  case-insensitive")
+            print("  -r   ranked mode: BM25 relevance ranking (multiple terms, comma or space separated)")
             print("  --ext py  restrict to .py files")
             print("  ctx  inject results into AI context")
             return
 
-        pattern_raw = tokens[1]
-        flags_raw   = tokens[2:]
-
-        only_files   = "-f"  in flags_raw
-        only_content = "-c"  in flags_raw
-        case_insens  = "-i"  in flags_raw
-        inject_ctx   = "ctx" in flags_raw
+        only_files   = "-f"  in tokens
+        only_content = "-c"  in tokens
+        case_insens  = "-i"  in tokens
+        ranked       = "-r"  in tokens
+        inject_ctx   = "ctx" in tokens
         ext_filter   = None
-        if "--ext" in flags_raw:
-            ei = flags_raw.index("--ext")
-            if ei + 1 < len(flags_raw):
-                ext_filter = "." + flags_raw[ei + 1].lstrip(".")
+        if "--ext" in tokens:
+            ei = tokens.index("--ext")
+            if ei + 1 < len(tokens):
+                ext_filter = "." + tokens[ei + 1].lstrip(".")
+
+        # collect all non-flag, non-keyword tokens as search terms
+        skip = {"--ext", ext_filter} if ext_filter else {"--ext"}
+        term_tokens = [t for t in tokens[1:]
+                       if t not in FLAGS and t not in skip and t != ext_filter]
+
+        if ranked:
+            # comma-separated terms in a single token (e.g. from {{kw}})
+            terms = []
+            for t in term_tokens:
+                terms.extend(p.strip() for p in t.split(",") if p.strip())
+            if not terms:
+                print("[find] -r requires at least one search term")
+                return
+            self._cmd_find_ranked(terms, ext_filter, inject_ctx)
+            return
+
+        pattern_raw = tokens[1]
 
         try:
             rx_flags = re.IGNORECASE if case_insens else 0
@@ -3111,7 +3427,7 @@ advanced_tools =
         _seen_files: set[str] = set()
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in self._FIND_SKIP_DIRS]
+            dirnames[:] = [d for d in dirnames if d not in self._FIND_SKIP_DIRS and not d.startswith('.')]
             rel_dir = os.path.relpath(dirpath, root)
             if rel_dir in (".", ""):
                 rel_dir = ""
@@ -3190,12 +3506,85 @@ advanced_tools =
         # ── inject into context ───────────────────────────────────────────
         has_results = bool(name_hits or content_hits)
         if has_results:
+            # collect unique files preserving order: content matches first, then name-only hits
+            seen = {}
+            for rel_path, _, _ in content_hits:
+                seen[rel_path] = None
+            for rel_path in name_hits:
+                seen[rel_path] = None
+            self._vars["find_files"] = ",".join(seen)
+            print(f"{_DIM}[find] {{{{find_files}}}} set — {len(seen)} file(s){_R}")
+
             ctx_text = "\n".join(ctx_lines)
             if not inject_ctx:
                 inject_ctx = self._confirm("Add results to context? [Y/n]", ctx_add=ctx_text)
             if inject_ctx and not self._auto_apply:
                 self.messages.append({"role": "user", "content": ctx_text})
                 _ok(f"[find] injected into context ({len(ctx_lines)} lines)")
+
+    # ── /find -r (ranked BM25) ────────────────────────────────────────────────
+
+    def _cmd_find_ranked(self, terms: list, ext_filter, inject_ctx: bool,
+                         search_dir: str = None, label_prefix: str = "find -r"):
+        """BM25-ranked content search via in-memory FTS5."""
+        root = search_dir or WORKDIR
+        terms_lower = [t.lower() for t in terms]
+
+        # ── pre-filter: collect files containing at least one term ────────────
+        candidates: dict = {}  # rel_path → full_text
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in self._FIND_SKIP_DIRS and not d.startswith('.')]
+            for fname in filenames:
+                if ext_filter and not fname.endswith(ext_filter):
+                    continue
+                full = os.path.join(dirpath, fname)
+                try:
+                    with open(full, "rb") as fh:
+                        if b"\x00" in fh.read(8192):
+                            continue
+                    with open(full, encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                    if any(t in text.lower() for t in terms_lower):
+                        rel = os.path.relpath(full, root)
+                        candidates[rel] = text
+                except OSError:
+                    continue
+
+        if not candidates:
+            print(f"  {_DIM}no matches for: {', '.join(terms)}{_R}")
+            return
+
+        # ── rank with FTS5 ────────────────────────────────────────────────────
+        try:
+            ranked = _fts_rank(terms, candidates, top_k=10)
+        except Exception as e:
+            _err(f"FTS5 ranking failed: {e}")
+            return
+
+        # ── render ────────────────────────────────────────────────────────────
+        ext_note = f" [.{ext_filter.lstrip('.')}]" if ext_filter else ""
+        print(f"{_DIM}[{label_prefix}] terms: {_R}{_BOLD}{', '.join(terms)}{_R}"
+              f"{_DIM}  top-{len(ranked)} of {len(candidates)} candidates{ext_note}{_R}")
+
+        ctx_lines = [f"[{label_prefix}] terms: {', '.join(terms)}{ext_note}  "
+                     f"top-{len(ranked)} of {len(candidates)} candidates"]
+
+        for i, (rel_path, score) in enumerate(ranked, 1):
+            # score is negative in FTS5 (lower = better), show as positive rank
+            print(f"  {_DIM}{i:>2}.{_R}  {rel_path}")
+            ctx_lines.append(f"  {i:>2}.  {rel_path}")
+
+        file_list = ",".join(r for r, _ in ranked)
+        self._vars["find_files"] = file_list
+        print(f"\n{_DIM}[find] {{{{find_files}}}} set — {len(ranked)} file(s){_R}")
+        ctx_lines.append(f"\nfiles: {file_list}")
+
+        ctx_text = "\n".join(ctx_lines)
+        if not inject_ctx:
+            inject_ctx = self._confirm("Add results to context? [Y/n]", ctx_add=ctx_text)
+        if inject_ctx and not self._auto_apply:
+            self.messages.append({"role": "user", "content": ctx_text})
+            _ok(f"[find] injected into context")
 
     # ── /read ──────────────────────────────────────────────────────────────────
 
@@ -3206,6 +3595,11 @@ advanced_tools =
             cmd = "/readln" if ln else "/read"
             print(f"usage: {cmd} <file> [file2 ...] [start-end]")
             return
+        # expand comma-separated tokens (e.g. from {{find_files}} or {{map_files}})
+        expanded = []
+        for t in tokens:
+            expanded.extend(p for p in t.split(",") if p)
+        tokens = expanded
         # detect trailing range token (digits-digits), only for single-file use
         start = end = None
         range_re = re.compile(r'^(\d+)-(\d+)$')
@@ -3752,13 +4146,14 @@ advanced_tools =
             "append-below", "append_below", "-ab",
             "add-suffix", "add_suffix",
         }
-        tokens = user_input.split()[1:]
-        if not tokens:
+        raw_tokens = user_input.split()[1:]
+        if not raw_tokens:
             print("usage: /save <file> [code] [overwrite|append-above|append-below|add-suffix]")
             return
         if not self.last_reply:
             print("no AI response yet")
             return
+        tokens = [p for t in raw_tokens for p in t.split(",") if p]
         files = [t for t in tokens if t.lower() not in _MODE_KEYWORDS]
         flags = {t.lower() for t in tokens if t.lower() in _MODE_KEYWORDS}
         if not files:
@@ -3879,16 +4274,11 @@ advanced_tools =
                 print("[no scripts found — use /script create]")
             else:
                 current = self._script_file
-                if global_plans:
-                    print(f"  {_DIM}global scripts:{_R}")
-                    for label, path in global_plans:
-                        marker = " *" if path == current else ""
-                        print(f"  {_DIM}g:{_R} {label}{marker}")
-                if local_plans:
-                    print(f"  {_DIM}project scripts:{_R}")
-                    for label, path in local_plans:
-                        marker = " *" if path == current else ""
-                        print(f"      {label}{marker}")
+                all_plans = [("g", l, p) for l, p in global_plans] + [("l", l, p) for l, p in local_plans]
+                for i, (src, label, path) in enumerate(all_plans, 1):
+                    marker = " *" if path == current else ""
+                    prefix = f"{_DIM}g:{_R} " if src == "g" else "   "
+                    print(f"  {i}. {prefix}{label}{marker}")
 
         elif sub == "open":
             global_plans, local_plans = _list_script_files()
@@ -3952,6 +4342,27 @@ advanced_tools =
                 print(f"[created and opened script: {name}]")
 
         elif sub == "show":
+            # /script show [N] — if N given, open script N from list then show it;
+            # otherwise show current open script
+            global_plans, local_plans = _list_script_files()
+            all_plans = [("g", l, p) for l, p in global_plans] + [("l", l, p) for l, p in local_plans]
+            if rest.strip().isdigit():
+                for i, (src, label, _) in enumerate(all_plans, 1):
+                    prefix = f"{_DIM}g:{_R} " if src == "g" else "   "
+                    print(f"  {i}. {prefix}{label}")
+                try:
+                    idx = int(rest.strip()) - 1
+                    if 0 <= idx < len(all_plans):
+                        src, label, path = all_plans[idx]
+                        self._script_file = path
+                        tag = "global" if src == "g" else "project"
+                        print(f"[opened {tag} script: {label}]")
+                    else:
+                        print("invalid choice")
+                        return
+                except ValueError:
+                    print("invalid choice")
+                    return
             if not _need_script():
                 return
             lines = _load_script(self._script_file)
@@ -4015,7 +4426,30 @@ advanced_tools =
                     tick = "v " if line.startswith("[v]") else ". "
                     print(f"  {i:2}. {tick}{line.replace('[v] ', '', 1)}")
 
-        elif sub == "apply":
+        elif sub == "run":
+            # /script run <file|N> [key=value ...] — shorthand for /script apply -y
+            # N can be a list index matching /script list / /script open / /script show
+            auto_yes, filename, params = _parse_script_apply_args("-y " + rest if rest else "-y")
+            if not filename:
+                print("usage: /script run <file> [key=value ...]")
+                return
+            # resolve numeric index → actual path (same list as /script list|open|show)
+            if filename.isdigit():
+                global_plans, local_plans = _list_script_files()
+                all_plans = [("g", l, p) for l, p in global_plans] + [("l", l, p) for l, p in local_plans]
+                idx = int(filename) - 1
+                if 0 <= idx < len(all_plans):
+                    _, label, resolved_path = all_plans[idx]
+                    # replace the numeric token with the resolved filename in rest
+                    rest = rest.replace(filename, resolved_path, 1)
+                else:
+                    print(f"invalid script index {filename} — use /script list to see available scripts")
+                    return
+            # delegate to apply logic by rewriting sub
+            sub = "apply"
+            rest = "-y " + rest
+
+        if sub == "apply":
             auto_yes, filename, params = _parse_script_apply_args(rest)
             if filename:
                 if os.path.isabs(filename):
@@ -4080,7 +4514,7 @@ advanced_tools =
             _save_script(_reset, self._script_file)
 
         else:
-            print("usage: /script list | open | create | show | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
+            print("usage: /script list | open [N] | create | show [N] | run <file> | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
 
     def _save_prompt(self, name: str, text: str):
         """Save text as a named prompt entry to prompts.txt."""
@@ -4165,7 +4599,11 @@ advanced_tools =
                 return
             for i, (name, text) in enumerate(entries, 1):
                 print(f"  {i}. {name}: {_DIM}{text[:80]}{_R}")
-            raw = self._prompt_input("  type number (Enter to cancel):")
+            # accept number inline: /prompt load 3
+            if rest.strip().isdigit():
+                raw = rest.strip()
+            else:
+                raw = self._prompt_input("  type number (Enter to cancel):")
             if not raw:
                 print("[cancelled]")
                 return
@@ -4178,10 +4616,14 @@ advanced_tools =
                 print("invalid choice")
                 return
             name, text = entries[idx]
-            # fill {{param}} placeholders
+            # fill {{param}} placeholders — use session vars first, prompt only if not set
             keys = sorted(set(re.findall(r'\{\{(\w+)\}\}', text)))
             for key in keys:
-                value = self._prompt_input(f"  {key}:")
+                value = self._vars.get(key, "")
+                if value and value != "NaN":
+                    print(f"  {key}: {value}  (from /var)")
+                else:
+                    value = self._prompt_input(f"  {key}:")
                 if value:
                     text = text.replace(f"{{{{{key}}}}}", value)
             # always show the filled prompt
@@ -4214,7 +4656,7 @@ advanced_tools =
             print(f"[prompt] deleted: {name}")
 
         else:
-            print("usage: /prompt save <name> | /prompt load | /prompt list | /prompt delete <name>")
+            print("usage: /prompt save <name> | /prompt load [N] | /prompt list | /prompt delete <name>")
 
     # ── /proc helpers ──────────────────────────────────────────────────────────
 
@@ -4816,6 +5258,8 @@ advanced_tools =
             lines.append("procs:")
             for p in procs:
                 lines.append(f"  - {p}")
+        if cfg.get('active_project'):
+            lines.append(f"active_project: {cfg['active_project']}")
         return '\n'.join(lines) + '\n' if lines else ''
 
     def _load_config_file(self, path: str = "") -> dict:
@@ -4842,6 +5286,9 @@ advanced_tools =
             if p not in self._proc_active:
                 self._proc_active.append(p)
         self._hooks.update(cfg.get("hooks", {}))
+        if cfg.get("active_project"):
+            self._proj_key = cfg["active_project"]
+            _info(f"[proj] {self._proj_key}")
 
     def _cmd_config(self, user_input: str):
         """Project-level session config saved in .1bcoder/config.yml.
@@ -4901,6 +5348,8 @@ advanced_tools =
             if field is None or field == "hooks":
                 if self._hooks:
                     cfg["hooks"] = dict(self._hooks)
+            if field is None and self._proj_key:
+                cfg["active_project"] = self._proj_key
             try:
                 os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
                 with open(cfg_path, "w", encoding="utf-8") as f:
@@ -4995,6 +5444,444 @@ advanced_tools =
         else:
             print("usage: /config save [file] | load [file] | show [file] | auto on|off | del <target> [name]")
 
+    # ── /proj helpers ────────────────────────────────────────────────────────────
+
+    def _proj_read_project_txt(self, proj_file: str) -> dict:
+        """Parse project.txt → {description, keywords: list, files: list}."""
+        data = {"description": "", "keywords": [], "files": []}
+        if not os.path.isfile(proj_file):
+            return data
+        try:
+            with open(proj_file, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return data
+        section = None
+        for line in lines:
+            stripped = line.rstrip("\n")
+            if stripped.startswith("Description:"):
+                data["description"] = stripped[len("Description:"):].strip()
+                section = None
+            elif stripped.startswith("Keywords:"):
+                kw_str = stripped[len("Keywords:"):].strip()
+                data["keywords"] = [k.strip() for k in kw_str.split(",") if k.strip()]
+                section = None
+            elif stripped.startswith("Files:"):
+                section = "files"
+            elif section == "files" and stripped.strip():
+                data["files"].append(stripped.strip())
+        return data
+
+    def _proj_write_project_txt(self, proj_file: str, data: dict):
+        """Write project.txt from data dict."""
+        lines = [
+            f"Description: {data.get('description', '')}",
+            f"Keywords: {', '.join(data.get('keywords', []))}",
+            "Files:",
+        ]
+        for f in data.get("files", []):
+            lines.append(f)
+        try:
+            with open(proj_file, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as e:
+            _err(f"cannot write project.txt: {e}")
+
+    def _proj_update_keywords(self, new_kws: list):
+        proj_file = os.path.join(PROJECTS_DIR, self._proj_key, "project.txt")
+        data = self._proj_read_project_txt(proj_file)
+        existing = set(data["keywords"])
+        added = [k for k in new_kws if k not in existing]
+        data["keywords"].extend(added)
+        self._proj_write_project_txt(proj_file, data)
+
+    def _proj_update_files(self, new_files: list):
+        proj_file = os.path.join(PROJECTS_DIR, self._proj_key, "project.txt")
+        data = self._proj_read_project_txt(proj_file)
+        existing = set(data["files"])
+        added = [f for f in new_files if f not in existing]
+        data["files"].extend(added)
+        self._proj_write_project_txt(proj_file, data)
+
+    def _proj_index(self):
+        """Extract file paths from command args in ctx files → add to project.txt."""
+        proj_dir = os.path.join(PROJECTS_DIR, self._proj_key)
+        CMD_FILE_RE = re.compile(
+            r'^>?\s*(?:/read|/readln|/edit|/patch|/save|/insert)\s+([\w./\\-]+\.\w{1,6})',
+            re.MULTILINE
+        )
+        found = set()
+        try:
+            ctx_files = [f for f in os.listdir(proj_dir)
+                         if f != "project.txt" and os.path.isfile(os.path.join(proj_dir, f))]
+        except OSError as e:
+            _err(f"cannot read project dir: {e}")
+            return
+        for fname in ctx_files:
+            fpath = os.path.join(proj_dir, fname)
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                for m in CMD_FILE_RE.finditer(text):
+                    found.add(m.group(1))
+            except OSError:
+                pass
+        if not found:
+            print("[proj index] no file references found in ctx files")
+            return
+        self._proj_update_files(sorted(found))
+        _ok(f"[proj index] extracted {len(found)} file(s) → project.txt")
+
+    def _proj_find(self, term: str, mode: str):
+        """Search across all projects in .1bcoder/projects/."""
+        if not os.path.isdir(PROJECTS_DIR):
+            print("[proj] no projects directory")
+            return
+        try:
+            proj_dirs = [e for e in os.scandir(PROJECTS_DIR) if e.is_dir()]
+        except OSError as e:
+            _err(f"cannot read projects: {e}")
+            return
+
+        term_lower = term.lower()
+        found_any = False
+        self._last_find_results = []  # reset for /ctx compose add N
+
+        for proj_entry in sorted(proj_dirs, key=lambda e: e.name):
+            proj_name = proj_entry.name
+            proj_file = os.path.join(proj_entry.path, "project.txt")
+
+            # --- search project.txt ---
+            matches_proj = []
+            data = self._proj_read_project_txt(proj_file)
+            if term_lower in data["description"].lower():
+                matches_proj.append(f"description: {data['description']}")
+            kw_hits = [k for k in data["keywords"] if term_lower in k.lower()]
+            if kw_hits:
+                matches_proj.append(f"keywords: {', '.join(kw_hits)}")
+            file_hits = [f for f in data["files"] if term_lower in f.lower()]
+            if file_hits:
+                matches_proj.append(f"files: {', '.join(file_hits)}")
+
+            # --- search ctx filenames ---
+            ctx_name_hits = []
+            try:
+                ctx_files = [f for f in os.listdir(proj_entry.path)
+                             if f != "project.txt" and os.path.isfile(os.path.join(proj_entry.path, f))]
+            except OSError:
+                ctx_files = []
+            for fname in ctx_files:
+                if term_lower in fname.lower():
+                    ctx_name_hits.append(fname)
+
+            def _register(full_path):
+                n = len(self._last_find_results) + 1
+                self._last_find_results.append(full_path)
+                return n
+
+            if mode == "f":
+                # fast mode: project.txt + filenames only
+                if matches_proj or ctx_name_hits:
+                    found_any = True
+                    parts_out = matches_proj[:]
+                    if ctx_name_hits:
+                        nums = [str(_register(os.path.join(proj_entry.path, f))) for f in ctx_name_hits]
+                        parts_out.append(f"ctx: {', '.join(f'[{n}]{f}' for n, f in zip(nums, ctx_name_hits))}")
+                    print(f"  {proj_name} — {' | '.join(parts_out)}")
+            else:
+                # content mode: also grep inside ctx files
+                content_hits = []
+                for fname in ctx_files:
+                    fpath = os.path.join(proj_entry.path, fname)
+                    try:
+                        with open(fpath, encoding="utf-8", errors="replace") as f:
+                            for lineno, line in enumerate(f, 1):
+                                if term_lower in line.lower():
+                                    content_hits.append((fname, lineno, line.rstrip()))
+                    except OSError:
+                        pass
+
+                if matches_proj or ctx_name_hits or content_hits:
+                    found_any = True
+                    if matches_proj or ctx_name_hits:
+                        parts_out = matches_proj[:]
+                        if ctx_name_hits:
+                            nums = [str(_register(os.path.join(proj_entry.path, f))) for f in ctx_name_hits]
+                            parts_out.append(f"ctx: {', '.join(f'[{n}]{f}' for n, f in zip(nums, ctx_name_hits))}")
+                        print(f"  {proj_name} — {' | '.join(parts_out)}")
+                    # register ctx files hit by content too (if not already registered)
+                    hit_fnames = list(dict.fromkeys(f for f, _, _ in content_hits))
+                    for fname in hit_fnames:
+                        fpath = os.path.join(proj_entry.path, fname)
+                        if fpath not in self._last_find_results:
+                            _register(fpath)
+                    if content_hits:
+                        if not (matches_proj or ctx_name_hits):
+                            print(f"  {proj_name}")
+                        last_fname = None
+                        for fname, lineno, line in content_hits[:20]:
+                            if fname != last_fname:
+                                n = next((i+1 for i, p in enumerate(self._last_find_results)
+                                          if os.path.basename(p) == fname), "?")
+                                print(f"    [{n}] {fname}")
+                                last_fname = fname
+                            print(f"    {lineno:>5}: {line[:120]}")
+
+        # also search .1bcoder/ctx/ filenames and content
+        if os.path.isdir(CTX_DIR):
+            try:
+                ctx_files = [f for f in os.listdir(CTX_DIR)
+                             if os.path.isfile(os.path.join(CTX_DIR, f))]
+            except OSError:
+                ctx_files = []
+            name_hits = [f for f in ctx_files if term_lower in f.lower()]
+            content_hits_ctx = []
+            if mode == "c":
+                for fname in ctx_files:
+                    fpath = os.path.join(CTX_DIR, fname)
+                    try:
+                        with open(fpath, encoding="utf-8", errors="replace") as f:
+                            for lineno, line in enumerate(f, 1):
+                                if term_lower in line.lower():
+                                    content_hits_ctx.append((fname, lineno, line.rstrip()))
+                    except OSError:
+                        pass
+            if name_hits or content_hits_ctx:
+                found_any = True
+                if name_hits:
+                    numbered = [f"[{len(self._last_find_results)+i+1}]{f}" for i, f in enumerate(name_hits)]
+                    for f in name_hits:
+                        self._last_find_results.append(os.path.join(CTX_DIR, f))
+                    print(f"  [ctx/] ctx: {', '.join(numbered)}")
+                if content_hits_ctx:
+                    last_fname = None
+                    for fname, lineno, line in content_hits_ctx[:20]:
+                        if fname != last_fname:
+                            fpath = os.path.join(CTX_DIR, fname)
+                            if fpath not in self._last_find_results:
+                                self._last_find_results.append(fpath)
+                            n = next((i+1 for i, p in enumerate(self._last_find_results)
+                                      if p == fpath), "?")
+                            print(f"    [{n}] ctx/{fname}")
+                            last_fname = fname
+                        print(f"    {lineno:>5}: {line[:120]}")
+
+        if self._last_find_results:
+            print(f"\n  use /ctx compose add <N,M|all> to add to compose queue")
+        if not found_any:
+            print(f"[proj find] no results for '{term}'")
+
+    def _cmd_proj(self, user_input: str):
+        """Project context management — local .1bcoder/projects/<key>/
+
+        /proj set <key>              Set active project (create if needed)
+        /proj status                 Show current project + project.txt
+        /proj list                   List all projects (newest first)
+        /proj save <file>            Save current ctx to project folder
+        /proj show                   List ctx files in current project
+        /proj find <term> [-f|-c]    Search projects: -f fast (default), -c with content
+        /proj keyword add <k1,k2>    Add keywords to project.txt
+        /proj file add <f1,f2>       Add files to project.txt
+        /proj index                  Extract file refs from ctx files → project.txt
+        """
+        parts = user_input.split(None, 2)
+        sub  = parts[1] if len(parts) > 1 else ""
+        rest = parts[2] if len(parts) > 2 else ""
+
+        if sub == "set":
+            key = rest.strip()
+            if not key:
+                print("usage: /proj set <key>")
+                return
+            proj_dir = os.path.join(PROJECTS_DIR, key)
+            try:
+                os.makedirs(proj_dir, exist_ok=True)
+            except OSError as e:
+                _err(f"cannot create project folder: {e}")
+                return
+            proj_file = os.path.join(proj_dir, "project.txt")
+            if not os.path.isfile(proj_file):
+                try:
+                    with open(proj_file, "w", encoding="utf-8") as f:
+                        f.write("Description: \nKeywords: \nFiles:\n")
+                except OSError as e:
+                    _err(f"cannot create project.txt: {e}")
+                    return
+            self._proj_key = key
+            _ok(f"[proj] {key}")
+
+        elif sub == "status":
+            if not self._proj_key:
+                print("[proj] no active project — use /proj set <key>")
+                return
+            proj_dir = os.path.join(PROJECTS_DIR, self._proj_key)
+            proj_file = os.path.join(proj_dir, "project.txt")
+            print(f"[proj] {self._proj_key}  ({proj_dir})")
+            if os.path.isfile(proj_file):
+                with open(proj_file, encoding="utf-8") as f:
+                    print(f.read())
+            else:
+                print("  (no project.txt)")
+
+        elif sub == "list":
+            if not os.path.isdir(PROJECTS_DIR):
+                print("[proj] no projects — use /proj set <key>")
+                return
+            try:
+                entries = [e for e in os.scandir(PROJECTS_DIR) if e.is_dir()]
+            except OSError as e:
+                _err(f"cannot read projects dir: {e}")
+                return
+            if not entries:
+                print("[proj] no projects yet")
+                return
+            entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+            for e in entries:
+                marker = " *" if e.name == self._proj_key else ""
+                proj_file = os.path.join(e.path, "project.txt")
+                desc = ""
+                if os.path.isfile(proj_file):
+                    try:
+                        with open(proj_file, encoding="utf-8") as f:
+                            for line in f:
+                                if line.startswith("Description:"):
+                                    desc = line[len("Description:"):].strip()
+                                    break
+                    except OSError:
+                        pass
+                desc_str = f"  — {desc}" if desc else ""
+                print(f"  {e.name}{marker}{desc_str}")
+
+        elif sub == "save":
+            if not self._proj_key:
+                _err("no active project — use /proj set <key> first")
+                return
+            fname = rest.strip()
+            if not fname:
+                print("usage: /proj save <filename>")
+                return
+            if not self.messages:
+                print("[proj] context is empty — nothing to save")
+                return
+            proj_dir = os.path.join(PROJECTS_DIR, self._proj_key)
+            try:
+                os.makedirs(proj_dir, exist_ok=True)
+            except OSError as e:
+                _err(f"cannot create project folder: {e}")
+                return
+            dest = os.path.join(proj_dir, fname)
+            try:
+                with open(dest, "w", encoding="utf-8") as f:
+                    for msg in self.messages:
+                        f.write(f"=== {msg['role']} ===\n{msg['content']}\n\n")
+                _ok(f"[proj] saved {len(self.messages)} messages → {dest}")
+            except OSError as e:
+                _err(f"cannot save: {e}")
+
+        elif sub == "show":
+            if not self._proj_key:
+                print("[proj] no active project — use /proj set <key>")
+                return
+            proj_dir = os.path.join(PROJECTS_DIR, self._proj_key)
+            if not os.path.isdir(proj_dir):
+                print(f"[proj] project folder not found: {proj_dir}")
+                return
+            try:
+                files = sorted(
+                    [f for f in os.listdir(proj_dir)
+                     if f != "project.txt" and os.path.isfile(os.path.join(proj_dir, f))],
+                    key=lambda f: os.path.getmtime(os.path.join(proj_dir, f)),
+                    reverse=True
+                )
+            except OSError as e:
+                _err(f"cannot list project: {e}")
+                return
+            if not files:
+                print(f"[proj] {self._proj_key} — no ctx files yet")
+                return
+            print(f"[proj] {self._proj_key}  ({len(files)} ctx file(s)):")
+            for fname in files:
+                size = os.path.getsize(os.path.join(proj_dir, fname))
+                print(f"  {fname}  ({size:,} bytes)")
+            print(f"\n  Load: /ctx load {proj_dir}/<filename>")
+
+        elif sub == "find":
+            find_parts = rest.split()
+            if not find_parts:
+                print("usage: /proj find <term> [-f|-c]")
+                return
+            mode = "f"
+            terms = []
+            for p in find_parts:
+                if p in ("-f", "-c"):
+                    mode = p[1:]
+                else:
+                    terms.append(p.lower())
+            if not terms:
+                print("usage: /proj find <term> [-f|-c]")
+                return
+            self._proj_find(" ".join(terms), mode)
+
+        elif sub == "keyword":
+            if not self._proj_key:
+                _err("no active project — use /proj set <key> first")
+                return
+            kw_parts = rest.split(None, 1)
+            if len(kw_parts) < 2 or kw_parts[0] != "add":
+                print("usage: /proj keyword add <k1>, <k2>, ...")
+                return
+            new_kws = [k.strip() for k in kw_parts[1].split(",") if k.strip()]
+            self._proj_update_keywords(new_kws)
+            _ok(f"[proj] keywords added: {', '.join(new_kws)}")
+
+        elif sub == "file":
+            if not self._proj_key:
+                _err("no active project — use /proj set <key> first")
+                return
+            f_parts = rest.split(None, 1)
+            if len(f_parts) < 2 or f_parts[0] != "add":
+                print("usage: /proj file add <f1>, <f2>, ...")
+                return
+            new_files = [f.strip() for f in f_parts[1].split(",") if f.strip()]
+            self._proj_update_files(new_files)
+            _ok(f"[proj] files added: {', '.join(new_files)}")
+
+        elif sub == "index":
+            if not self._proj_key:
+                _err("no active project — use /proj set <key> first")
+                return
+            self._proj_index()
+
+        elif sub == "load":
+            if not self._proj_key:
+                _err("no active project — use /proj set <key> first")
+                return
+            fname = rest.strip()
+            if not fname:
+                print("usage: /proj load <file>")
+                return
+            proj_dir = os.path.join(PROJECTS_DIR, self._proj_key)
+            load_path = os.path.join(proj_dir, fname)
+            if not os.path.isfile(load_path):
+                # fuzzy-match against files in the project directory
+                try:
+                    candidates = [f for f in os.listdir(proj_dir)
+                                  if f != "project.txt" and os.path.isfile(os.path.join(proj_dir, f))]
+                except OSError:
+                    candidates = []
+                fixed = _fuzzy_fix(fname, candidates, cutoff=0.65)
+                if fixed:
+                    _warn(f"[proj] '{fname}' → '{fixed}'")
+                    load_path = os.path.join(proj_dir, fixed)
+                else:
+                    _err(f"file not found in project {self._proj_key}: {fname}")
+                    return
+            self._route(f"/ctx load {load_path}")
+
+        else:
+            print("usage: /proj set <key> | status | list | save <file> | load <file> | show")
+            print("       /proj find <term> [-f|-c] | keyword add <k1,k2> | file add <f1,f2> | index")
+
     def _cmd_doc(self, user_input: str):
         """List or display documentation articles from the doc/ folder."""
         LOCAL_DOC_DIR  = os.path.join(BCODER_DIR, "doc")
@@ -5023,19 +5910,26 @@ advanced_tools =
                 print(f"  {f[:-3]}")
             return
 
-        # find article — local overrides global, case-insensitive, .md optional
-        name = sub if sub.endswith(".md") else sub + ".md"
-        path = None
-        for d in DOC_DIRS:
-            for f in os.listdir(d):
-                if f.lower() == name.lower():
-                    path = os.path.join(d, f)
-                    break
-            if path:
-                break
-        if path is None:
-            _err(f"doc not found: {sub}  (try /doc list)")
+        # direct path: /doc path/to/file.md
+        if os.path.isfile(sub) or (sub.endswith(".md") and os.path.isfile(sub)):
+            path = sub
+        elif os.path.sep in sub or "/" in sub:
+            _err(f"file not found: {sub}")
             return
+        else:
+            # find article — local overrides global, case-insensitive, .md optional
+            name = sub if sub.endswith(".md") else sub + ".md"
+            path = None
+            for d in DOC_DIRS:
+                for f in os.listdir(d):
+                    if f.lower() == name.lower():
+                        path = os.path.join(d, f)
+                        break
+                if path:
+                    break
+            if path is None:
+                _err(f"doc not found: {sub}  (try /doc list)")
+                return
 
         try:
             with open(path, encoding="utf-8") as fh:
@@ -5239,12 +6133,19 @@ advanced_tools =
         sub = parts[1] if len(parts) > 1 else ""
         if sub == "connect":
             if len(parts) < 4:
-                print("usage: /mcp connect <name> <command>")
+                print("usage: /mcp connect <name> <command> [--cwd <dir>]")
                 return
             name, cmd = parts[2], parts[3]
-            print(f"[mcp] connecting to {name}...")
+            # extract --cwd <dir> from the command string if present
+            cwd = None
+            import re as _re
+            m = _re.search(r'--cwd\s+(\S+)', cmd)
+            if m:
+                cwd = m.group(1)
+                cmd = cmd[:m.start()].rstrip() + cmd[m.end():]
+            print(f"[mcp] connecting to {name}..." + (f" (cwd={cwd})" if cwd else ""))
             try:
-                client = MCPClient(cmd)
+                client = MCPClient(cmd, cwd=cwd)
                 if name in self._mcp:
                     self._mcp[name].close()
                 self._mcp[name] = client
@@ -5310,7 +6211,7 @@ advanced_tools =
             else:
                 print(f"[mcp] unknown server '{name}'")
         else:
-            print("usage: /mcp connect <name> <cmd> | tools [name] | call <server/tool> [json] | disconnect <name>")
+            print("usage: /mcp connect <name> <cmd> [--cwd <dir>] | tools [name] | call <server/tool> {json} | disconnect <name>")
 
     def _cmd_parallel(self, user_input: str):
         import concurrent.futures
@@ -6081,6 +6982,11 @@ advanced_tools =
 
         print(result)
         print(f"\n[map] {len(hits)} match(es)")
+
+        paths = [b.split('\n')[0].strip() for b in hits]
+        self._vars["map_files"] = ",".join(paths)
+        print(f"[map] {{{{map_files}}}} set — {len(paths)} file(s)")
+
         if auto_yes or self._confirm("  add to context? [Y/n]:", ctx_add=result):
             if not self._auto_apply:
                 self.messages.append({"role": "user",
