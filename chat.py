@@ -42,6 +42,85 @@ def _info(msg: str): print(f"{_CYAN}{msg}{_R}")
 def _warn(msg: str): print(f"{_YELL}{msg}{_R}")
 
 
+def _multiline_input() -> str:
+    """Open a multi-line text editor in the terminal.
+
+    Uses prompt_toolkit if available (Alt+Enter / Esc→Enter to submit).
+    Falls back to a line-by-line collector terminated by '/end' on its own line.
+    Returns the composed text, or empty string on Ctrl+C / cancel.
+    """
+    try:
+        from prompt_toolkit import prompt as _pt_prompt
+        from prompt_toolkit.key_binding import KeyBindings as _KB
+
+        kb = _KB()
+        _QUICKSAVE_FILE = os.path.join('.1bcoder', 'task.txt')
+
+        @kb.add('c-d')
+        def _submit(event):
+            event.current_buffer.validate_and_handle()
+
+        @kb.add('enter')
+        def _enter_or_end(event):
+            buf = event.current_buffer
+            current_line = buf.document.current_line.strip()
+            if current_line in ('/end', '/save') or current_line.startswith('/save '):
+                buf.validate_and_handle()
+            else:
+                buf.newline()
+
+        print(f"[multiline — Enter = new line · Ctrl+D or /end to submit · /save to save to .1bcoder/task.txt · /save filename.txt for custom name · Ctrl+C to cancel]")
+        try:
+            text = _pt_prompt('··· ', multiline=True, key_bindings=kb)
+        except KeyboardInterrupt:
+            print()
+            return ""
+
+        # strip trailing empty lines, check for /end or /save command
+        lines = text.split('\n')
+        while lines and lines[-1].strip() == '':
+            lines.pop()
+
+        save_filename = None
+        if lines:
+            last = lines[-1].strip()
+            if last == '/end':
+                lines.pop()
+            elif last == '/save':
+                save_filename = ''
+                lines.pop()
+            elif last.startswith('/save '):
+                save_filename = last[6:].strip()
+                lines.pop()
+
+        text = '\n'.join(lines)
+
+        if save_filename == '' and text.strip():
+            os.makedirs('.1bcoder', exist_ok=True)
+            with open(_QUICKSAVE_FILE, 'w', encoding='utf-8') as _f:
+                _f.write(text)
+            print(f"  [text] saved → {_QUICKSAVE_FILE}")
+        elif save_filename and text.strip():
+            with open(save_filename, 'w', encoding='utf-8') as _f:
+                _f.write(text)
+            print(f"  [text] saved → {save_filename}")
+        return text
+
+    except ImportError:
+        print("[multiline — type /end on its own line to submit · Ctrl+C to cancel]")
+        lines = []
+        while True:
+            try:
+                line = input("··· ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return ""
+            if line.strip() == "/end":
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
+
 def _fts_rank(terms: list, file_contents: dict, top_k: int = 10) -> list:
     """Rank files by BM25 using in-memory FTS5.
 
@@ -325,6 +404,18 @@ Commands
     e.g.  /readln main.py
           /readln models.py 40-60
           /readln {{find_files}}
+
+/text
+    Open a multi-line text editor and send the composed text to the AI.
+    Enter = new line. To submit, use one of:
+      Ctrl+D                — submit without saving
+      /end                  — submit without saving (type on its own line, then Enter)
+      /save                 — save to .1bcoder/task.txt and submit
+      /save <filename>      — save to custom file and submit
+    Ctrl+C cancels without sending.
+    If prompt_toolkit is installed: full editing with arrow keys, Home/End, scroll.
+    Fallback (no prompt_toolkit): same commands work line by line.
+    Useful for pasting multi-paragraph task descriptions, code snippets, or long instructions.
 
 /edit <file> <line>
     Manually replace a line. Type new content when prompted.
@@ -1855,7 +1946,7 @@ _KNOWN_CMDS = [
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
-    "/doc", "/tempctx", "/proj",
+    "/doc", "/tempctx", "/proj", "/text", "/role", "/ask",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -2547,6 +2638,8 @@ class CoderCLI:
             self._cmd_team(user_input)
         elif user_input.startswith("/var"):
             self._cmd_var(user_input)
+        elif user_input.startswith("/text"):
+            self._cmd_note()
         elif user_input.startswith("/role"):
             self._cmd_role(user_input)
         elif user_input.startswith("/config"):
@@ -4912,6 +5005,26 @@ advanced_tools =
 
         else:
             print("usage: /proc list | run <name> | on <name> | off | new <name>")
+
+    # ── /text ───────────────────────────────────────────────────────────────────
+
+    def _cmd_note(self):
+        """Open multi-line editor, then send the composed text to the AI."""
+        text = _multiline_input()
+        if not text.strip():
+            print("[note] empty — nothing sent")
+            return
+        self.messages.append({"role": "user", "content": text})
+        self._sep("AI")
+        reply = self._stream_chat(self.messages)
+        if reply:
+            self.last_reply = reply
+            self._last_output = reply
+            self.messages.append({"role": "assistant", "content": reply})
+            for _proc in self._proc_active:
+                self._run_proc(_proc, auto=True)
+        elif self.messages:
+            self.messages.pop()
 
     # ── /var ────────────────────────────────────────────────────────────────────
 

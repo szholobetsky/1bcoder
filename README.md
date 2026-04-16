@@ -288,6 +288,31 @@ Examples:
 
 ## Command Reference
 
+### Multi-line input
+
+`/text` opens a full multi-line editor inside the terminal and sends the composed text to the AI as a regular message.
+
+| Key / Command | Action |
+|---|---|
+| Enter | New line |
+| Ctrl+D | Submit without saving |
+| `/end` on its own line + Enter | Submit without saving |
+| `/save` on its own line + Enter | Save to `.1bcoder/task.txt` and submit |
+| `/save filename.txt` on its own line + Enter | Save to custom file and submit |
+| Ctrl+C | Cancel without sending |
+
+Requires `prompt_toolkit` for full editing (arrow keys, Home/End, scroll). Falls back to plain line-by-line input if not installed.
+
+```
+> /text
+··· Describe the bug in detail here.
+··· Paste stack traces, requirements, anything long.
+··· /save
+  [text] saved → .1bcoder/task.txt
+```
+
+---
+
 ### File operations
 
 | Command | Description |
