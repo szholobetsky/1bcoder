@@ -16,7 +16,8 @@ if len(sys.argv) > 1 and sys.argv[1]:
 else:
     reply = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 
+import io
 from rich.console import Console
 from rich.markdown import Markdown
 
-Console().print(Markdown(reply))
+Console(file=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")).print(Markdown(reply))

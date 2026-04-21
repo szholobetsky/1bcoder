@@ -518,6 +518,7 @@ Commands
 
 /proc list              List available post-processors (.py files in proc dir).
 /proc run <name> [-f <file>]  Run processor against last LLM reply (or file with -f).
+/proc run <name> translated   Run processor against last translated reply (from /translate).
 /proc on <name>         Persistent mode: run processor after every LLM reply automatically.
 /proc off               Stop persistent processor.
 /proc before on <name>  Before-proc: run processor BEFORE every LLM call to enrich agent context.
@@ -572,6 +573,28 @@ Commands
           /proc run md
           # render last reply as Markdown + LaTeX + Mermaid in browser
           /proc run mdx
+          # render translated reply in browser (after /translate last or with auto-translate on)
+          /proc run mdx translated
+
+/translate setup <lang> [online|mini|offline|lm] [host <url>] [model <name>]
+/translate on             Enable translation (uses saved language and mode).
+/translate off            Disable translation.
+/translate status         Show current state (lang, mode, enabled).
+/translate lang <code>    Change language.
+/translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]
+/translate last [mode online|mini|offline|lm] [lang <code>]  Retranslate last reply.
+    online  = Google Translate — WARNING: sends text to Google, not for confidential projects
+    mini    = argostranslate (local, ~100MB packages, fully private)
+    offline = NLLB-200 ctranslate2 (local, ~2.4GB download, ~600MB after conversion download, better quality, no model switch)
+    lm      = local/remote Ollama model (fully private, configurable host + model)
+    Language codes: uk (Ukrainian), de (German), fr (French), pl (Polish), es (Spanish), hi (Hindi)
+    Full list: /doc translate
+    Config stored globally in ~/.1bcoder/translate.json — persists across sessions.
+    e.g.  /translate setup uk lm host 192.168.0.5:11434 model translategemma:4b
+          /translate setup uk offline
+          /translate last
+          /translate last mode lm lang de
+          /translate off
 
 /var save <file>            Save all session variables to a key=value file (auto adds .var if no ext).
                              First line is always "# <description>" — set with /var set description=...
@@ -1946,7 +1969,7 @@ _KNOWN_CMDS = [
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
-    "/doc", "/tempctx", "/proj", "/text", "/role", "/ask",
+    "/doc", "/tempctx", "/proj", "/text", "/role", "/ask", "/translate",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -1979,6 +2002,7 @@ _CMD_SPEC = {
     "/proj":     dict(file_idx=None, kw_idx=1, keywords=["set", "status", "list", "save", "load", "show", "find", "keyword", "file", "index"]),
     "/alias":    dict(file_idx=None, kw_idx=1, keywords=["save", "clear"]),
     "/doc":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
+    "/translate": dict(file_idx=None, kw_idx=1, keywords=["setup", "on", "off", "status", "lang", "mode", "last"]),
 }
 
 
@@ -2222,6 +2246,7 @@ class CoderCLI:
         self.models = models
         self.messages = []
         self.last_reply = ""
+        self.last_translated_reply = ""
         self.think_in_ctx = False  # False = strip <think> from context (default)
         self.think_show   = True   # True = show <think> blocks in terminal (default)
         self.num_ctx = NUM_CTX
@@ -2443,6 +2468,7 @@ class CoderCLI:
             _session_cfg = {k: v for k, v in _auto_cfg.items() if k not in ("host", "model")}
             self._apply_config(_session_cfg)
             print()
+        self._translate_autoload()
         while True:
             try:
                 self._print_status()
@@ -2600,6 +2626,8 @@ class CoderCLI:
             self._cmd_script(user_input)
         elif user_input.startswith("/prompt"):
             self._cmd_prompt(user_input)
+        elif user_input.startswith("/translate"):
+            self._cmd_translate(user_input)
         elif user_input.startswith("/proc"):
             self._cmd_proc(user_input)
         elif user_input.startswith("/mcp"):
@@ -2658,15 +2686,37 @@ class CoderCLI:
             else:
                 _err(f"unknown command: /{name}  (type /help for commands)")
         else:
-            self.messages.append({"role": "user", "content": user_input})
+            _tr_cfg = self._translate_load_cfg() if os.path.isfile(self._TRANSLATE_CFG) else {}
+            _tr_on  = _tr_cfg.get("enabled") and _tr_cfg.get("lang") and _tr_cfg.get("lang") != "en"
+            _tr_lang = _tr_cfg.get("lang", "en") if _tr_on else "en"
+            msg_content = user_input
+            if _tr_on:
+                _translated_input = self._translate_run(user_input, _tr_lang, "en")
+                if _translated_input:
+                    msg_content = _translated_input
+                    print(f"  [{_tr_lang}→en] {msg_content}")
+                else:
+                    print(f"  [{_tr_lang}→en] [translation failed — sending original]")
+            self.messages.append({"role": "user", "content": msg_content})
             self._sep("AI")
             reply = self._stream_chat(self.messages)
             if reply:
                 self.last_reply = reply
                 self._last_output = reply
                 self.messages.append({"role": "assistant", "content": reply})
-                for _proc in self._proc_active:
-                    self._run_proc(_proc, auto=True)
+                if _tr_on:
+                    print(f"\n[translating en → {_tr_lang}...]", end="", flush=True)
+                    translated_reply = self._translate_run(reply, "en", _tr_lang)
+                    print(f"\r\033[K{_LBLUE}─── {_tr_lang.upper()} ───{_R}")
+                    if translated_reply:
+                        print(translated_reply)
+                        self._last_output = translated_reply
+                        self.last_translated_reply = translated_reply
+                    else:
+                        print("[translation failed]")
+                else:
+                    for _proc in self._proc_active:
+                        self._run_proc(_proc, auto=True)
             elif self.messages:
                 self.messages.pop()
 
@@ -4533,14 +4583,16 @@ advanced_tools =
                 idx = int(filename) - 1
                 if 0 <= idx < len(all_plans):
                     _, label, resolved_path = all_plans[idx]
-                    # replace the numeric token with the resolved filename in rest
-                    rest = rest.replace(filename, resolved_path, 1)
+                    # forward slashes: shlex.split strips backslashes on Windows
+                    rest = f"-y {resolved_path.replace(os.sep, '/')}"
                 else:
                     print(f"invalid script index {filename} — use /script list to see available scripts")
                     return
-            # delegate to apply logic by rewriting sub
+            else:
+                rest = "-y " + rest
+            # delegate to apply logic; flag reset so apply starts fresh
             sub = "apply"
-            rest = "-y " + rest
+            _script_run_reset = True
 
         if sub == "apply":
             auto_yes, filename, params = _parse_script_apply_args(rest)
@@ -4559,6 +4611,9 @@ advanced_tools =
                 self._script_file = path
             elif not _need_script():
                 return
+            if locals().get("_script_run_reset"):
+                _raw = _load_script(self._script_file)
+                _save_script([l[4:] if l.startswith("[v] ") else l for l in _raw], self._script_file)
             lines = _load_script(self._script_file)
             pending = [(i, l.rstrip("\n")) for i, l in enumerate(lines)
                        if not l.startswith("[v]") and not l.strip().startswith("#")]
@@ -4760,14 +4815,21 @@ advanced_tools =
         auto=False — manual /proc run: confirm ACTION, ask to inject result.
         Returns captured stdout or "" on failure.
         """
-        if input_text is None:
-            if not self.last_reply:
-                print("[proc] no LLM reply yet")
-                return ""
-            input_text = self.last_reply
         parts = name.split()
         name_only = parts[0]
-        extra_args = parts[1:]
+        extra_args = [a for a in parts[1:] if a != "translated"]
+        use_translated = "translated" in parts[1:]
+        if input_text is None:
+            if use_translated:
+                if not self.last_translated_reply:
+                    print("[proc] no translated reply yet — run /translate last first")
+                    return ""
+                input_text = self.last_translated_reply
+            else:
+                if not self.last_reply:
+                    print("[proc] no LLM reply yet")
+                    return ""
+                input_text = self.last_reply
         fname = name_only if name_only.endswith(".py") else name_only + ".py"
         path = None
         for d in (PROC_DIR, LOCAL_PROC_DIR):
@@ -4876,6 +4938,436 @@ advanced_tools =
                 print("[proc] injected")
 
         return stdout
+
+    # ── /translate ──────────────────────────────────────────────────────────
+
+    _TRANSLATE_CFG = os.path.join(os.path.expanduser("~"), ".1bcoder", "translate.json")
+
+    def _translate_load_cfg(self) -> dict:
+        try:
+            with open(self._TRANSLATE_CFG, encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            print(f"[translate] cannot read config: {e}")
+            return {}
+
+    def _translate_save_cfg(self, cfg: dict):
+        os.makedirs(os.path.dirname(self._TRANSLATE_CFG), exist_ok=True)
+        with open(self._TRANSLATE_CFG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    def _translate_run(self, text: str, from_lang: str, to_lang: str, mode: str = "") -> str:
+        if not mode:
+            mode = self._translate_load_cfg().get("mode", "online")
+        try:
+            if mode == "online":
+                from deep_translator import GoogleTranslator as _GT
+                return _GT(source=from_lang, target=to_lang).translate(text)
+            elif mode == "lm":
+                cfg = self._translate_load_cfg()
+                lm_timeout = int(cfg.get("lm_timeout", 120))
+                lm_host  = cfg.get("lm_host",  "localhost:11434")
+                lm_model = cfg.get("lm_model", "translategemma:4b")
+                import urllib.request as _ur, json as _j
+                _LANG_NAMES = {
+                    "af":"Afrikaans","am":"Amharic","ar":"Arabic","az":"Azerbaijani",
+                    "be":"Belarusian","bg":"Bulgarian","bn":"Bengali","bs":"Bosnian",
+                    "ca":"Catalan","cs":"Czech","cy":"Welsh","da":"Danish","de":"German",
+                    "el":"Greek","en":"English","eo":"Esperanto","es":"Spanish","et":"Estonian",
+                    "eu":"Basque","fa":"Persian","fi":"Finnish","fr":"French","ga":"Irish",
+                    "gl":"Galician","gu":"Gujarati","ha":"Hausa","he":"Hebrew","hi":"Hindi",
+                    "hr":"Croatian","hu":"Hungarian","hy":"Armenian","id":"Indonesian",
+                    "ig":"Igbo","is":"Icelandic","it":"Italian","ja":"Japanese","ka":"Georgian",
+                    "kk":"Kazakh","km":"Khmer","kn":"Kannada","ko":"Korean","ky":"Kyrgyz",
+                    "lo":"Lao","lt":"Lithuanian","lv":"Latvian","mg":"Malagasy","mk":"Macedonian",
+                    "ml":"Malayalam","mn":"Mongolian","mr":"Marathi","ms":"Malay","mt":"Maltese",
+                    "my":"Burmese","ne":"Nepali","nl":"Dutch","no":"Norwegian","ny":"Chichewa",
+                    "pa":"Punjabi","pl":"Polish","ps":"Pashto","pt":"Portuguese","ro":"Romanian",
+                    "ru":"Russian","sd":"Sindhi","si":"Sinhala","sk":"Slovak","sl":"Slovenian",
+                    "sn":"Shona","so":"Somali","sq":"Albanian","sr":"Serbian","st":"Sesotho",
+                    "sv":"Swedish","sw":"Swahili","ta":"Tamil","te":"Telugu","tg":"Tajik",
+                    "th":"Thai","tl":"Filipino","tr":"Turkish","uk":"Ukrainian","ur":"Urdu",
+                    "uz":"Uzbek","vi":"Vietnamese","xh":"Xhosa","yo":"Yoruba",
+                    "zh-cn":"Chinese","zh-tw":"Chinese Traditional","zu":"Zulu",
+                }
+                src_name = _LANG_NAMES.get(from_lang.lower(), from_lang)
+                tgt_name = _LANG_NAMES.get(to_lang.lower(), to_lang)
+                prompt = (
+                    f"You are a professional {src_name} ({from_lang}) to {tgt_name} ({to_lang}) translator. "
+                    f"Your goal is to accurately convey the meaning and nuances of the original {src_name} text "
+                    f"while adhering to {tgt_name} grammar, vocabulary, and cultural sensitivities.\n"
+                    f"Produce only the {tgt_name} translation, without any additional explanations or commentary. "
+                    f"Please translate the following {src_name} text into {tgt_name}:\n\n{text}"
+                )
+                # parse host prefix: openai:// → OpenAI-compatible, ollama:// or plain → Ollama
+                if lm_host.startswith("openai://"):
+                    base = lm_host[len("openai://"):]
+                    url  = f"http://{base}/v1/chat/completions"
+                    is_translategemma = "translategemma" in lm_model.lower()
+                    content = [{"type": "text", "source_lang_code": from_lang,
+                                "target_lang_code": to_lang, "text": text}] if is_translategemma else prompt
+                    payload_dict = {
+                        "model": lm_model,
+                        "messages": [{"role": "user", "content": content}],
+                        "stream": False,
+                        "temperature": 0.1,
+                    }
+                    payload = _j.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+                    req = _ur.Request(url, payload, {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer lm-studio",
+                    })
+                    try:
+                        with _ur.urlopen(req, timeout=lm_timeout) as resp:
+                            return _j.loads(resp.read())["choices"][0]["message"]["content"].strip()
+                    except _ur.HTTPError as e:
+                        body = e.read().decode("utf-8", errors="replace")
+                        raise RuntimeError(f"HTTP {e.code}: {body[:300]}")
+                else:
+                    base = lm_host[len("ollama://"):] if lm_host.startswith("ollama://") else lm_host
+                    url  = f"http://{base}/api/generate"
+                    payload = _j.dumps({"model": lm_model, "prompt": prompt, "stream": False}, ensure_ascii=False).encode("utf-8")
+                    req = _ur.Request(url, payload, {"Content-Type": "application/json"})
+                    try:
+                        with _ur.urlopen(req, timeout=lm_timeout) as resp:
+                            raw = resp.read()
+                            data = _j.loads(raw)
+                            return data["response"].strip()
+                    except _ur.HTTPError as e:
+                        body = e.read().decode("utf-8", errors="replace")
+                        raise RuntimeError(f"HTTP {e.code} from {url}: {body[:300]}")
+                    except _ur.URLError as e:
+                        raise RuntimeError(f"cannot connect to {url}: {e.reason}")
+            elif mode == "offline":
+                import ctranslate2, sentencepiece as _spm, os as _os
+                _NLLB_DIR = _os.path.join(_os.path.expanduser("~"), ".1bcoder", "nllb-200")
+                _SP_PATH  = _os.path.join(_NLLB_DIR, "sentencepiece.bpe.model")
+                if not _os.path.isdir(_NLLB_DIR):
+                    raise RuntimeError(f"NLLB model not found at {_NLLB_DIR} — run /translate setup mode:offline to download")
+                _FLORES = {
+                    "en": "eng_Latn", "uk": "ukr_Cyrl", "de": "deu_Latn", "fr": "fra_Latn",
+                    "es": "spa_Latn", "pl": "pol_Latn", "ru": "rus_Cyrl", "zh": "zho_Hans",
+                    "zh-CN": "zho_Hans", "zh-TW": "zho_Hant", "ja": "jpn_Jpan", "ko": "kor_Hang",
+                    "ar": "arb_Arab", "hi": "hin_Deva", "tr": "tur_Latn", "it": "ita_Latn",
+                    "pt": "por_Latn", "nl": "nld_Latn", "cs": "ces_Latn", "sk": "slk_Latn",
+                    "ro": "ron_Latn", "hu": "hun_Latn", "sv": "swe_Latn", "da": "dan_Latn",
+                    "fi": "fin_Latn", "no": "nob_Latn", "bg": "bul_Cyrl", "hr": "hrv_Latn",
+                    "sr": "srp_Cyrl", "vi": "vie_Latn", "id": "ind_Latn", "ms": "zsm_Latn",
+                    "fa": "pes_Arab", "he": "heb_Hebr", "th": "tha_Thai",
+                }
+                src_flores = _FLORES.get(from_lang, f"{from_lang}_Latn")
+                tgt_flores = _FLORES.get(to_lang,   f"{to_lang}_Latn")
+                sp = _spm.SentencePieceProcessor()
+                sp.Load(_SP_PATH)
+                translator = ctranslate2.Translator(_NLLB_DIR, device="cpu")
+
+                def _translate_chunk(chunk):
+                    toks = sp.encode(chunk, out_type=str)
+                    src = [src_flores] + toks + ["</s>"]
+                    res = translator.translate_batch(
+                        [src],
+                        target_prefix=[[tgt_flores]],
+                        max_decoding_length=512,
+                        repetition_penalty=1.3,
+                        beam_size=4,
+                    )
+                    return sp.decode(res[0].hypotheses[0][1:])
+
+                # translate line by line — NLLB is sentence-level, long input causes repetition
+                lines = text.split("\n")
+                out_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        out_lines.append("")
+                    else:
+                        out_lines.append(_translate_chunk(stripped))
+                return "\n".join(out_lines)
+            else:
+                import argostranslate.translate as _at
+                return _at.translate(text, from_lang, to_lang)
+        except Exception as e:
+            print(f"[translate] error ({mode}): {e}")
+            return None
+
+    def _translate_activate(self):
+        pass  # translation is handled inline in the main loop via translate.json
+
+    def _translate_deactivate(self):
+        pass  # translation is handled inline in the main loop via translate.json
+
+    def _translate_autoload(self):
+        cfg = self._translate_load_cfg()
+        if cfg.get("enabled") and cfg.get("lang"):
+            mode = cfg.get("mode", "mini")
+            print(f"  [translate] on — {cfg['lang']} ↔ en ({mode})")
+
+    def _cmd_translate(self, user_input: str):
+        """
+/translate setup [lang:uk] [mode:lm] [host:<url>] [model:<name>] [profile:<name>]
+                  All params optional — unspecified ones keep existing values.
+/translate on             Enable translation (uses saved language and mode).
+/translate off            Disable translation.
+/translate status         Show current state.
+/translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]
+
+Language codes: uk (Ukrainian), de (German), fr (French), pl (Polish), es (Spanish), zh (Chinese)
+Modes: online  = Google Translate — good quality, needs internet, sends text to Google servers
+       mini    = argostranslate — fully local, ~100MB packages per language pair
+       offline = NLLB-200 ctranslate2 — fully local, ~2.4GB download, ~600MB after conversion download, better quality
+       lm      = local/remote Ollama — fully private, uses dedicated translation model
+Config stored in ~/.1bcoder/translate.json
+        """
+        parts = user_input.split(None, 3)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub == "status":
+            cfg = self._translate_load_cfg()
+            if not cfg:
+                print("[translate] not configured — run /translate setup <lang>")
+                return
+            mode = cfg.get("mode", "mini")
+            print(f"  lang    : {cfg.get('lang', '?')}")
+            print(f"  mode    : {mode}")
+            if mode == "lm":
+                print(f"  lm_host   : {cfg.get('lm_host', 'localhost:11434')}")
+                print(f"  lm_model  : {cfg.get('lm_model', 'translategemma:4b')}")
+                print(f"  lm_timeout: {cfg.get('lm_timeout', 120)}s")
+            print(f"  enabled : {'yes' if cfg.get('enabled') else 'no'}")
+            if mode == "online":
+                print("  WARNING : online mode sends text to Google servers")
+            return
+
+        if sub == "off":
+            cfg = self._translate_load_cfg()
+            cfg["enabled"] = False
+            self._translate_save_cfg(cfg)
+            print("[translate] off")
+            return
+
+        if sub == "on":
+            cfg = self._translate_load_cfg()
+            if not cfg.get("lang"):
+                print("[translate] no language set — run /translate setup <lang> first")
+                return
+            cfg["enabled"] = True
+            self._translate_save_cfg(cfg)
+            mode = cfg.get("mode", "mini")
+            print(f"[translate] on — {cfg['lang']} ↔ en ({mode})")
+            return
+
+        if sub == "mode":
+            rest_tokens = " ".join(parts[2:]).split() if len(parts) > 2 else []
+            mode = rest_tokens[0].lower() if rest_tokens else ""
+            if mode not in ("online", "mini", "offline", "lm"):
+                print("usage: /translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]")
+                return
+            cfg = self._translate_load_cfg()
+            cfg["mode"] = mode
+            if mode == "lm":
+                # parse optional: profile <name>, host <url>, model <name>
+                i = 1
+                while i < len(rest_tokens):
+                    if rest_tokens[i] == "profile" and i + 1 < len(rest_tokens):
+                        prof = _load_profile(rest_tokens[i + 1])
+                        if not prof:
+                            print(f"[translate] profile '{rest_tokens[i+1]}' not found")
+                            return
+                        cfg["lm_host"]  = prof[0][0]
+                        cfg["lm_model"] = prof[0][1]
+                        print(f"  profile : {rest_tokens[i+1]} → {cfg['lm_host']} | {cfg['lm_model']}")
+                        i += 2
+                    elif rest_tokens[i] == "host" and i + 1 < len(rest_tokens):
+                        cfg["lm_host"] = rest_tokens[i + 1]; i += 2
+                    elif rest_tokens[i] == "model" and i + 1 < len(rest_tokens):
+                        cfg["lm_model"] = rest_tokens[i + 1]; i += 2
+                    else:
+                        i += 1
+            self._translate_save_cfg(cfg)
+            if mode == "online":
+                print("[translate] mode set to online")
+                print("  WARNING: online mode sends your text to Google servers.")
+                print("           Do not use with confidential projects.")
+                print("           For private use: /translate mode mini  or  /translate mode offline  or  /translate mode lm")
+            elif mode == "lm":
+                lm_host  = cfg.get("lm_host",  "localhost:11434")
+                lm_model = cfg.get("lm_model", "translategemma:4b")
+                print(f"[translate] mode set to lm — {lm_host} | {lm_model}")
+            else:
+                print(f"[translate] mode set to {mode}")
+            return
+
+        if sub == "lang":
+            lang = parts[2].strip().lower() if len(parts) > 2 else ""
+            if not lang:
+                print("usage: /translate lang <lang_code>  e.g. /translate lang uk")
+                return
+            cfg = self._translate_load_cfg()
+            cfg["lang"] = lang
+            self._translate_save_cfg(cfg)
+            print(f"[translate] language set to {lang}")
+            return
+
+        if sub == "setup":
+            raw = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+            if not raw:
+                print("usage: /translate setup [lang:uk] [mode:lm] [host:<url>] [model:<name>] [profile:<name>]")
+                print("  All parameters optional — unset ones keep existing values from translate.json")
+                print("  e.g. /translate setup lang:uk mode:lm host:192.168.0.229:11434 model:translategemma:4b")
+                print("       /translate setup host:openai://192.168.0.229:1234")
+                print("       /translate setup mode:online")
+                return
+            # parse key:value tokens (partition on first : to handle colons in values)
+            params = {}
+            for token in raw.split():
+                if ':' in token:
+                    k, _, v = token.partition(':')
+                    params[k.lower()] = v
+            # load existing config and apply only what was provided
+            cfg = self._translate_load_cfg()
+            if 'lang'    in params: cfg['lang']       = params['lang']
+            if 'mode'    in params: cfg['mode']       = params['mode']
+            if 'host'    in params: cfg['lm_host']    = params['host']
+            if 'model'   in params: cfg['lm_model']   = params['model']
+            if 'timeout' in params: cfg['lm_timeout'] = int(params['timeout'])
+            if 'profile' in params:
+                prof = _load_profile(params['profile'])
+                if not prof:
+                    print(f"[translate] profile '{params['profile']}' not found")
+                    return
+                cfg['lm_host']  = prof[0][0]
+                cfg['lm_model'] = prof[0][1]
+                cfg['mode']     = 'lm'
+            cfg['enabled'] = True
+            mode = cfg.get('mode', 'online')
+            lang = cfg.get('lang', '')
+            # install dependencies if mode requires it
+            import subprocess as _sp
+            if mode == 'online':
+                try:
+                    import deep_translator  # noqa
+                except ImportError:
+                    print("[translate] installing deep-translator...")
+                    r = _sp.run([sys.executable, "-m", "pip", "install", "deep-translator", "-q"],
+                                capture_output=True, text=True)
+                    if r.returncode != 0:
+                        print(f"[translate] pip failed: {r.stderr.strip()}"); return
+                    print("[translate] deep-translator installed")
+                print("  WARNING: online mode sends your text to Google servers.")
+                print("           Do not use with confidential projects.")
+            elif mode == 'mini' and lang:
+                try:
+                    import argostranslate.translate  # noqa
+                except ImportError:
+                    print("[translate] installing argostranslate...")
+                    r = _sp.run([sys.executable, "-m", "pip", "install", "argostranslate", "-q"],
+                                capture_output=True, text=True)
+                    if r.returncode != 0:
+                        print(f"[translate] pip failed: {r.stderr.strip()}"); return
+                    print("[translate] argostranslate installed")
+                if 'lang' in params or 'mode' in params:
+                    print(f"[translate] downloading packages {lang} ↔ en...")
+                    try:
+                        import argostranslate.package as _pkg
+                        _pkg.update_package_index()
+                        available = _pkg.get_available_packages()
+                        for fc, tc in [(lang, "en"), ("en", lang)]:
+                            try:
+                                pkg = next(p for p in available if p.from_code == fc and p.to_code == tc)
+                                print(f"  {fc} → {tc} ...")
+                                _pkg.install_from_path(pkg.download())
+                                print(f"  OK")
+                            except StopIteration:
+                                print(f"  WARNING: {fc}→{tc} not found in index")
+                    except Exception as e:
+                        print(f"[translate] error: {e}"); return
+            elif mode == 'offline':
+                _NLLB_DIR = os.path.join(os.path.expanduser("~"), ".1bcoder", "nllb-200")
+                for pkg_name in ("ctranslate2", "sentencepiece"):
+                    try:
+                        __import__(pkg_name)
+                    except ImportError:
+                        print(f"[translate] installing {pkg_name}...")
+                        r = _sp.run([sys.executable, "-m", "pip", "install", pkg_name, "-q"],
+                                    capture_output=True, text=True)
+                        if r.returncode != 0:
+                            print(f"[translate] pip failed: {r.stderr.strip()}"); return
+                        print(f"[translate] {pkg_name} installed")
+                if not os.path.isdir(_NLLB_DIR):
+                    print("[translate] downloading NLLB-200-distilled-600M (~2.4 GB, converts to ~600 MB after int8 conversion)...")
+                    print("  This is a one-time download. Stored in ~/.1bcoder/nllb-200/")
+                    try:
+                        from huggingface_hub import snapshot_download
+                    except ImportError:
+                        r = _sp.run([sys.executable, "-m", "pip", "install", "huggingface_hub", "-q"],
+                                    capture_output=True, text=True)
+                        if r.returncode != 0:
+                            print(f"[translate] pip failed: {r.stderr.strip()}"); return
+                        from huggingface_hub import snapshot_download
+                    import ctranslate2
+                    ct2_dir = os.path.join(os.path.expanduser("~"), ".1bcoder", "nllb-200-hf")
+                    snapshot_download("facebook/nllb-200-distilled-600M", local_dir=ct2_dir)
+                    print("[translate] converting to ctranslate2 format...")
+                    ctranslate2.converters.TransformersConverter(ct2_dir).convert(_NLLB_DIR, quantization="int8")
+                    import shutil as _sh
+                    _sp_src = os.path.join(ct2_dir, "sentencepiece.bpe.model")
+                    _sp_dst = os.path.join(_NLLB_DIR, "sentencepiece.bpe.model")
+                    _sh.copy2(_sp_src, _sp_dst)
+                    if not os.path.isfile(_sp_dst):
+                        print(f"[translate] WARNING: failed to copy sentencepiece model to {_sp_dst}")
+                        print(f"  Copy manually: {_sp_src}  →  {_sp_dst}")
+                    else:
+                        print("[translate] NLLB model ready")
+                        _sh.rmtree(ct2_dir, ignore_errors=True)
+                        print(f"[translate] removed source download (~2.4 GB freed)")
+                else:
+                    print(f"[translate] NLLB model already at {_NLLB_DIR}")
+            self._translate_save_cfg(cfg)
+            # show summary
+            print(f"[translate] saved — {lang or '?'} ↔ en ({mode})")
+            if mode == 'lm':
+                print(f"  host    : {cfg.get('lm_host',  'localhost:11434')}")
+                print(f"  model   : {cfg.get('lm_model', 'translategemma:4b')}")
+                print(f"  timeout : {cfg.get('lm_timeout', 120)}s")
+            return
+
+        if sub == "last":
+            if not self.last_reply:
+                print("[translate] no reply to translate yet")
+                return
+            cfg = self._translate_load_cfg()
+            mode = cfg.get("mode", "online")
+            lang = cfg.get("lang", "")
+            tokens = parts[2].split() if len(parts) > 2 else []
+            i = 0
+            while i < len(tokens):
+                if tokens[i] in ("online", "mini", "offline", "lm"):
+                    mode = tokens[i]
+                elif tokens[i] == "lang" and i + 1 < len(tokens):
+                    lang = tokens[i + 1]
+                    i += 1
+                elif tokens[i] == "mode" and i + 1 < len(tokens):
+                    mode = tokens[i + 1]
+                    i += 1
+                i += 1
+            if not lang:
+                print("[translate] no language set — run /translate setup <lang> first")
+                return
+            print(f"[translate] en → {lang} ({mode})...")
+            translated = self._translate_run(self.last_reply, "en", lang, mode=mode)
+            self.last_translated_reply = translated
+            print(f"\n{_LBLUE}─── {lang.upper()} ───{_R}")
+            print(translated)
+            return
+
+        print("usage: /translate setup [lang:uk] [mode:lm] [host:<url>] [model:<name>] [profile:<name>]")
+        print("       /translate on | off | status")
+        print("       /translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]")
+        print("       /translate last [mode online|mini|offline|lm] [lang <code>]")
+
+    # ── /proc ───────────────────────────────────────────────────────────────
 
     def _cmd_proc(self, user_input: str):
         parts = user_input.split(None, 2)

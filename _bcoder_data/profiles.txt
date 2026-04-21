@@ -11,6 +11,8 @@ small:    localhost:11434|qwen3:0.6b|ctx
 explain:  localhost:11434|gemma3:1b|ctx
 thinking: localhost:11434|lfm2.5-thinking:1.2b|ctx
 short:    localhost:11434|llama3.2:1b|ctx
+# translation via dedicated local/remote model (change host/model to match your setup)
+lmtrans:  localhost:11434|translategemma:4b|ctx
 
 # two workers on the same machine, different models
 duo: localhost:11434|gemma3:1b|ans/w1.txt localhost:11434|llama3.2:1b|ans/w2.txt

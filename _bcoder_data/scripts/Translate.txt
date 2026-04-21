@@ -1,0 +1,6 @@
+# Translate last reply using configured /translate mode
+# Usage: /script run Translate
+# Runs /translate last with current settings from ~/.1bcoder/translate.json
+# To switch mode: /translate mode lm  or  /translate mode offline
+/translate last
+/proc run mdx translated

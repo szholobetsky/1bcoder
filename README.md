@@ -313,6 +313,95 @@ Requires `prompt_toolkit` for full editing (arrow keys, Home/End, scroll). Falls
 
 ---
 
+### Translation (`/translate`)
+
+Enables on-the-fly translation between your native language and English. Supports four modes:
+
+| Mode | Backend | Model size | Quality | Private | Internet |
+|---|---|---|---|---|---|
+| `online` | Google Translate (deep-translator) | none | High | **No** | Required |
+| `mini` | argostranslate | ~100 MB per language pair | Moderate | Yes | Not required |
+| `offline` | NLLB-200 (ctranslate2) | ~2.4 GB download, ~600 MB after conversion | Good | Yes | Not required |
+| `lm` | Local/remote Ollama model | depends on model | High | Yes | Not required |
+
+> **Privacy warning:** `online` mode sends your text to Google servers. Do not use with confidential projects, proprietary code, or sensitive data. Use `mini`, `offline`, or `lm` mode instead.
+
+**One-time setup:**
+
+```
+# Fully offline, best local quality (downloads ~2.4 GB (converts to ~600 MB)):
+> /translate setup lang:uk mode:offline
+
+# Dedicated translation model via Ollama (no model switching overhead):
+> /translate setup lang:uk mode:lm host:192.168.0.5:11434 model:translategemma:4b
+
+# Or using a profile from profiles.txt:
+> /translate setup lang:uk profile:lmtrans
+
+# Minimal offline footprint (~100 MB per language pair):
+> /translate setup lang:uk mode:mini
+
+# Online (best quality, not for confidential work):
+> /translate setup lang:uk mode:online
+
+# Change only the host (all other settings stay):
+> /translate setup host:openai://192.168.0.229:1234
+```
+
+Config is saved globally to `~/.1bcoder/translate.json` and applied automatically on every future startup.
+
+| Command | Description |
+|---|---|
+| `/translate setup [lang:uk] [mode:offline] [host:<url>] [model:<name>] [profile:<name>]` | Configure translation; all params optional, unset ones keep existing values |
+| `/translate on` | Enable translation (uses saved language and mode) |
+| `/translate off` | Disable translation |
+| `/translate status` | Show lang, mode, lm_host, lm_model, enabled |
+| `/translate lang <code>` | Change language |
+| `/translate mode online\|mini\|offline\|lm [profile <name>]` | Switch mode; `profile` loads host+model from profiles.txt |
+| `/translate last` | Retranslate last reply |
+| `/translate last mode offline lang de` | Retranslate with overrides (mode / lang) |
+
+Common language codes: `uk` Ukrainian, `de` German, `fr` French, `pl` Polish, `es` Spanish, `zh` Chinese. Full list: `/doc translate`
+
+How it works: user input is translated to English before the LLM call, and the reply is translated back to the native language after. The model always reasons in English; the user always reads and writes in their language.
+
+To open the translated reply in the browser:
+
+```
+/translate last
+/proc run mdx translated
+```
+
+Or use the built-in script:
+
+```
+/script run Translate
+```
+
+**`offline` mode — NLLB-200 (recommended for private use):**
+
+Downloads the NLLB-200-distilled-600M model (~2.4 GB download, ~600 MB after int8 conversion) and runs fully in-process via ctranslate2. No Ollama model switching — the translation model lives in RAM alongside the main model, keeping full VRAM free for the LLM.
+
+```
+/translate setup lang:uk mode:offline
+```
+
+**`lm` mode — dedicated translation model on phone or remote device:**
+
+Add a `lmtrans` profile in `~/.1bcoder/profiles.txt` pointing to the device running the translation model:
+
+```
+lmtrans: 192.168.0.5:11434|translategemma:4b|ctx
+```
+
+Then configure `/translate` to use it:
+
+```
+/translate setup uk lm host 192.168.0.5:11434 model translategemma:4b
+```
+
+---
+
 ### File operations
 
 | Command | Description |
@@ -1343,6 +1432,7 @@ Run a Python script against the last LLM reply. Useful for extracting filenames,
 ```
 /proc list                         # list available processors
 /proc run <name>                   # one-shot: run against last reply
+/proc run <name> translated        # run against last translated reply (from /translate)
 /proc run <name> -f <file>         # run against an external file instead of last reply
 /proc on grounding-check           # persistent: run after every reply automatically
 /proc off                          # stop persistent processor
@@ -1374,8 +1464,8 @@ Built-in processors in `~/.1bcoder/proc/`:
 | `extract-list` | Convert first bullet/numbered list in reply to comma-separated line | one-shot |
 | `grounding-check` | Score identifiers against `map.txt`, warn if <50% | persistent / gate |
 | `collect-files` | Accumulate filenames to `.1bcoder/collected-files.txt` | persistent |
-| `md` | Render last reply as formatted Markdown in terminal | one-shot |
-| `mdx` | Render last reply as Markdown + LaTeX (KaTeX) + Mermaid diagrams in browser | one-shot |
+| `md` | Render last reply as formatted Markdown in terminal; add `translated` to use translated reply | one-shot |
+| `mdx` | Render last reply as Markdown + LaTeX (KaTeX) + Mermaid diagrams in browser; add `translated` to use translated reply | one-shot |
 | `ctx_cut` | Auto `/ctx cut` when context exceeds threshold (default 90%) | persistent |
 | `rude_words` | Alert if reply contains profanity (`ua` arg adds Ukrainian list) | persistent |
 | `secret_check` | Alert if reply contains sensitive names (google, anthropic…) | persistent |
