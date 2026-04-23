@@ -356,10 +356,7 @@ Config is saved globally to `~/.1bcoder/translate.json` and applied automaticall
 | `/translate on` | Enable translation (uses saved language and mode) |
 | `/translate off` | Disable translation |
 | `/translate status` | Show lang, mode, lm_host, lm_model, enabled |
-| `/translate lang <code>` | Change language |
-| `/translate mode online\|mini\|offline\|lm [profile <name>]` | Switch mode; `profile` loads host+model from profiles.txt |
-| `/translate last` | Retranslate last reply |
-| `/translate last mode offline lang de` | Retranslate with overrides (mode / lang) |
+| `/translate last [mode:<m>] [lang:<code>]` | Retranslate last reply with optional overrides |
 
 Common language codes: `uk` Ukrainian, `de` German, `fr` French, `pl` Polish, `es` Spanish, `zh` Chinese. Full list: `/doc translate`
 
@@ -397,7 +394,7 @@ lmtrans: 192.168.0.5:11434|translategemma:4b|ctx
 Then configure `/translate` to use it:
 
 ```
-/translate setup uk lm host 192.168.0.5:11434 model translategemma:4b
+/translate setup lang:uk mode:lm host:192.168.0.5:11434 model:translategemma:4b
 ```
 
 ---
@@ -1533,6 +1530,25 @@ Built-in team scripts in `~/.1bcoder/scripts/`:
 | `team-search-worker.txt` | `/find` → which functions implement it? |
 | `team-map-worker.txt` | `/map find` → what depends on it? |
 | `team-summarize.txt` | reads all results, produces unified answer |
+
+---
+
+### Flows (`/flow`)
+
+Flows are deterministic Python pipelines — they run commands, loop over lists, and pass everything to the LLM in a **temporary context**. Only the final summary lands in your main conversation. Works reliably even with 1B models because the LLM only needs to read, not make tool decisions.
+
+```
+/flow list                          # list all available flows
+/flow webask what is asyncio -d 5   # web search → fetch top 5 pages → summarize
+/flow grounding fix MultilineTernary # extract codebase keywords → locate files → summarize
+/flow simargl_files add user auth   # simargl retrieval → read matched files → explain
+/flow py_error_trace -f error.txt   # parse traceback → read code at each location → explain
+/flow commit_message                # git diff → generate commit message
+```
+
+Custom flows go in `~/.1bcoder/flows/<name>.py` (global) or `.1bcoder/flows/<name>.py` (project-local).
+Each flow is a Python file with a single `run(chat, args)` function.
+Full guide: `/doc flows`
 
 ---
 

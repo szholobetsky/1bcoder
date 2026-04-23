@@ -576,25 +576,37 @@ Commands
           # render translated reply in browser (after /translate last or with auto-translate on)
           /proc run mdx translated
 
-/translate setup <lang> [online|mini|offline|lm] [host <url>] [model <name>]
-/translate on             Enable translation (uses saved language and mode).
-/translate off            Disable translation.
-/translate status         Show current state (lang, mode, enabled).
-/translate lang <code>    Change language.
-/translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]
-/translate last [mode online|mini|offline|lm] [lang <code>]  Retranslate last reply.
+/translate setup [lang:<code>] [mode:online|mini|offline|lm] [host:<url>] [model:<name>] [profile:<name>]
+/translate on | off | status
+/translate last [mode:<m>] [lang:<code>]  Retranslate last reply with optional override.
     online  = Google Translate — WARNING: sends text to Google, not for confidential projects
     mini    = argostranslate (local, ~100MB packages, fully private)
-    offline = NLLB-200 ctranslate2 (local, ~2.4GB download, ~600MB after conversion download, better quality, no model switch)
+    offline = NLLB-200 ctranslate2 (local, ~2.4GB download, ~600MB after conversion, better quality, no model switch)
     lm      = local/remote Ollama model (fully private, configurable host + model)
     Language codes: uk (Ukrainian), de (German), fr (French), pl (Polish), es (Spanish), hi (Hindi)
     Full list: /doc translate
     Config stored globally in ~/.1bcoder/translate.json — persists across sessions.
-    e.g.  /translate setup uk lm host 192.168.0.5:11434 model translategemma:4b
-          /translate setup uk offline
+    e.g.  /translate setup lang:uk mode:lm host:192.168.0.5:11434 model:translategemma:4b
+          /translate setup host:openai://localhost:1234 model:translategemma:4b
+          /translate setup lang:uk mode:offline
           /translate last
-          /translate last mode lm lang de
+          /translate last mode:mini lang:de
           /translate off
+
+/web search <term> [-> varname]   Search DuckDuckGo; results shown + URLs saved to variable.
+/web fetch <url> [-n 4000]        Fetch URL, strip HTML, inject cleaned text into context.
+    e.g.  /web search python asyncio tutorial -> urls
+          /web fetch https://docs.python.org/3/library/asyncio.html
+
+/flow list                List available flows (built-in + global + local).
+/flow <name> [args]       Run a flow — deterministic Python pipeline with loops and lists.
+    Flows live in _bcoder_data/flows/ (built-in) or ~/.1bcoder/flows/ (global/local).
+    Built-in flows: webask, grounding, simargl_files, py_error_trace, commit_message
+    e.g.  /flow webask what is asyncio -d 5
+          /flow grounding dependency injection
+          /flow simargl_files add user authentication
+          /flow py_error_trace -f error.txt
+          /flow commit_message
 
 /var save <file>            Save all session variables to a key=value file (auto adds .var if no ext).
                              First line is always "# <description>" — set with /var set description=...
@@ -809,7 +821,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
     Prompt modes:
       plain text only  → same prompt sent to all workers
       list: a1, a2     → aspects distributed one per worker; combined with main question as:
-                          "{main question}\n\nAspect: {aspect_i}"
+                          "{main question} Aspect: {aspect_i}"
                           Use list: to ask one question from multiple angles simultaneously.
       comma list only  → matched 1:1 to workers (last reused for remaining)
     file: path [-n N]  split file into N chunks (one per worker); -n auto = chunks = workers.
@@ -1970,6 +1982,7 @@ _KNOWN_CMDS = [
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
     "/doc", "/tempctx", "/proj", "/text", "/role", "/ask", "/translate",
+    "/web", "/flow",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -2002,7 +2015,9 @@ _CMD_SPEC = {
     "/proj":     dict(file_idx=None, kw_idx=1, keywords=["set", "status", "list", "save", "load", "show", "find", "keyword", "file", "index"]),
     "/alias":    dict(file_idx=None, kw_idx=1, keywords=["save", "clear"]),
     "/doc":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
-    "/translate": dict(file_idx=None, kw_idx=1, keywords=["setup", "on", "off", "status", "lang", "mode", "last"]),
+    "/translate": dict(file_idx=None, kw_idx=1, keywords=["setup", "on", "off", "status", "last"]),
+    "/web":       dict(file_idx=None, kw_idx=1, keywords=["search", "fetch"]),
+    "/flow":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
 }
 
 
@@ -2628,6 +2643,10 @@ class CoderCLI:
             self._cmd_prompt(user_input)
         elif user_input.startswith("/translate"):
             self._cmd_translate(user_input)
+        elif user_input.startswith("/web"):
+            self._cmd_web(user_input)
+        elif user_input.startswith("/flow"):
+            self._cmd_flow(user_input)
         elif user_input.startswith("/proc"):
             self._cmd_proc(user_input)
         elif user_input.startswith("/mcp"):
@@ -4390,6 +4409,7 @@ advanced_tools =
             output = proc.stdout + proc.stderr
             print(output if output else "(no output)")
             status = f"exit code {proc.returncode}"
+            self._last_output = output or "(no output)"
             if not self._auto_apply:
                 self.messages.append(
                     {"role": "user", "content": f"[run: {shell_cmd}  ({status})]\n```\n{output or '(no output)'}```"}
@@ -5041,7 +5061,16 @@ advanced_tools =
                     except _ur.URLError as e:
                         raise RuntimeError(f"cannot connect to {url}: {e.reason}")
             elif mode == "offline":
-                import ctranslate2, sentencepiece as _spm, os as _os
+                import re as _re, ctranslate2, sentencepiece as _spm, os as _os
+                _blocks: list[str] = []
+                def _stash(m):
+                    _blocks.append(m.group(0))
+                    return f"[CODEBLK_{len(_blocks)-1}]"
+                text = _re.sub(r"```[\s\S]*?```", _stash, text)
+                _ph_re = _re.compile(r"^\[CODEBLK_\d+\]$")
+                def _restore(s):
+                    for i, b in enumerate(_blocks): s = s.replace(f"[CODEBLK_{i}]", b)
+                    return s
                 _NLLB_DIR = _os.path.join(_os.path.expanduser("~"), ".1bcoder", "nllb-200")
                 _SP_PATH  = _os.path.join(_NLLB_DIR, "sentencepiece.bpe.model")
                 if not _os.path.isdir(_NLLB_DIR):
@@ -5076,21 +5105,250 @@ advanced_tools =
                     return sp.decode(res[0].hypotheses[0][1:])
 
                 # translate line by line — NLLB is sentence-level, long input causes repetition
+                # placeholder lines are passed through unchanged
                 lines = text.split("\n")
                 out_lines = []
                 for line in lines:
                     stripped = line.strip()
-                    if not stripped:
-                        out_lines.append("")
+                    if not stripped or _ph_re.match(stripped):
+                        out_lines.append(line)
                     else:
                         out_lines.append(_translate_chunk(stripped))
-                return "\n".join(out_lines)
+                return _restore("\n".join(out_lines))
             else:
-                import argostranslate.translate as _at
-                return _at.translate(text, from_lang, to_lang)
+                import re as _re, argostranslate.translate as _at
+                _blocks: list[str] = []
+                def _stash(m):
+                    _blocks.append(m.group(0))
+                    return f"[CODEBLK_{len(_blocks)-1}]"
+                text = _re.sub(r"```[\s\S]*?```", _stash, text)
+                def _restore(s):
+                    for i, b in enumerate(_blocks): s = s.replace(f"[CODEBLK_{i}]", b)
+                    return s
+                # split on placeholders, translate text segments only, rejoin
+                _ph_re = _re.compile(r"(\[CODEBLK_\d+\])")
+                parts = _ph_re.split(text)
+                out_parts = []
+                for part in parts:
+                    if _ph_re.fullmatch(part):
+                        out_parts.append(part)
+                    elif part.strip():
+                        out_parts.append(_at.translate(part, from_lang, to_lang))
+                    else:
+                        out_parts.append(part)
+                return _restore("".join(out_parts))
         except Exception as e:
             print(f"[translate] error ({mode}): {e}")
             return None
+
+    # ── /web + /webask ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _web_strip_html(html_bytes: bytes) -> str:
+        from html.parser import HTMLParser
+        class _S(HTMLParser):
+            SKIP = {"script","style","nav","header","footer","aside","noscript"}
+            def __init__(self):
+                super().__init__(); self._d=0; self.out=[]
+            def handle_starttag(self,t,a):
+                if t in self.SKIP: self._d+=1
+            def handle_endtag(self,t):
+                if t in self.SKIP and self._d: self._d-=1
+            def handle_data(self,d):
+                if not self._d:
+                    s=d.strip()
+                    if s: self.out.append(s)
+        p=_S(); p.feed(html_bytes.decode("utf-8","replace")); return "\n".join(p.out)
+
+    @staticmethod
+    def _web_ddg_search(term: str, n: int = 8):
+        """Return list of (title, url, snippet) from DuckDuckGo HTML search."""
+        import requests as _r, re as _re
+        from urllib.parse import parse_qs, urlparse, unquote
+        from html.parser import HTMLParser
+
+        class _DDG(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.results = []
+                self._cur = {}
+                self._in = None
+            def handle_starttag(self, tag, attrs):
+                d = dict(attrs)
+                cls = d.get("class","")
+                if tag == "a" and "result__a" in cls:
+                    href = d.get("href","")
+                    try:
+                        params = parse_qs(urlparse(href).query)
+                        url = params.get("uddg",[""])[0]
+                        if not url: url = unquote(href)
+                    except Exception:
+                        url = href
+                    self._cur["url"] = url
+                    self._in = "title"
+                elif tag == "a" and "result__snippet" in cls:
+                    self._in = "snippet"
+            def handle_endtag(self, tag):
+                if self._in and tag == "a":
+                    if "url" in self._cur and "title" in self._cur:
+                        if "snippet" not in self._cur:
+                            self._cur["snippet"] = ""
+                        self.results.append((
+                            self._cur.get("title",""),
+                            self._cur.get("url",""),
+                            self._cur.get("snippet",""),
+                        ))
+                        self._cur = {}
+                    self._in = None
+            def handle_data(self, data):
+                if self._in == "title":
+                    self._cur["title"] = self._cur.get("title","") + data
+                elif self._in == "snippet":
+                    self._cur["snippet"] = self._cur.get("snippet","") + data
+
+        resp = _r.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": term},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        parser = _DDG()
+        parser.feed(resp.text)
+        return parser.results[:n]
+
+    def _cmd_web(self, user_input: str):
+        """
+/web search <term> [-> varname]   Search DuckDuckGo; optionally save URL list to variable.
+/web fetch <url> [-n 4000]        Fetch URL, strip HTML, inject cleaned text into context.
+        """
+        parts = user_input.split(None, 2)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        ctx = self._agent_msgs if (self._in_agent and self._agent_msgs) else self.messages
+
+        if sub == "search":
+            raw = parts[2] if len(parts) > 2 else ""
+            var_name = None
+            if " -> " in raw:
+                raw, _, var_name = raw.partition(" ->")
+                var_name = var_name.strip().lstrip("$")
+            term = raw.strip()
+            if not term:
+                print("usage: /web search <term> [-> varname]"); return
+            print(f"[web] searching: {term} ...")
+            try:
+                results = self._web_ddg_search(term)
+            except Exception as e:
+                print(f"[web] search failed: {e}"); return
+            if not results:
+                print("[web] no results"); return
+            urls = []
+            lines = []
+            for i, (title, url, snippet) in enumerate(results, 1):
+                print(f"  {i}. {title}")
+                print(f"     {url}")
+                if snippet: print(f"     {snippet}")
+                urls.append(url)
+                lines.append(f"{i}. {title}\n   {url}" + (f"\n   {snippet}" if snippet else ""))
+            ctx.append({"role": "user",
+                        "content": f"[WEB SEARCH: {term}]\n" + "\n\n".join(lines)})
+            if var_name:
+                self._vars[var_name] = "\n".join(urls)
+                print(f"[web] {len(urls)} URLs saved to {{{var_name}}}")
+            return
+
+        if sub == "fetch":
+            raw = parts[2] if len(parts) > 2 else ""
+            max_chars = 4000
+            if " -n " in raw:
+                raw, _, n_str = raw.partition(" -n ")
+                try: max_chars = int(n_str.strip().split()[0])
+                except ValueError: pass
+            url = raw.strip()
+            if not url:
+                print("usage: /web fetch <url> [-n 4000]"); return
+            print(f"[web] fetching {url} ...")
+            try:
+                import requests as _r
+                resp = _r.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                text = self._web_strip_html(resp.content)
+                text = text[:max_chars]
+            except Exception as e:
+                print(f"[web] fetch failed: {e}"); return
+            ctx.append({"role": "user",
+                        "content": f"[WEB CONTENT from {url}]\n{text}"})
+            print(f"[web] {len(text)} chars injected into context")
+            return
+
+        print("usage: /web search <term> [-> varname]")
+        print("       /web fetch <url> [-n 4000]")
+
+    # ── /flow ───────────────────────────────────────────────────────────────
+
+    def _cmd_flow(self, user_input: str):
+        """
+/flow <name> [args]   Run a flow from _bcoder_data/flows/<name>.py.
+/flow list            List available flows.
+        """
+        import importlib.util as _ilu
+        parts = user_input.split(None, 2)
+        sub = parts[1].strip() if len(parts) > 1 else ""
+
+        def _find_flow(name):
+            for d in (os.path.join(BCODER_DIR, "flows"),
+                      os.path.join(HOME_BCODER_DIR, "flows"),
+                      os.path.join(INSTALL_BCODER_DIR, "flows")):
+                p = os.path.join(d, name + ".py")
+                if os.path.isfile(p):
+                    return p
+            return None
+
+        if not sub or sub == "list":
+            dirs = [
+                os.path.join(BCODER_DIR, "flows"),
+                os.path.join(HOME_BCODER_DIR, "flows"),
+                os.path.join(INSTALL_BCODER_DIR, "flows"),
+            ]
+            shown = set()
+            for d in dirs:
+                if not os.path.isdir(d): continue
+                for f in sorted(os.listdir(d)):
+                    if f.endswith(".py") and not f.startswith("_") and f not in shown:
+                        shown.add(f)
+                        spec = _ilu.spec_from_file_location("_flow", os.path.join(d, f))
+                        mod  = _ilu.module_from_spec(spec)
+                        try:
+                            spec.loader.exec_module(mod)
+                            doc = (getattr(mod, "run", None) or (lambda:None)).__doc__ or ""
+                            desc = doc.strip().splitlines()[0] if doc.strip() else ""
+                        except Exception:
+                            desc = ""
+                        tag = "[local]" if d.startswith(BCODER_DIR) else ("[global]" if d.startswith(HOME_BCODER_DIR) else "")
+                        print(f"  {f[:-3]:<20} {desc}  {tag}")
+            if not shown:
+                print("[flow] no flows found")
+            return
+
+        name = sub
+        args = parts[2].strip() if len(parts) > 2 else ""
+        path = _find_flow(name)
+        if not path:
+            print(f"[flow] '{name}' not found — use /flow list"); return
+
+        spec = _ilu.spec_from_file_location(f"_flow_{name}", path)
+        mod  = _ilu.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            print(f"[flow] load error: {e}"); return
+        if not hasattr(mod, "run"):
+            print(f"[flow] '{name}.py' has no run(chat, args) function"); return
+        try:
+            mod.run(self, args)
+        except Exception as e:
+            import traceback
+            print(f"[flow] runtime error: {e}")
+            traceback.print_exc()
 
     def _translate_activate(self):
         pass  # translation is handled inline in the main loop via translate.json
@@ -5106,17 +5364,14 @@ advanced_tools =
 
     def _cmd_translate(self, user_input: str):
         """
-/translate setup [lang:uk] [mode:lm] [host:<url>] [model:<name>] [profile:<name>]
+/translate setup [lang:<code>] [mode:online|mini|offline|lm] [host:<url>] [model:<name>] [profile:<name>]
                   All params optional — unspecified ones keep existing values.
-/translate on             Enable translation (uses saved language and mode).
-/translate off            Disable translation.
-/translate status         Show current state.
-/translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]
+/translate on | off | status
+/translate last [mode:<m>] [lang:<code>]
 
-Language codes: uk (Ukrainian), de (German), fr (French), pl (Polish), es (Spanish), zh (Chinese)
-Modes: online  = Google Translate — good quality, needs internet, sends text to Google servers
+Modes: online  = Google Translate — needs internet, not for confidential projects
        mini    = argostranslate — fully local, ~100MB packages per language pair
-       offline = NLLB-200 ctranslate2 — fully local, ~2.4GB download, ~600MB after conversion download, better quality
+       offline = NLLB-200 ctranslate2 — fully local, ~2.4GB one-time download → ~600MB after conversion, better quality, no model switch
        lm      = local/remote Ollama — fully private, uses dedicated translation model
 Config stored in ~/.1bcoder/translate.json
         """
@@ -5156,58 +5411,6 @@ Config stored in ~/.1bcoder/translate.json
             self._translate_save_cfg(cfg)
             mode = cfg.get("mode", "mini")
             print(f"[translate] on — {cfg['lang']} ↔ en ({mode})")
-            return
-
-        if sub == "mode":
-            rest_tokens = " ".join(parts[2:]).split() if len(parts) > 2 else []
-            mode = rest_tokens[0].lower() if rest_tokens else ""
-            if mode not in ("online", "mini", "offline", "lm"):
-                print("usage: /translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]")
-                return
-            cfg = self._translate_load_cfg()
-            cfg["mode"] = mode
-            if mode == "lm":
-                # parse optional: profile <name>, host <url>, model <name>
-                i = 1
-                while i < len(rest_tokens):
-                    if rest_tokens[i] == "profile" and i + 1 < len(rest_tokens):
-                        prof = _load_profile(rest_tokens[i + 1])
-                        if not prof:
-                            print(f"[translate] profile '{rest_tokens[i+1]}' not found")
-                            return
-                        cfg["lm_host"]  = prof[0][0]
-                        cfg["lm_model"] = prof[0][1]
-                        print(f"  profile : {rest_tokens[i+1]} → {cfg['lm_host']} | {cfg['lm_model']}")
-                        i += 2
-                    elif rest_tokens[i] == "host" and i + 1 < len(rest_tokens):
-                        cfg["lm_host"] = rest_tokens[i + 1]; i += 2
-                    elif rest_tokens[i] == "model" and i + 1 < len(rest_tokens):
-                        cfg["lm_model"] = rest_tokens[i + 1]; i += 2
-                    else:
-                        i += 1
-            self._translate_save_cfg(cfg)
-            if mode == "online":
-                print("[translate] mode set to online")
-                print("  WARNING: online mode sends your text to Google servers.")
-                print("           Do not use with confidential projects.")
-                print("           For private use: /translate mode mini  or  /translate mode offline  or  /translate mode lm")
-            elif mode == "lm":
-                lm_host  = cfg.get("lm_host",  "localhost:11434")
-                lm_model = cfg.get("lm_model", "translategemma:4b")
-                print(f"[translate] mode set to lm — {lm_host} | {lm_model}")
-            else:
-                print(f"[translate] mode set to {mode}")
-            return
-
-        if sub == "lang":
-            lang = parts[2].strip().lower() if len(parts) > 2 else ""
-            if not lang:
-                print("usage: /translate lang <lang_code>  e.g. /translate lang uk")
-                return
-            cfg = self._translate_load_cfg()
-            cfg["lang"] = lang
-            self._translate_save_cfg(cfg)
-            print(f"[translate] language set to {lang}")
             return
 
         if sub == "setup":
@@ -5340,15 +5543,20 @@ Config stored in ~/.1bcoder/translate.json
             cfg = self._translate_load_cfg()
             mode = cfg.get("mode", "online")
             lang = cfg.get("lang", "")
-            tokens = parts[2].split() if len(parts) > 2 else []
+            tokens = " ".join(parts[2:]).split() if len(parts) > 2 else []
             i = 0
             while i < len(tokens):
-                if tokens[i] in ("online", "mini", "offline", "lm"):
-                    mode = tokens[i]
-                elif tokens[i] == "lang" and i + 1 < len(tokens):
+                tok = tokens[i]
+                if ":" in tok:
+                    k, _, v = tok.partition(":")
+                    if k == "mode": mode = v
+                    elif k == "lang": lang = v
+                elif tok in ("online", "mini", "offline", "lm"):
+                    mode = tok
+                elif tok == "lang" and i + 1 < len(tokens):
                     lang = tokens[i + 1]
                     i += 1
-                elif tokens[i] == "mode" and i + 1 < len(tokens):
+                elif tok == "mode" and i + 1 < len(tokens):
                     mode = tokens[i + 1]
                     i += 1
                 i += 1
@@ -5364,8 +5572,7 @@ Config stored in ~/.1bcoder/translate.json
 
         print("usage: /translate setup [lang:uk] [mode:lm] [host:<url>] [model:<name>] [profile:<name>]")
         print("       /translate on | off | status")
-        print("       /translate mode online|mini|offline|lm [profile <name>] [host <url>] [model <name>]")
-        print("       /translate last [mode online|mini|offline|lm] [lang <code>]")
+        print("       /translate last [mode:<m>] [lang:<code>]")
 
     # ── /proc ───────────────────────────────────────────────────────────────
 
@@ -8216,14 +8423,6 @@ Config stored in ~/.1bcoder/translate.json
                     print(f"{_DIM}[{label}] no ACTION and no plan steps remaining — done{_R}")
                     if on_done:
                         self._route(on_done)
-                    break
-                # only proc actions fired (model said nothing actionable) and no steps left → done
-                if not model_actions and not plan_steps and proc_actions:
-                    print(f"{_DIM}[{label}] proc-only actions, no plan steps remaining — finishing{_R}")
-                    for _pa in proc_actions:
-                        self._route(_pa, auto=True)
-                    if on_done:
-                        self._route(on_done)
                     ans = input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
                     if ans == "a":
                         self.messages.extend(agent_msgs[msgs_offset:])
@@ -8236,9 +8435,12 @@ Config stored in ~/.1bcoder/translate.json
                     else:
                         print(f"[{label}] nothing added to context")
                     break
-                    print(f"\n{_GREEN}[{label}] done{_R}{_DIM} (no more ACTIONs){_R}")
+                # only proc actions fired (model said nothing actionable) and no steps left → done
+                if not model_actions and not plan_steps and proc_actions:
+                    print(f"{_DIM}[{label}] proc-only actions, no plan steps remaining — finishing{_R}")
+                    for _pa in proc_actions:
+                        self._route(_pa, auto=True)
                     if on_done:
-                        print(f"{_DIM}[{label}] on_done: {on_done}{_R}")
                         self._route(on_done)
                     ans = input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
                     if ans == "a":

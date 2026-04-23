@@ -7,8 +7,10 @@
 /sqlite   = /agent sqlite
 /plan     = /agent planning
 /fill     = /agent fill
-/scan     = /agent scan {{args}}
-/compact  = /agent compact {{args}}
+/scan       = /agent scan {{args}}
+/compact    = /agent compact {{args}}
+/websearch  = /agent websearch {{args}}
+/webask     = /flow webask {{args}}
 
 /small    = /parallel {{args}}  profile: small
 /explain  = /parallel {{args}}  profile: explain
