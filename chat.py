@@ -2243,6 +2243,30 @@ class CoderCLI:
         right = right[:5]
         return f"{left}:{right}" if right else left
 
+    def _autosave_prompt(self) -> None:
+        """Ask user whether to save context; save to .1bcoder/autosave/ if confirmed."""
+        if not self.messages:
+            return
+        try:
+            ans = input("Save context before action? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans == "n":
+            return
+        import datetime as _dt
+        stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        save_dir = os.path.join(
+            BCODER_DIR if os.path.isdir(BCODER_DIR) else HOME_BCODER_DIR,
+            "autosave"
+        )
+        os.makedirs(save_dir, exist_ok=True)
+        fpath = os.path.join(save_dir, f"{stamp}.txt")
+        with open(fpath, "w", encoding="utf-8") as f:
+            for msg in self.messages:
+                f.write(f"=== {msg['role']} ===\n{msg['content']}\n\n")
+        print(f"[autosave] context saved → {fpath}")
+
     def _print_status(self) -> None:
         """Print a single status line showing model, size, quant, native ctx, and usage."""
         est_tokens = sum(len(m["content"]) for m in self.messages) // 4
@@ -2253,6 +2277,7 @@ class CoderCLI:
             parts.append(_fmt_ctx(self._meta_ctx))
         meta = f" [{' '.join(parts)}]" if parts else ""
         print(f"\033[2m {model_str}{meta}  │  ctx {est_tokens} / {self.num_ctx} ({pct}%)\033[0m")
+        print()
 
     def __init__(self, base_url, model, models, provider="ollama"):
         self.base_url = base_url
@@ -2350,6 +2375,8 @@ class CoderCLI:
                 ) as resp:
                     resp.raise_for_status()
                     in_think = False
+                    _had_thinking = False
+                    _sep_done = False
                     for line in resp.iter_lines():
                         if not line:
                             continue
@@ -2367,6 +2394,7 @@ class CoderCLI:
                         reasoning = delta.get("reasoning_content") or ""
                         if reasoning and self.think_show:
                             _print(f"\033[90m{reasoning}\033[0m")
+                            _had_thinking = True
                         chunk = delta.get("content") or ""
                         if chunk:
                             # apply <think>...</think> state machine (same as Ollama path)
@@ -2385,6 +2413,9 @@ class CoderCLI:
                                 else:
                                     start = chunk.find('<think>')
                                     if start == -1:
+                                        if _had_thinking and not _sep_done:
+                                            _print("\n")
+                                            _sep_done = True
                                         _print(chunk)
                                         chunks.append(chunk)
                                         chunk = ""
@@ -2393,6 +2424,7 @@ class CoderCLI:
                                             _print(chunk[:start])
                                             chunks.append(chunk[:start])
                                         in_think = True
+                                        _had_thinking = True
                                         chunk = chunk[start + 7:]
             else:
                 opts = {"num_ctx": self.num_ctx}
@@ -2405,6 +2437,8 @@ class CoderCLI:
                 ) as resp:
                     resp.raise_for_status()
                     in_think = False
+                    _had_thinking = False
+                    _sep_done = False
                     for line in resp.iter_lines():
                         if not line:
                             continue
@@ -2414,6 +2448,7 @@ class CoderCLI:
                         thinking = msg.get("thinking", "")
                         if thinking and self.think_show:
                             _print(f"\033[90m{thinking}\033[0m")
+                            _had_thinking = True
                         chunk = msg.get("content", "")
                         if chunk:
                             # State machine: track <think>...</think> across tokens
@@ -2432,6 +2467,9 @@ class CoderCLI:
                                 else:
                                     start = chunk.find('<think>')
                                     if start == -1:
+                                        if _had_thinking and not _sep_done:
+                                            _print("\n")
+                                            _sep_done = True
                                         _print(chunk)
                                         chunks.append(chunk)
                                         chunk = ""
@@ -2440,6 +2478,7 @@ class CoderCLI:
                                             _print(chunk[:start])
                                             chunks.append(chunk[:start])
                                         in_think = True
+                                        _had_thinking = True
                                         chunk = chunk[start + len('<think>'):]
                         if data.get("done"):
                             break
@@ -2484,9 +2523,9 @@ class CoderCLI:
             self._apply_config(_session_cfg)
             print()
         self._translate_autoload()
+        self._print_status()
         while True:
             try:
-                self._print_status()
                 user_input = input("> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
@@ -2496,6 +2535,7 @@ class CoderCLI:
             if user_input not in self._history or (self._history and self._history[-1] != user_input):
                 self._history.append(user_input)
             self._route(user_input)
+            self._print_status()
             if user_input.startswith("/"):
                 import shlex as _shlex
                 _args = user_input.split(None, 1)[1] if " " in user_input else ""
@@ -2569,6 +2609,7 @@ class CoderCLI:
             return
 
         if user_input == "/exit":
+            self._autosave_prompt()
             sys.exit(0)
         elif user_input == "/about":
             self._cmd_about()
@@ -2940,6 +2981,10 @@ advanced_tools =
                     print(f"[no messages found in {load_path}]")
                     return
                 self.messages.extend(loaded)
+                last_a = next((m["content"] for m in reversed(loaded) if m["role"] == "assistant"), "")
+                if last_a:
+                    self.last_reply = last_a
+                    self._last_output = last_a
                 print(f"[loaded {len(loaded)} messages from {load_path}]")
             except FileNotFoundError:
                 print(f"file not found: {load_path}")
@@ -3086,6 +3131,7 @@ advanced_tools =
                 print("[ctx compact] failed — context unchanged")
                 return
 
+            self._autosave_prompt()
             if use_savepoint:
                 del self.messages[self._savepoint:]
                 self.messages.append({"role": "user", "content": f"[summary since savepoint]\n{summary}"})
@@ -4984,7 +5030,21 @@ advanced_tools =
         try:
             if mode == "online":
                 from deep_translator import GoogleTranslator as _GT
-                return _GT(source=from_lang, target=to_lang).translate(text)
+                _MAX = 4500
+                if len(text) <= _MAX:
+                    return _GT(source=from_lang, target=to_lang).translate(text) or text
+                # chunk by paragraphs to stay under Google's limit
+                _parts, _buf, _results = text.split("\n\n"), "", []
+                for _p in _parts:
+                    if len(_buf) + len(_p) + 2 <= _MAX:
+                        _buf = (_buf + "\n\n" + _p) if _buf else _p
+                    else:
+                        if _buf:
+                            _results.append(_GT(source=from_lang, target=to_lang).translate(_buf) or _buf)
+                        _buf = _p
+                if _buf:
+                    _results.append(_GT(source=from_lang, target=to_lang).translate(_buf) or _buf)
+                return "\n\n".join(_results)
             elif mode == "lm":
                 cfg = self._translate_load_cfg()
                 lm_timeout = int(cfg.get("lm_timeout", 120))
@@ -5567,7 +5627,10 @@ Config stored in ~/.1bcoder/translate.json
             translated = self._translate_run(self.last_reply, "en", lang, mode=mode)
             self.last_translated_reply = translated
             print(f"\n{_LBLUE}─── {lang.upper()} ───{_R}")
-            print(translated)
+            if translated:
+                print(translated)
+            else:
+                print("[translate] translation returned empty result — check language code or network")
             return
 
         print("usage: /translate setup [lang:uk] [mode:lm] [host:<url>] [model:<name>] [profile:<name>]")

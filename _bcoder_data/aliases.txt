@@ -11,6 +11,10 @@
 /compact    = /agent compact {{args}}
 /websearch  = /agent websearch {{args}}
 /webask     = /flow webask {{args}}
+/simargl    = /run simargl {{args}}
+/sim        = /run simargl {{args}}
+/svitovyd   = /run svitovyd {{args}}
+/svi        = /run svitovyd {{args}}
 
 /small    = /parallel {{args}}  profile: small
 /explain  = /parallel {{args}}  profile: explain
