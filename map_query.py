@@ -538,6 +538,74 @@ def idiff_report(map_prev: str, map_curr: str) -> str:
     return '\n'.join(lines)
 
 
+# ── keywords ────────────────────────────────────────────────────────────────────
+
+def _split_identifier(name: str) -> list:
+    """Split camelCase / snake_case / PascalCase into lowercase subwords."""
+    parts = re.split(r'[_\-]+', name)
+    result = []
+    for part in parts:
+        if not part:
+            continue
+        s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', part)
+        s = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
+        result.extend(w.lower() for w in s.split('_') if len(w) >= 2)
+    seen: dict = {}
+    for w in result:
+        seen.setdefault(w, None)
+    return list(seen)
+
+
+def _build_line_to_file(map_path: str) -> dict:
+    """Return {line_number: file_path} for every line in map.txt.
+
+    File ownership: nearest non-indented, non-comment line above.
+    """
+    with open(map_path, encoding='utf-8', errors='replace') as f:
+        lines = f.readlines()
+    result = {}
+    current_file = None
+    for i, line in enumerate(lines, 1):
+        stripped = line.rstrip('\n')
+        if stripped and not stripped[0].isspace() and not stripped.startswith('#'):
+            current_file = stripped.strip()
+        if current_file:
+            result[i] = current_file
+    return result
+
+
+def keyword_to_files(map_path: str, word: str) -> list:
+    """Return list of files where *word* appears, in order of first occurrence."""
+    import csv as _csv
+
+    kw_path = os.path.join(os.path.dirname(os.path.abspath(map_path)), 'keyword.txt')
+    if not os.path.exists(kw_path):
+        return []
+
+    line_nums = []
+    _csv.field_size_limit(10_000_000)
+    with open(kw_path, encoding='utf-8', newline='') as f:
+        reader = _csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if len(row) >= 3 and row[0] == word:
+                line_nums = [int(x) for x in row[2].split(';') if x]
+                break
+
+    if not line_nums:
+        return []
+
+    line_to_file = _build_line_to_file(map_path)
+    seen: set = set()
+    files = []
+    for ln in line_nums:
+        f = line_to_file.get(ln)
+        if f and f not in seen:
+            seen.add(f)
+            files.append(f)
+    return files
+
+
 # ── CLI entry point ─────────────────────────────────────────────────────────────
 
 def main():

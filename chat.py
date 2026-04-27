@@ -916,7 +916,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
     CSV format: word, count, semicolon-separated list of line numbers in map.txt.
     Sorted alphabetically. Run once after /map index (or whenever map changes).
     e.g.  /map keyword index
-/map keyword extract <text or file> [-a] [-f] [-n] [-c]
+/map keyword extract <text or file> [-a] [-s] [-f] [-l] [-n] [-c] [-o]
     Extract real identifiers from keyword.txt matching words in the given text or file.
     Output is always real identifiers from keyword.txt — never synthetic splits.
     Default (exact): query word must exactly match a keyword.txt entry.
@@ -928,16 +928,20 @@ Output capture operators (work with any command — LLM reply, tool, proc):
         "RuleIndex" → matches RuleIndex only (needs both 'rule' AND 'index')
         "coverage"  → matches CoverageMetric, LineCoverage, BranchCoverage
         "RuleIndex" → does NOT match Rule (missing 'index') or Index (missing 'rule')
+    -l  like match (%token%): any keyword containing the query token as substring
+        "rule" → RuleIndex, rule_validator, parseRule, getRuleSet
     -a  alphabetical order
     -s  sort by codebase count descending (most frequent first)
     -n  show codebase count next to each word: RuleIndex(25) RuleName(12)
         (-n implies -s)
     -c  comma-separated output instead of one per line
+    -o  show origin: which files each keyword appears in: keyword -> file1, file2
     e.g.  /map keyword extract notes.txt
           /map keyword extract notes.txt -f
+          /map keyword extract notes.txt -l
           /map keyword extract notes.txt -f -n -c
           /map keyword extract "add isbn field to the Book class" -f -a
-          /map keyword extract "fix rule search" -f -c
+          /map keyword extract "fix rule search" -l -o
 
 /hook before|after <cmd> <script>
     Run a script before or after a command (edit, patch, fix, insert).
@@ -1175,8 +1179,11 @@ def _fmt_ctx(n: int) -> str:
 
 
 def read_file(path, start=None, end=None, line_numbers=True):
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        raise ValueError(f"[read] {path}: binary file, cannot read as text")
     total = len(lines)
     if start is not None:
         start = max(1, start)
@@ -3828,7 +3835,7 @@ advanced_tools =
                     _ok(f"context: injected {label}")
             except FileNotFoundError:
                 print(f"file not found: {path}")
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 _err(e)
 
     def _cmd_edit(self, user_input: str):
@@ -7731,11 +7738,13 @@ Config stored in ~/.1bcoder/translate.json
         sort_alpha  = "-a" in args
         sort_count  = "-s" in args
         fuzzy       = "-f" in args
+        like        = "-l" in args
         show_counts = "-n" in args
         csv_out     = "-c" in args
-        src_tokens  = [a for a in args if a not in ("-a", "-s", "-f", "-n", "-c")]
+        show_origin = "-o" in args
+        src_tokens  = [a for a in args if a not in ("-a", "-s", "-f", "-l", "-n", "-c", "-o")]
         if not src_tokens:
-            print("usage: /map keyword extract <text or file> [-a] [-s] [-f] [-n] [-c]")
+            print("usage: /map keyword extract <text or file> [-a] [-s] [-f] [-l] [-n] [-c] [-o]")
             return
         # load keyword vocab: word → count
         _csv.field_size_limit(10_000_000)  # lines field can be large for common words
@@ -7777,6 +7786,12 @@ Config stored in ~/.1bcoder/translate.json
                     # keyword matches if ALL query subwords are present in keyword's subwords
                     if query_parts <= kp and kw not in seen:
                         seen[kw] = i
+        elif like:
+            for i, m in enumerate(token_re.finditer(text)):
+                token = m.group().lower()
+                for j, kw in enumerate(kw_freq):
+                    if token in kw.lower() and kw not in seen:
+                        seen[kw] = i * 100000 + j
         else:
             # default: exact identifier match
             kw_set = set(kw_freq)
@@ -7793,6 +7808,30 @@ Config stored in ~/.1bcoder/translate.json
             result = sorted(seen, key=lambda w: (-kw_freq[w], w.lower()))
         else:
             result = sorted(seen, key=lambda w: (seen[w], w.lower()))
+        if show_origin:
+            map_path = os.path.join(BCODER_DIR, "map.txt")
+            line_to_file = map_query._build_line_to_file(map_path)
+            # load line numbers column from keyword.txt
+            kw_lines: dict = {}
+            with open(kw_path, encoding="utf-8", newline="") as f:
+                reader2 = _csv.reader(f)
+                next(reader2, None)
+                for row in reader2:
+                    if len(row) >= 3 and row[0] in seen:
+                        kw_lines[row[0]] = [int(x) for x in row[2].split(";") if x]
+            lines_out = []
+            for w in result:
+                label = f"{w}({kw_freq[w]})" if show_counts else w
+                files: list = []
+                seen_files: set = set()
+                for ln in kw_lines.get(w, []):
+                    f = line_to_file.get(ln)
+                    if f and f not in seen_files:
+                        seen_files.add(f)
+                        files.append(f)
+                lines_out.append(f"{label} -> {', '.join(files)}" if files else label)
+            print("\n".join(lines_out))
+            return
         if show_counts:
             items = [f"{w}({kw_freq[w]})" for w in result]
         else:

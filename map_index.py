@@ -292,15 +292,18 @@ def build_map(root: str, depth: int = 2, map_path: str = None) -> str:
                 global_index[name] = rel
 
     # ── link phase (changed files only) ──────────────────────────────────────────
+    global_set = set(global_index.keys())
     file_links = {}   # rel → { target_rel → { name → kind } }
     for rel, text in tqdm(file_content.items(), desc="linking", unit="file", file=sys.stderr):
+        tokens_in_file = set(_WORD_RE.findall(text))
+        candidates = tokens_in_file & global_set
         by_target = {}
-        for name, target_rel in global_index.items():
+        for name in candidates:
+            target_rel = global_index[name]
             if target_rel == rel:
                 continue
-            if re.search(r'\b' + re.escape(name) + r'\b', text):
-                kind = classify_ref(name, text)
-                by_target.setdefault(target_rel, {})[name] = kind
+            kind = classify_ref(name, text)
+            by_target.setdefault(target_rel, {})[name] = kind
         file_links[rel] = by_target
 
     # ── format output ────────────────────────────────────────────────────────────

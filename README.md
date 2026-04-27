@@ -44,7 +44,7 @@ Key design decisions:
 - **Short agent system prompts, at most 5 tools per agent, one function per agent** — `ask`, `edit`, `fill`, `scan`, `compact`. Not universal agents with bloated skill sets.
 - **Tolerant of long and malformed output** — post-processing is automatic; the programmer does not teach the model JSON syntax.
 - **`/parallel`** — send the same context to several models simultaneously and combine results; a 0.5b and a 1b model working together often outperform either alone; designed to coordinate small models running on multiple machines or phones.
-- **`/map`** — project structure index with structural diff; lets the model navigate a codebase without loading it into context.
+- **`/map`** — project structure index with structural diff and keyword grounding; lets the model navigate a codebase without loading it into context. Keyword extract supports three modes: exact, like (`%token%`), and fuzzy (subword); `-o` resolves each keyword to the files it appears in.
 - **`/ctx`** — surgical context management: savepoints, selective compaction, named context library, multi-turn rollback. Small models cannot afford wasted tokens.
 - **`/scan`** — reads any large file chunk by chunk and builds a themed summary without overflowing context.
 - **`/proc`** — parameterized command scripts for repeatable preparation workflows.
@@ -523,8 +523,8 @@ The map command scans your project with language-agnostic regex, extracts defini
 /map trace <start> <end> [-y]                  — shortest dependency path between two points
 /map idiff [path] [depth]                      — re-index then show diff vs previous snapshot
 /map diff                                      — show diff without re-indexing (safe to repeat)
-/map keyword index                             — build keyword vocabulary from map.txt
-/map keyword extract <text> [-f] [-a] [-n] [-c] — extract real identifiers from keyword.txt matching text/file
+/map keyword index                                  — build keyword vocabulary from map.txt
+/map keyword extract <text> [-f] [-l] [-a] [-s] [-n] [-c] [-o] — extract real identifiers from keyword.txt matching text/file
 ```
 
 **Partial / incremental indexing** — for large codebases where a full re-scan is slow:
@@ -566,6 +566,33 @@ This lets you re-index a changed module in seconds instead of hours.
 /map find \py -!import                   — show only non-import lines in .py files
 /map find password -d 1                  — just filenames, no details
 /map find models -d 2                    — filenames + defines/vars only
+```
+
+**`/map keyword`** — two-step identifier grounding:
+
+```
+/map keyword index                   — scan map.txt → .1bcoder/keyword.txt (word, count, line refs)
+/map keyword extract "fix rule search" -l -o   — find identifiers, show which files they're in
+```
+
+Extract flags:
+
+| Flag | Mode | Effect |
+|---|---|---|
+| *(none)* | exact | query word must exactly match a keyword |
+| `-f` | fuzzy | splits camelCase/snake_case into subwords; matches if all query subwords (≥5 chars) appear in the identifier |
+| `-l` | like | substring match: any keyword containing the token (`%token%`) |
+| `-n` | — | show frequency count: `RuleIndex(25)` |
+| `-s` | — | sort by frequency descending |
+| `-a` | — | sort alphabetically |
+| `-c` | — | comma-separated output (default: one per line) |
+| `-o` | — | show origin files: `parameter_rule -> lib/cop/rule.rb, config/default.yml` |
+
+```
+/map keyword extract "add validation rule" -l -o
+# parameter_rule -> lib/rubocop/cop/style/rule.rb, config/default.yml
+# cop_rule       -> lib/rubocop/cop/base.rb
+# load_rules     -> lib/rubocop/config_loader.rb
 ```
 
 **`/map trace`** — three modes:
