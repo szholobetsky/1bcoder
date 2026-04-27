@@ -1,3 +1,5 @@
+![1bcoder](images/1bcoder.png)
+
 # 1bcoder
 
 AI coding assistant for small local models (0.5B–4B) — runs via [Ollama](https://ollama.com), [LMStudio](https://lmstudio.ai), or any OpenAI-compatible backend.
