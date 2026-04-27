@@ -2326,6 +2326,7 @@ class CoderCLI:
         self._last_find_results: list = []  # numbered results from last /proj find
         self._history: list[str] = []
         self.cmd_history: list[str] = []   # all /commands typed this session
+        self.log_requests: bool = False    # /param log true — print request body + error detail
         # enable readline history if available
         try:
             import readline
@@ -2376,6 +2377,9 @@ class CoderCLI:
             if self.provider == "openai":
                 body = {"model": self.model, "messages": messages, "stream": True}
                 body.update(self.params)
+                if self.log_requests:
+                    print(f"  [log] POST {self.base_url}/v1/chat/completions")
+                    print(f"  [log] model={self.model} messages={len(messages)} params={self.params}")
                 with requests.post(
                     f"{self.base_url}/v1/chat/completions",
                     json=body, stream=True, timeout=self.timeout,
@@ -2436,6 +2440,9 @@ class CoderCLI:
             else:
                 opts = {"num_ctx": self.num_ctx}
                 opts.update(self.params)
+                if self.log_requests:
+                    print(f"  [log] POST {self.base_url}/api/chat")
+                    print(f"  [log] model={self.model} messages={len(messages)} options={opts}")
                 with requests.post(
                     f"{self.base_url}/api/chat",
                     json={"model": self.model, "messages": messages, "stream": True,
@@ -2494,6 +2501,13 @@ class CoderCLI:
             return None  # sentinel: interrupted (vs "" which means empty reply)
         except requests.exceptions.RequestException as e:
             print(f"\nerror: {e}")
+            if hasattr(e, "response") and e.response is not None:
+                body = e.response.text.strip()
+                if body:
+                    print(f"  detail: {body[:500]}")
+                if self.log_requests:
+                    print(f"  [log] status: {e.response.status_code}")
+                    print(f"  [log] headers: {dict(e.response.headers)}")
             return ""
         print()
         reply = "".join(chunks)
@@ -2882,6 +2896,7 @@ advanced_tools =
             print(f"  num_ctx        = {self.num_ctx}")
             print(f"  think_exclude  = {not self.think_in_ctx}  (strip <think> blocks from context)")
             print(f"  think_show     = {self.think_show}  (show <think> blocks in terminal)")
+            print(f"  log            = {self.log_requests}  (print request body + error detail)")
             print(f"  ask_limit      = {self.params.get('ask_limit', ASK_RESULT_LIMIT_CHARS)}  (chars, /ask truncation limit)")
             print(f"  ask_show       = {self.params.get('ask_show',  ASK_RESULT_SHOW_CHARS)}  (chars shown when truncated)")
             model_params = {k: v for k, v in self.params.items() if k not in ("ask_limit", "ask_show")}
@@ -2926,6 +2941,10 @@ advanced_tools =
         if key == "think_show":
             self.think_show = bool(val)
             _ok(f"[param] think_show = {self.think_show}")
+            return
+        if key == "log":
+            self.log_requests = bool(val)
+            _ok(f"[param] log = {self.log_requests}")
             return
         self.params[key] = val
         _ok(f"[param] {key} = {val}")
