@@ -22,6 +22,7 @@ Filter token syntax for find:
     \\!term exclude entire block if any child contains term
     -term   show ONLY child lines containing term
     -!term  hide child lines containing term
+    +term   show ONLY child lines containing term AND hide file if none match
 
     (no tokens → print full map)
 
@@ -154,13 +155,14 @@ def find_map(map_path: str, query: str) -> tuple:
     with open(map_path, encoding='utf-8') as f:
         content = f.read()
 
-    tokens     = query.split()
-    pos_file   = []   # term   — filename must contain
-    neg_file   = []   # !term  — filename must NOT contain
-    pos_child  = []   # \term  — include block if any child line contains (all terms same line)
-    neg_block  = []   # \!term — exclude block if any child line contains
-    show_lines = []   # -term  — show ONLY child lines containing term (whitelist)
-    hide_lines = []   # -!term — hide child lines containing term
+    tokens          = query.split()
+    pos_file        = []   # term   — filename must contain
+    neg_file        = []   # !term  — filename must NOT contain
+    pos_child       = []   # \term  — include block if any child line contains (all terms same line)
+    neg_block       = []   # \!term — exclude block if any child line contains
+    show_lines      = []   # -term  — show ONLY child lines containing term (keep file even if empty)
+    hide_lines      = []   # -!term — hide child lines containing term
+    must_show_lines = []   # +term  — show ONLY child lines containing term AND hide file if none match
 
     for t in tokens:
         if t.startswith('\\!') and len(t) > 2:
@@ -171,13 +173,15 @@ def find_map(map_path: str, query: str) -> tuple:
             hide_lines.append(t[2:].lower())
         elif t.startswith('-') and len(t) > 1:
             show_lines.append(t[1:].lower())
+        elif t.startswith('+') and len(t) > 1:
+            must_show_lines.append(t[1:].lower())
         elif t.startswith('!') and len(t) > 1:
             neg_file.append(t[1:].lower())
         else:
             pos_file.append(t.lower())
 
     # no criteria → return full map
-    if not any([pos_file, neg_file, pos_child, neg_block, show_lines, hide_lines]):
+    if not any([pos_file, neg_file, pos_child, neg_block, show_lines, hide_lines, must_show_lines]):
         return [], content
 
     blocks = re.split(r'\n(?=\S)', content)
@@ -201,6 +205,11 @@ def find_map(map_path: str, query: str) -> tuple:
         if show_lines:
             child_lines = [l for l in child_lines
                            if any(t in l.lower() for t in show_lines)]
+        if must_show_lines:
+            child_lines = [l for l in child_lines
+                           if any(t in l.lower() for t in must_show_lines)]
+            if not child_lines:
+                return None
         if hide_lines:
             child_lines = [l for l in child_lines
                            if not any(t in l.lower() for t in hide_lines)]

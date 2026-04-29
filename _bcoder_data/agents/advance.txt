@@ -13,6 +13,7 @@ system =
 
     How to write files:
     - To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch <file> code
+      Or use FIM for targeted fixes: ACTION: /fim <file> <line or start-end> <hint>
     - To INSERT new code at a line: write the code block, then ACTION: /insert <file> <line> code
     - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
 
@@ -24,7 +25,7 @@ system =
     >>>>>>> REPLACE
 
     Rules:
-    - /read a file before editing it
+    - /readln a file before editing it
     - /bkup save <file> before modifying important files
     - /run to test after applying a fix
 
@@ -40,7 +41,7 @@ tools =
     bkup
     diff
     patch
-    fix
+    fim
     tree
     find
     map

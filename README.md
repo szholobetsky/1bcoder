@@ -115,7 +115,7 @@ Tasks that require the model to decide *what to look at* — refactoring across 
 - **Command autocorrection** — typos in command names, file paths, and keywords are detected and fixed automatically before execution, for both human input and agent actions
 - **`/tree [path]`** — display directory tree of the whole project or any subtree; ask to inject into context (or pass `ctx` to skip the prompt)
 - **`/find <pattern>`** — search filenames and file content with regex; supports `-f`/`-c`/`-i`/`--ext` flags; highlights matches, asks to inject results into context; sets `{{find_files}}` after every search; **`/find <terms> -r`** ranked BM25 mode returns top-10 files by relevance; hidden directories (`.git`, `.venv`, etc.) excluded automatically
-- AI proposes a **one-line fix** (`/fix`) or a **SEARCH/REPLACE patch** (`/patch`) — always shows a diff before applying
+- AI proposes a **one-line fix** (`/fix`), a **SEARCH/REPLACE patch** (`/patch`), or a **FIM-based fix** (`/fim`) — always shows a unified diff before applying
 - **Apply AI code blocks directly** with `/edit <file> code` (new/full file) or `/patch <file> code` (SEARCH/REPLACE from reply, no line numbers needed) — preferred for agent mode
 - **`<think>` tag support** — reasoning blocks shown in terminal by default; `/think hide` suppresses terminal display; `/think include` keeps reasoning in context for chained turns
 - Run shell commands and inject their output with `/run`
@@ -440,10 +440,12 @@ Then configure `/translate` to use it:
 | Command | Description |
 |---|---|
 | `/fix <file> [start-end] [hint]` | AI proposes one-line fix, shows diff, asks to apply |
+| `/fim <file> <line or start-end> [-w N] [hint]` | FIM-based fix — model rewrites the marked section, shows unified diff |
 | `/patch <file> [start-end] [hint]` | AI proposes SEARCH/REPLACE block, shows unified diff |
 | `/patch <file> code` | Apply SEARCH/REPLACE block from last AI reply (no new LLM call) |
 
-`/fix` is designed for 1B models — output is strictly constrained to `LINE N: content`.
+`/fix` asks the model to output `LINE N: content` — simple but small models often lose indentation.
+`/fim` (Fill-In-the-Middle) marks the target line(s) with `<<<...>>>` inside the full file, asks the model to return the corrected file, then diffs the result — no output format to learn, grammar constraints come from the surrounding code. Use `-w N` to limit context to N lines around the target when the file is larger than the context window.
 `/patch` works better with larger models (7B+) and can replace multiple consecutive lines.
 `/patch <file> code` is the preferred agent mode edit — the agent writes the SEARCH/REPLACE block in its reply, then calls `/patch <file> code` to apply it without needing line numbers.
 
@@ -452,6 +454,9 @@ When `/patch` fails to find the SEARCH text it shows a diagnostic diff — the S
 ```
 /fix main.py
 /fix main.py 2-2 wrong operator
+/fim main.py 3 replace != with ==
+/fim main.py 3-5 fix the logic
+/fim huge_file.py 14567 -w 20 fix indentation
 /patch main.py 10-40 fix the loop logic
 /patch main.py code
 ```
@@ -1726,7 +1731,7 @@ On Windows: hold `Shift` and drag with the left mouse button to select and copy 
 ## Tips for 1B models
 
 - **Start small.** Use `/read file.py 10-25` instead of loading the whole file. Short context = better focus.
-- **Use `/fix` not `/patch`.** The `LINE N: content` format is much more reliable at 1B scale than free-form generation.
+- **Try `/fim` for tricky fixes.** FIM-based editing activates the model's grammar knowledge through surrounding code context — more reliable than `/fix` for indentation and multi-line logic. Use `-w 20` for large files.
 - **Build a map first.** Run `/map index .` at the start of a session, then use `/map find` to load only the relevant parts into context.
 - **Use scripts.** Scripts make multi-step work reproducible — the model only needs to handle one step at a time.
 - **Capture workflows.** After solving a task manually, run `/script create ctx` to save the exact steps as a reusable script.

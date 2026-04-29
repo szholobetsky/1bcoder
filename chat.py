@@ -225,7 +225,7 @@ PROFILES_FILE        = os.path.join(BCODER_DIR, "profiles.txt")
 GLOBAL_PROFILES_FILE = os.path.join(HOME_BCODER_DIR, "profiles.txt")
 
 DEFAULT_AGENT_TOOLS = [
-    "read", "tree", "find", "insert", "save", "patch",
+    "read", "readln", "tree", "find", "insert", "save", "fim",
 ]
 
 DEFAULT_AGENT_TOOLS_ADVANCED = [
@@ -247,33 +247,19 @@ AGENT_SYSTEM_BASIC = """\
 You are a coding assistant. Complete the task using the available tools.
 
 To call a tool, write ACTION: on its own line. Wait for [tool result].
-Run actions in a loop until the task is complete.
-When all actions are done, write a short summary with no ACTION and end with: Task is complete.
+Run one action at a time until the task is complete.
+When done, write a short summary with no ACTION and end with: Task is complete.
 
-Available actions:
-  ACTION: /read <file>            ← read whole file
-  ACTION: /read <file> 35-55     ← read lines 35–55
+To fix or edit a file:
+  ACTION: /fim <file> <description of what to fix>
+  Example: ACTION: /fim calc.py fix the division by zero bug
+  Example: ACTION: /fim main.py fix the indentation on line 5
 
-To modify a file:
-1. Write the code block (```...```)
-2. Then call:
-   ACTION: /insert <file> <line> code        ← insert code block before line N
-   ACTION: /insert <file> <line> <text>      ← insert literal text before line N
-   ACTION: /patch <file> code                ← apply SEARCH/REPLACE block
-   ACTION: /save <file> code                 ← save or overwrite whole file
+To read a file:
+  ACTION: /read <file>
 
-The keyword "code" in the action means: use the last code block (``` ```) written above as the content.
-
-SEARCH/REPLACE format for /patch:
-<<<<<<< SEARCH
-exact lines to replace
-=======
-new lines
->>>>>>> REPLACE
-
-Rules:
-- If you don't know the project structure, start with ACTION: /tree
-- Always /read a file before inserting or patching it.
+To create or fully replace a file: write the full code block, then:
+  ACTION: /save <file> code
 
 Available tools:
 {tool_list}
@@ -287,6 +273,7 @@ When the task is complete, write a short summary and end with: Task is complete.
 
 How to write files (the keyword "code" means: use the last ``` ``` block written above):
 - To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch <file> code
+  Or use FIM for targeted fixes: ACTION: /fim <file> <line or start-end> <hint>
 - To INSERT new code at a line: write the code block, then ACTION: /insert <file> <line> code
 - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
 
@@ -298,7 +285,7 @@ new lines
 >>>>>>> REPLACE
 
 Rules:
-- /read a file before editing it
+- /readln a file before editing it
 - /bkup save <file> before modifying important files
 - /run to test after applying a fix
 
@@ -339,7 +326,7 @@ FIX_SYSTEM = (
     "You are a code repair tool. "
     "Respond with ONLY the single most important fix in this exact format:\n"
     "LINE <number>: <corrected line content>\n"
-    "One fix only. No explanation. No other text. Preserve indentation."
+    "One fix only. No explanation. No other text."
 )
 
 PATCH_SYSTEM = (
@@ -449,6 +436,16 @@ Commands
     e.g.  /fix main.py
           /fix main.py 2-2
           /fix main.py 2-2 wrong operator
+
+/fim <file> [line or start-end] [-w N] [hint]
+    FIM-based fix. Marks the line(s), passes file to model, diffs the result.
+    Without a line number: passes the whole file with hint only (agent fallback mode).
+    -w N  pass only N lines of context around the marked section (for large files).
+    e.g.  /fim main.py 3
+          /fim main.py 3 replace != with ==
+          /fim main.py 3-5 fix the logic
+          /fim huge.py 14567 -w 20 fix indentation
+          /fim main.py fix the division by zero bug
 
 /patch <file> [start-end] [hint]
     AI proposes a multi-line SEARCH/REPLACE edit. Shows unified diff before applying.
@@ -874,6 +871,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
       \\!term exclude entire block if any child contains term
       -term   show ONLY child lines containing term
       -!term  hide child lines containing term
+      +term   like -term but also hides files with no matching children
     e.g.  /map find register
           /map find \\register !mock
           /map find auth \\UserService -!deprecated -y
@@ -1269,6 +1267,54 @@ def ai_fix(base_url, model, content, label, hint="", on_chunk=None, provider="ol
     if m:
         return int(m.group(1)), m.group(2).rstrip()
     return None, raw
+
+
+def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, provider="ollama"):
+    """FIM-based fix: marks line range in the whole file, asks model for corrected file.
+    If start is None: no marker — whole file passed with hint only (agent fallback mode)."""
+    if start is None:
+        file_content = "".join(file_lines)
+        user_msg = file_content + "\nFix the issue. Output the complete corrected file."
+    else:
+        marked = list(file_lines)
+        if start == end:
+            marked[start - 1] = f"<<<{file_lines[start - 1].rstrip()}>>>\n"
+        else:
+            marked[start - 1] = "<<<\n" + file_lines[start - 1]
+            marked[end - 1]   = file_lines[end - 1].rstrip() + "\n>>>\n"
+        file_content = "".join(marked)
+        user_msg = file_content + "\nFix the <<<...>>> section. Output the complete corrected file."
+    if hint:
+        user_msg = f"{hint}\n\n{user_msg}"
+    msgs = [{"role": "user", "content": user_msg}]
+    chunks = []
+    if provider == "openai":
+        with requests.post(
+            f"{base_url}/v1/chat/completions",
+            json={"model": model, "messages": msgs, "stream": True},
+            stream=True, timeout=120,
+        ) as resp:
+            resp.raise_for_status()
+            _parse_openai_stream(resp, on_chunk, chunks)
+    else:
+        with requests.post(
+            f"{base_url}/api/chat",
+            json={"model": model, "messages": msgs, "stream": True},
+            stream=True, timeout=120,
+        ) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                chunk = data.get("message", {}).get("content", "")
+                if chunk:
+                    if on_chunk:
+                        on_chunk(chunk)
+                    chunks.append(chunk)
+                if data.get("done"):
+                    break
+    return "".join(chunks)
 
 
 def _parse_patch(text):
@@ -1984,7 +2030,7 @@ def _map_patch_remove(map_path: str, rel_prefix: str) -> int:
 
 _KNOWN_CMDS = [
     "/read", "/readln", "/insert", "/edit", "/save", "/run", "/script", "/mcp",
-    "/parallel", "/patch", "/fix", "/bkup", "/diff", "/agent", "/tree",
+    "/parallel", "/patch", "/fix", "/fim", "/bkup", "/diff", "/agent", "/tree",
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
@@ -2720,6 +2766,8 @@ class CoderCLI:
             if self._run_hook("before_patch", _ha):
                 self._cmd_patch(user_input)
                 self._run_hook("after_patch", _ha)
+        elif user_input.startswith("/fim"):
+            self._cmd_fill(user_input)
         elif user_input.startswith("/fix"):
             _ha = self._extract_hook_args(user_input)
             if self._run_hook("before_fix", _ha):
@@ -2897,6 +2945,7 @@ advanced_tools =
             print(f"  think_exclude  = {not self.think_in_ctx}  (strip <think> blocks from context)")
             print(f"  think_show     = {self.think_show}  (show <think> blocks in terminal)")
             print(f"  log            = {self.log_requests}  (print request body + error detail)")
+            print(f"  run_timeout    = {self.params.get('run_timeout', 30)}s  (0 = no timeout, for /run commands)")
             print(f"  ask_limit      = {self.params.get('ask_limit', ASK_RESULT_LIMIT_CHARS)}  (chars, /ask truncation limit)")
             print(f"  ask_show       = {self.params.get('ask_show',  ASK_RESULT_SHOW_CHARS)}  (chars shown when truncated)")
             model_params = {k: v for k, v in self.params.items() if k not in ("ask_limit", "ask_show")}
@@ -4080,7 +4129,7 @@ advanced_tools =
             return
         try:
             current_text, _ = read_file(path, lineno, lineno)
-            current_text = current_text.split(":", 1)[1].rstrip("\n") if ":" in current_text else current_text.rstrip()
+            current_text = current_text.split(":", 1)[1][1:].rstrip("\n") if ":" in current_text else current_text.rstrip()
             print(f"  current [{lineno}]: {current_text}")
             print(f"  new     [{lineno}]: {new_content}")
         except (FileNotFoundError, OSError):
@@ -4090,6 +4139,95 @@ advanced_tools =
                 edit_line(path, lineno, new_content)
                 print(f"[line {lineno} updated in {path}]")
             except (ValueError, OSError) as e:
+                _err(e)
+        else:
+            print("[skipped]")
+
+    def _cmd_fill(self, user_input: str):
+        parts = user_input[4:].strip().split(None, 2)
+        path = parts[0] if parts else ""
+        start = end = None
+        hint = ""
+        if not path:
+            print("usage: /fim <file> <line or start-end> [-w N] [hint]")
+            return
+        if len(parts) >= 2:
+            m = re.match(r'^(\d+)(?:-(\d+))?$', parts[1])
+            if m:
+                start = int(m.group(1))
+                end   = int(m.group(2)) if m.group(2) else start
+                hint  = parts[2] if len(parts) >= 3 else ""
+            else:
+                hint = " ".join(parts[1:])
+        if start is None and not hint:
+            print("usage: /fim <file> [line or start-end] [-w N] [hint]")
+            return
+        # extract -w <window> from hint
+        window = None
+        wm = re.search(r'(?:^|\s)-w\s+(\d+)', hint)
+        if wm:
+            window = int(wm.group(1))
+            hint = (hint[:wm.start()] + hint[wm.end():]).strip()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                file_lines = f.readlines()
+        except (FileNotFoundError, OSError) as e:
+            _err(e)
+            return
+        total = len(file_lines)
+        if start is not None and (start < 1 or end > total):
+            _err(f"line {start}-{end} out of range (file has {total} lines)")
+            return
+        # compute slice for windowed mode (only when line range is given)
+        if start is not None and window is not None:
+            w_start = max(0, start - 1 - window)          # 0-indexed inclusive
+            w_end   = min(total, end + window)             # 0-indexed exclusive
+            slice_lines = file_lines[w_start:w_end]
+            rel_start   = start - w_start                  # 1-indexed within slice
+            rel_end     = end   - w_start
+        else:
+            slice_lines = file_lines
+            rel_start, rel_end = start, end
+            w_start, w_end = 0, total
+        if hint:
+            print(f"hint: {hint}")
+        if window is not None:
+            print(f"[fim] window: lines {w_start+1}–{w_end} of {total}")
+        self._sep("AI")
+        def on_chunk(c):
+            sys.stdout.write(c)
+            sys.stdout.flush()
+        try:
+            raw = ai_fill(self.base_url, self.model, slice_lines, rel_start, rel_end, hint, on_chunk, self.provider)
+        except KeyboardInterrupt:
+            print("\n[interrupted]")
+            return
+        except requests.exceptions.RequestException as e:
+            print(f"\nerror: {e}")
+            if hasattr(e, "response") and e.response is not None:
+                body = e.response.text.strip()
+                if body:
+                    print(f"  detail: {body[:500]}")
+            return
+        print()
+        m = re.search(r'```(?:\w+)?\n(.*?)\n```', raw, re.DOTALL)
+        new_content = m.group(1) if m else raw.strip()
+        new_slice = [l if l.endswith('\n') else l + '\n' for l in new_content.splitlines()]
+        # reconstruct full file: unchanged prefix + new slice + unchanged suffix
+        full_new = file_lines[:w_start] + new_slice + file_lines[w_end:]
+        diff = list(difflib.unified_diff(file_lines, full_new, fromfile=path, tofile=path + " (fixed)", lineterm=""))
+        if not diff:
+            print("[fim] no changes detected — try a different hint or model")
+            return
+        for dline in diff:
+            print(_cdiff(dline))
+        if self._confirm("  apply? [Y/n]:"):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(full_new)
+                changed = sum(1 for d in diff if d.startswith('+') and not d.startswith('+++'))
+                print(f"[{changed} line(s) updated in {path}]")
+            except OSError as e:
                 _err(e)
         else:
             print("[skipped]")
@@ -4322,7 +4460,7 @@ advanced_tools =
         if search_text is None:
             print("could not parse SEARCH/REPLACE block — try a more capable model")
             return
-        if search_text.strip() == replace_text.strip():
+        if search_text == replace_text:
             _warn("[patch] SEARCH and REPLACE are identical — model included the new code in both blocks (no-op)")
             return
         try:
@@ -4473,9 +4611,11 @@ advanced_tools =
 
     def _cmd_run(self, shell_cmd: str):
         print(f"$ {shell_cmd}")
+        run_timeout = self.params.get("run_timeout", 30)
         try:
             proc = subprocess.run(
-                shell_cmd, shell=True, capture_output=True, timeout=30,
+                shell_cmd, shell=True, capture_output=True,
+                timeout=run_timeout if run_timeout else None,
                 encoding="utf-8", errors="replace",
             )
             output = proc.stdout + proc.stderr
@@ -7665,6 +7805,7 @@ Config stored in ~/.1bcoder/translate.json
             print("  /map find \\!term              — exclude block if any child contains term")
             print("  /map find -term                — show ONLY child lines containing term")
             print("  /map find -!term               — hide child lines containing term")
+            print("  /map find +term                — like -term but also hides files with no matching children")
             print("  combine freely: auth \\register !mock -!deprecated -y -d 2")
             print("  /map trace <identifier> [-d N] [-y]   — follow call chain backwards from identifier")
             print("  /map diff                      — diff map.txt vs map.prev.txt (no re-index)")
@@ -8294,13 +8435,7 @@ Config stored in ~/.1bcoder/translate.json
         if template is None:
             return user_input
         if "{{args}}" in template:
-            # Extract --flags separately; pass remaining args verbatim to preserve
-            # quoted segments and keywords like file: / plan: intact.
-            flags = re.findall(r'--\S+', args)
-            text  = re.sub(r'\s*--\S+', '', args).strip()
-            expanded = template.replace("{{args}}", text)
-            if flags:
-                expanded = expanded + " " + " ".join(flags)
+            expanded = template.replace("{{args}}", args)
         else:
             expanded = (template + (" " + args if args else "")).strip()
         return self._expand_alias(expanded, depth + 1)

@@ -17,6 +17,8 @@ These are handled by 1bcoder directly and are not forwarded to the model API.
 | `think_exclude` | `true` | Strip `<think>…</think>` blocks from context (blocks are shown in terminal only). Set `false` to keep reasoning in context for multi-turn chains. |
 | `ask_limit` | 8000 | Max characters of `/ask` tool output kept in context. |
 | `ask_show` | 500 | Characters shown in terminal when output is truncated. |
+| `run_timeout` | 30 | Timeout in seconds for `/run` shell commands. Set to `0` to disable (no timeout). Useful for long-running CLI tools like `simargl search`. |
+| `log` | `false` | Print full request details before each LLM call: URL, model, message count, options. Also prints HTTP response headers on error. Useful for debugging 500 errors or unexpected model behaviour. |
 
 ---
 
