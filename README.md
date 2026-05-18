@@ -29,8 +29,8 @@ This is not a niche concern. It is the default requirement for any serious profe
 | Size | Reliable in 1bcoder |
 |---|---|
 | 0.5b | Explain a 10–20 line function; identify a known technology from a file name; write a standard construct in an unfamiliar language |
-| 1b | Explain a full module; recognize a tech stack from a directory tree; answer questions about error messages and short log excerpts |
-| 1b thinking | Explain whole-file logic; identify design patterns across a module — still unreliable for editing |
+| 1b | Explain a full module; recognize a tech stack from a directory tree; answer questions about error messages and short log excerpts; edit single lines reliably with `/fim` |
+| 1b thinking | Explain whole-file logic; identify design patterns across a module; reliable for targeted edits with `/fim` |
 | 2b–4b | Edit files under instruction; write new functions; follow SEARCH/REPLACE format consistently |
 
 Every tier is useful. Each requires a different approach to context preparation. 1bcoder provides the tools to do that preparation with surgical precision.
@@ -111,7 +111,8 @@ Tasks that require the model to decide *what to look at* — refactoring across 
 ## Features
 
 - Plain terminal REPL — works in any shell, IDE terminal, or SSH session; status line before each prompt shows active model, disk size, quantization, native context limit, and context fill %
-- **`/read`** injects files without line numbers (clean text, ideal for `notes.txt` and structured data); **`/readln`** injects with line numbers (use before `/fix` or `/patch` when line references matter); both accept comma- or space-separated file lists — use directly with `{{find_files}}` or `{{map_files}}` captured from `/find` or `/map find`
+- **`/read`** injects files without line numbers (clean text, ideal for `notes.txt` and structured data); **`/readln`** injects with line numbers (use before `/fim`, `/fix`, or `/patch` when line references matter); both accept comma- or space-separated file lists — use directly with `{{find_files}}` or `{{map_files}}` captured from `/find` or `/map find`
+- **`/view <image> [prompt]`** — inject images into context for multimodal models (`qwen2-vl`, `llava`, `moondream`); trailing non-image words become the prompt; works with `@` file picker; supports png jpg jpeg gif webp bmp
 - **Command autocorrection** — typos in command names, file paths, and keywords are detected and fixed automatically before execution, for both human input and agent actions
 - **`/tree [path]`** — display directory tree of the whole project or any subtree; ask to inject into context (or pass `ctx` to skip the prompt)
 - **`/find <pattern>`** — search filenames and file content with regex; supports `-f`/`-c`/`-i`/`--ext` flags; highlights matches, asks to inject results into context; sets `{{find_files}}` after every search; **`/find <terms> -r`** ranked BM25 mode returns top-10 files by relevance; hidden directories (`.git`, `.venv`, etc.) excluded automatically
@@ -283,7 +284,7 @@ Examples:
 > /map index .
 > /read main.py 1-20
 > what does the divide() function do?
-> /fix main.py 5-5 wrong operator
+> /fim main.py 5 wrong operator
 ```
 
 ---
@@ -406,7 +407,8 @@ Then configure `/translate` to use it:
 | Command | Description |
 |---|---|
 | `/read <file> [file2 ...] [start-end]` | Inject file(s) into AI context **without line numbers** (clean text) |
-| `/readln <file> [file2 ...] [start-end]` | Same as `/read` but **with line numbers** — use before `/fix` or `/patch` |
+| `/readln <file> [file2 ...] [start-end]` | Same as `/read` but **with line numbers** — use before `/fim`, `/fix`, or `/patch` |
+| `/view <image> [image2 ...] [prompt]` | Inject image(s) for multimodal models — trailing non-image words become the prompt |
 | `/insert <file> <line>` | Insert last AI reply before line N (full text) |
 | `/insert <file> <line> code` | Insert extracted code block from last AI reply before line N |
 | `/insert <file> <line> <text>` | Insert literal text directly, preserving indentation (e.g. `/insert main.py 14    x = 1`) |
@@ -420,6 +422,8 @@ Then configure `/translate` to use it:
 | `/diff <file_a> <file_b> [-y]` | Show colored unified diff between two files; `-y` auto-injects into context |
 
 `/save` modes: `overwrite` (default), `append-above` / `-aa`, `append-below` / `-ab`, `add-suffix`, `code`
+
+Use `@/` to pick the target directory interactively: `/save @/result.txt code` shows a numbered directory tree, you pick a number, the token becomes `chosen_dir/result.txt`. Multiple `@/name` tokens in one command share a single pick.
 
 ```
 /diff main.py main.py.bkup          # colored diff, asks to inject into context
@@ -973,7 +977,7 @@ Lines starting with `[v]` are already done and skipped. Lines starting with `#` 
 | `/script apply [file] [key=value ...]` | Run steps one by one (Y/n/q per step) |
 | `/script apply -y [file] [key=value ...]` | Run all pending steps automatically |
 
-**`/script create ctx`** captures all work commands typed this session (`/read`, `/edit`, `/fix`, `/patch`, `/run`, `/save`, `/bkup`, `/map`, `/model`, `/host`) into a ready-to-run plan:
+**`/script create ctx`** captures all work commands typed this session (`/read`, `/edit`, `/fim`, `/fix`, `/patch`, `/run`, `/save`, `/bkup`, `/map`, `/model`, `/host`) into a ready-to-run plan:
 
 ```
 > /host http://192.168.1.50:11434
@@ -1064,12 +1068,14 @@ Any `{{key}}` found but not yet set is registered as NaN — `/script reapply` w
 
 ---
 
-### Output capture (`->`, `$` and `~`)
+### Output capture (`->`, `$`, `~` and `@`)
 
-Any command — LLM reply, tool output, or proc result — can be captured into a session variable using the `->` suffix. Two special tokens expand anywhere in a command or message:
+Any command — LLM reply, tool output, or proc result — can be captured into a session variable using the `->` suffix. Three special tokens expand anywhere in a command or message:
 
 - `$` — last captured output (last AI reply or tool result)
 - `~` — last user input (last message or command you typed)
+- `@[dir]` — file picker: shows a numbered tree rooted at `dir` (default: `.`); type a number to select a file; the token is replaced by the chosen path
+- `@/[suffix]` — directory picker: shows a numbered tree of directories; type a number; `@/suffix` is replaced by `chosen_dir/suffix`; multiple `@/suffix` tokens in one command share a single pick
 
 ```
 /map keyword extract auth.py -> keywords      # capture tool output into variable
@@ -1093,6 +1099,23 @@ summarize this for me -> myplan              # capture LLM reply
 /explain "$"                                 # ask small model to explain the reply
 поясни: $                                    # ask main model to explain its own reply
 ```
+
+**`@` — file picker (numbered tree):**
+```
+/readln @                                    # pick any file from current directory
+/readln @src                                 # pick from src/ subtree
+/fim @src fix the null check                 # pick file, then run /fim on it
+```
+Type `@` (optionally followed by a path, no space), press Enter — a numbered tree appears; type the number to substitute the path.
+
+**`@/` — directory picker:**
+```
+/save @/result.txt code                      # pick a directory, save to chosen_dir/result.txt
+/save @/result1.txt @/result2.txt code       # pick once, both tokens get the same prefix
+```
+Type `@/suffix` — a numbered tree of directories appears; pick one; every `@/suffix` in the command is replaced by `chosen_dir/suffix`. Use this when you want to save output into a deeply nested directory without typing the full path.
+
+`@` and `@/` work wherever `$` and `~` work: in any command or message.
 
 `->` stores the full text (including ANSI-stripped terminal output) and also updates `$` for immediate reuse. Variables captured with `->` appear in `/var get` like any other session variable.
 
@@ -1347,7 +1370,7 @@ Use `list:` when you want to explore a single question from multiple angles simu
 | `ctx: last` | Last message only (default) |
 | `ctx: none` | No context — prompt only |
 
-**`$` and `~` expansion** — `$` expands to the last AI reply, `~` to your last input:
+**`$`, `~` and `@` expansion** — `$` expands to the last AI reply, `~` to your last input, `@` opens a file picker:
 
 ```
 /parallel $  profile: short          # ask short model to summarise last reply
@@ -1808,6 +1831,6 @@ Together they cover the full development loop: understand the codebase, find rel
 
 ---
 
-**(c) 2026 Stanislav Zholobetskyi**
+**(c) 2026 Stanislav Zholobetskyi, Oleh Andriichuk**
 Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv
 *PhD research: «Intelligent Technology for Software Development and Maintenance Support»*

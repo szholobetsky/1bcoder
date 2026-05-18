@@ -10,6 +10,7 @@
 /scan       = /agent scan {{args}}
 /compact    = /agent compact {{args}}
 /websearch  = /agent websearch {{args}}
+/visual_search = /flow visual_search {{args}}
 /webask     = /flow webask {{args}}
 /simargl    = /run simargl {{args}}
 /sim        = /run simargl {{args}}

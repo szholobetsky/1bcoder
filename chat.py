@@ -392,6 +392,21 @@ Commands
           /readln models.py 40-60
           /readln {{find_files}}
 
+/view [--keep] <image> [image2 ...] [prompt]
+    Inject image(s) for multimodal models (qwen2-vl, llava, moondream, etc.).
+    Supported formats: png jpg jpeg gif webp bmp.
+    With prompt  — injects image and immediately calls the model.
+    Without prompt — injects silently; ask your question in the next message.
+    --keep  retain raw image bytes in context after the reply (default: strip).
+    Default (no --keep): after the model replies, the base64 image is removed
+    from context — only the text prompt and reply remain. Use this for agents
+    that process many images without overflowing the context window.
+    Works with @ file picker. Multiple images share one model call.
+    e.g.  /view screenshot.png what do you see?
+          /view diagram.png explain this architecture
+          /view @ is there a dog in this image? YES or NO
+          /view --keep ref.png before.png after.png what changed?
+
 /text
     Open a multi-line text editor and send the composed text to the AI.
     Enter = new line. To submit, use one of:
@@ -476,6 +491,8 @@ Commands
           /save index.html style.css code
           /save main.py code -ab     -> appends extracted code below
           /save out.txt add-suffix   -> out_1.txt, out_2.txt ...
+          /save @/result.txt code    -> pick dir with @/, save chosen_dir/result.txt
+          /save @/r1.txt @/r2.txt code  -> pick dir once, save two files there
 
 /script list              List all scripts (* = current). Shows global scripts (g:) and project scripts.
 /script open              Select and load a script (type number). Includes global and project scripts.
@@ -590,6 +607,27 @@ Commands
           /translate last mode:mini lang:de
           /translate off
 
+/visual setup host:<url> model:<name> [timeout:<s>] [profile:<name>]
+    Configure a dedicated vision model (separate from the main model).
+    Config stored globally in ~/.1bcoder/visual.json — persists across sessions.
+/visual status
+    Show current vision model configuration.
+/visual explain [<image>] [prompt] [-y]
+    Send image to the vision model in an isolated context (no conversation history shared).
+    If no image file given, uses the last image injected via /view.
+    Result is shown, sets $, then asks "Inject into context? [Y/n]".
+    -y or agent mode: auto-injects without asking.
+    Use this to get a text description from a vision model (moondream, qwen2-vl, llava)
+    and pass it to a non-vision main model (nemotron, deepseek-coder, etc.).
+    e.g.  /visual setup host:localhost:11434 model:moondream:v2
+          /visual setup host:localhost:11434 model:qwen3-vl:4b timeout:300
+          /visual setup profile:moondream
+          /visual explain screenshot.png
+          /visual explain diagram.png describe the architecture
+          /visual explain -y
+          /view diagram.png
+          /visual explain what technologies are shown?
+
 /web search <term> [-> varname]   Search DuckDuckGo; results shown + URLs saved to variable.
 /web fetch <url> [-n 4000]        Fetch URL, strip HTML, inject cleaned text into context.
     e.g.  /web search python asyncio tutorial -> urls
@@ -633,6 +671,11 @@ Output capture operators (work with any command — LLM reply, tool, proc):
   <command> -> <varname>   Capture all output of <command> into session variable <varname>.
   $                        Expand to the last captured output (last AI reply or tool output).
   ~                        Expand to the last user input (last message or command typed).
+  @[dir]                   File picker: show numbered tree (rooted at dir or . by default),
+                           type a number to select; the @[dir] token is replaced by the chosen path.
+  @/[suffix]               Directory picker: show numbered tree of directories,
+                           type a number; @/suffix → chosen_dir/suffix.
+                           Multiple @/suffix tokens in one command share the same pick.
     e.g.  /map keyword extract auth.py -> keywords
           /ask find files related to {{keywords}}
           summarize this for me -> myplan
@@ -640,6 +683,11 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /ask ~
           /small ~
           поясни: $
+          /readln @
+          /readln @src
+          /fim @src
+          /save @/result.txt code
+          /save @/result1.txt @/result2.txt code
 
 /role <persona>             Set a system role prepended to every chat request (survives /ctx clear).
 /role show                  Show the current role.
@@ -702,6 +750,8 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /ctx <n>                  Set context window size in tokens (default 8192).
 /ctx clear               Clear all conversation messages (keeps /param, num_ctx, and /var variables).
 /ctx clear <n>           Remove last N messages from context.
+/ctx clear view [N|all]        Strip base64 from oldest N (default 1) image messages.
+/ctx clear view last [N|all]   Strip base64 from newest N image messages.
 /ctx cut                 Remove oldest messages until context fits within the limit.
 /ctx compact             Ask AI to summarize the conversation, then replace context with the summary.
 /ctx compact <N>         Summarize last N messages in place, replace them with one compact block.
@@ -810,7 +860,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           [ctx: full|last|none]  [file: path [-n N]]
           [collect: compact [profile: name]]  [--seq]
     Send prompts to multiple models. No quotes required.
-    $ expands to last output, ~ expands to last input.
+    $ expands to last output, ~ expands to last input, @ triggers file picker, @/ triggers dir picker.
     Context sent to workers (default: ctx: last):
       ctx: full    send full conversation context
       ctx: last    send only the last message (default)
@@ -981,10 +1031,14 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /alias /ask = /agent ask
           /alias save /sql
 
+/agent list
+    List all named agents from .1bcoder/agents/ (* = local project) and ~/.1bcoder/agents/ (g = global).
+    Shows name and description for each agent.
 /agent <name> [-t N] [-y] <task> [plan: step1, step2, ...] [file: steps.md]
     Run a named agent defined in .1bcoder/agents/<name>.txt (local overrides global).
     Agent file defines: system prompt, tools, max_turns, auto_exec, aliases, params, before, gates.
-    e.g.  /agent ask what does this project do
+    e.g.  /agent list
+          /agent ask what does this project do
           /agent advance refactor the auth module
           /agent dbsearcher find all users created this week
     Direct command syntax also works: /dbsearcher find all users created this week
@@ -1810,6 +1864,20 @@ def _parse_plan_arg(raw: str):
     return [s.strip() for s in raw.split(',') if s.strip()], ""
 
 
+def _parse_path_arg(raw: str) -> list:
+    """Parse 'path:' argument — expand to sorted list of matching file paths."""
+    import glob as _glob
+    pattern = raw.strip()
+    if os.path.isdir(pattern):
+        files = []
+        for root, _, fnames in os.walk(pattern):
+            for fn in sorted(fnames):
+                files.append(os.path.join(root, fn).replace("\\", "/"))
+        return files
+    files = sorted(_glob.glob(pattern, recursive=True))
+    return [f.replace("\\", "/") for f in files]
+
+
 def _parse_file_arg(raw: str):
     """Parse 'file:' argument — load plan steps from a file (=== separator required).
 
@@ -2029,13 +2097,13 @@ def _map_patch_remove(map_path: str, rel_prefix: str) -> int:
 # ── command fixer ──────────────────────────────────────────────────────────────
 
 _KNOWN_CMDS = [
-    "/read", "/readln", "/insert", "/edit", "/save", "/run", "/script", "/mcp",
+    "/read", "/readln", "/view", "/insert", "/edit", "/save", "/run", "/script", "/mcp",
     "/parallel", "/patch", "/fix", "/fim", "/bkup", "/diff", "/agent", "/tree",
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
     "/doc", "/tempctx", "/proj", "/text", "/role", "/ask", "/translate",
-    "/web", "/flow",
+    "/web", "/flow", "/visual",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -2044,6 +2112,7 @@ _KNOWN_CMDS = [
 _CMD_SPEC = {
     "/read":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/readln":   dict(file_idx=1, kw_idx=None, keywords=[]),
+    "/view":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/insert":   dict(file_idx=1, kw_idx=3,    keywords=["code"]),
     "/edit":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/save":     dict(file_idx=1, kw_idx=None, keywords=["code", "overwrite",
@@ -2069,6 +2138,7 @@ _CMD_SPEC = {
     "/alias":    dict(file_idx=None, kw_idx=1, keywords=["save", "clear"]),
     "/doc":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
     "/translate": dict(file_idx=None, kw_idx=1, keywords=["setup", "on", "off", "status", "last"]),
+    "/visual":    dict(file_idx=None, kw_idx=1, keywords=["setup", "status", "explain"]),
     "/web":       dict(file_idx=None, kw_idx=1, keywords=["search", "fetch"]),
     "/flow":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
 }
@@ -2134,21 +2204,25 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None) ->
     spec = _CMD_SPEC.get(cmd_root)
     if spec:
         # 2. file path — skip for output commands where file need not exist yet
+        #    also skip @ picker tokens (they are not real paths yet)
         fi = spec["file_idx"]
         if fi is not None and len(tokens) > fi and cmd_root not in ("/save",):
-            fixed_path = _fix_path(tokens[fi])
-            if fixed_path:
-                fixes[fi] = (tokens[fi], fixed_path)
-                tokens[fi] = fixed_path
+            if not tokens[fi].startswith("@"):
+                fixed_path = _fix_path(tokens[fi])
+                if fixed_path:
+                    fixes[fi] = (tokens[fi], fixed_path)
+                    tokens[fi] = fixed_path
 
         # 3. keyword / subcommand
         ki = spec["kw_idx"]
         kws = spec["keywords"]
         if ki is not None and kws and len(tokens) > ki:
             tok = tokens[ki].lower()
+            if tokens[ki].startswith("@"):
+                pass  # @ picker token — not a keyword
             # For /insert kw_idx=3: only fix if it looks like "code" (short word),
             # not if it's inline content like "SET_SLEEP_DELAY = 10"
-            if cmd_root == "/insert" and ki == 3 and len(tokens[ki]) > 6:
+            elif cmd_root == "/insert" and ki == 3 and len(tokens[ki]) > 6:
                 pass  # long token → treat as inline text, not a keyword
             else:
                 fixed_kw = _fuzzy_fix(tok, kws, cutoff=0.6)
@@ -2162,11 +2236,12 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None) ->
         if cmd_root in ("/save", "/patch") and len(tokens) > 2:
             last_i = len(tokens) - 1
             if last_i not in fixes and last_i != spec.get("file_idx"):
-                tok = tokens[last_i].lower()
-                prefix_matches = [k for k in kws if k.startswith(tok)]
-                if len(prefix_matches) == 1 and prefix_matches[0] != tok:
-                    fixes[last_i] = (tokens[last_i], prefix_matches[0])
-                    tokens[last_i] = prefix_matches[0]
+                if not tokens[last_i].startswith("@"):
+                    tok = tokens[last_i].lower()
+                    prefix_matches = [k for k in kws if k.startswith(tok)]
+                    if len(prefix_matches) == 1 and prefix_matches[0] != tok:
+                        fixes[last_i] = (tokens[last_i], prefix_matches[0])
+                        tokens[last_i] = prefix_matches[0]
 
     if not fixes:
         return cmd
@@ -2296,6 +2371,121 @@ class CoderCLI:
         right = right[:5]
         return f"{left}:{right}" if right else left
 
+    def _file_picker(self, subdir: str = ".") -> dict:
+        """Walk directory tree, number files only. Returns {n: path}."""
+        mapping = {}
+        counter = [1]
+        SKIP = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.mypy_cache'}
+
+        def walk(path: str, prefix: str = ""):
+            try:
+                entries = sorted(os.scandir(path), key=lambda e: (e.is_file(), e.name.lower()))
+            except PermissionError:
+                return
+            entries = [e for e in entries if e.name not in SKIP]
+            for i, entry in enumerate(entries):
+                last = i == len(entries) - 1
+                connector = "└── " if last else "├── "
+                ext       = "    " if last else "│   "
+                if entry.is_dir():
+                    print(f"  {prefix}{connector}{_DIM}{entry.name}/{_R}")
+                    walk(entry.path, prefix + ext)
+                else:
+                    n = counter[0]
+                    mapping[n] = entry.path
+                    counter[0] += 1
+                    print(f"  {prefix}{connector}[{n}] {entry.name}")
+
+        walk(subdir)
+        return mapping
+
+    def _resolve_at(self, user_input: str) -> str | None:
+        """Replace the first @[dir] token (not @/) with a file path chosen from a tree picker."""
+        m = re.search(r'@(?!/)(\S*)', user_input)
+        if not m:
+            return user_input
+        subdir = m.group(1) or "."
+        if not os.path.isdir(subdir):
+            print(f"[picker] not a directory: {subdir}")
+            return None
+        mapping = self._file_picker(subdir)
+        if not mapping:
+            print("[picker] no files found")
+            return None
+        try:
+            raw = input("pick: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            print(f"[picker] expected a number, got: {raw}")
+            return None
+        path = mapping.get(n)
+        if path is None:
+            print(f"[picker] no file #{n}")
+            return None
+        return user_input[:m.start()] + path + user_input[m.end():]
+
+    def _dir_picker(self, subdir: str = ".") -> dict:
+        """Print a numbered tree of directories under subdir. Returns {n: dir_path}."""
+        mapping: dict = {0: subdir}
+        counter = [1]
+        SKIP = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.mypy_cache'}
+        print(f"  [0] {_DIM}./{_R}  (current directory)")
+
+        def walk(path: str, prefix: str = ""):
+            try:
+                entries = sorted(os.scandir(path), key=lambda e: e.name.lower())
+            except PermissionError:
+                return
+            dirs = [e for e in entries if e.is_dir() and e.name not in SKIP]
+            for i, entry in enumerate(dirs):
+                last = i == len(dirs) - 1
+                connector = "└── " if last else "├── "
+                ext       = "    " if last else "│   "
+                n = counter[0]
+                mapping[n] = entry.path.replace("\\", "/")
+                counter[0] += 1
+                print(f"  {prefix}{connector}[{n}] {_DIM}{entry.name}/{_R}")
+                walk(entry.path, prefix + ext)
+
+        walk(subdir)
+        return mapping
+
+    def _resolve_at_dir(self, user_input: str) -> str | None:
+        """Replace all @/suffix tokens with chosen_dir/suffix using a directory picker."""
+        matches = list(re.finditer(r'@/(\S*)', user_input))
+        if not matches:
+            return user_input
+        mapping = self._dir_picker(".")
+        try:
+            raw = input("pick dir: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            print(f"[picker] expected a number, got: {raw}")
+            return None
+        chosen = mapping.get(n)
+        if chosen is None:
+            print(f"[picker] no directory #{n}")
+            return None
+        chosen = chosen.rstrip("/")
+        result = user_input
+        for m in reversed(matches):
+            suffix = m.group(1)
+            replacement = (chosen + "/" + suffix) if suffix else chosen
+            result = result[:m.start()] + replacement + result[m.end():]
+        return result
+
     def _autosave_prompt(self) -> None:
         """Ask user whether to save context; save to .1bcoder/autosave/ if confirmed."""
         if not self.messages:
@@ -2412,6 +2602,25 @@ class CoderCLI:
             print()
             return ""
 
+    @staticmethod
+    def _to_openai_messages(messages: list) -> list:
+        """Convert internal message list to OpenAI format, expanding image messages."""
+        result = []
+        for m in messages:
+            if "images" in m:
+                content: list = []
+                if m.get("content"):
+                    content.append({"type": "text", "text": m["content"]})
+                for b64 in m["images"]:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    })
+                result.append({"role": m["role"], "content": content})
+            else:
+                result.append(m)
+        return result
+
     def _stream_chat(self, messages, hint: str = "") -> str:
         """POST to active provider, stream chunks to stdout. Returns full reply."""
         if self._role and not (messages and messages[0].get("role") == "system"):
@@ -2421,7 +2630,7 @@ class CoderCLI:
             sys.stdout.write(c); sys.stdout.flush()
         try:
             if self.provider == "openai":
-                body = {"model": self.model, "messages": messages, "stream": True}
+                body = {"model": self.model, "messages": self._to_openai_messages(messages), "stream": True}
                 body.update(self.params)
                 if self.log_requests:
                     print(f"  [log] POST {self.base_url}/v1/chat/completions")
@@ -2574,7 +2783,8 @@ class CoderCLI:
         print()
         print("  /help for all commands   /init to create .1bcoder/ folder")
         print("  Ctrl+C interrupts stream   /exit to quit")
-        print("  <cmd> -> var  capture output into variable   $ = last output")
+        print("  <cmd> -> var  capture output into variable   $ = last output   ~ = last input")
+        print("  @ = file picker (type number)             @/ = dir prefix picker")
         print("  tip: /agent ask <question> to analyze code   /read <file> to load   /tree to explore")
         print()
         _auto_cfg = {}
@@ -2601,7 +2811,28 @@ class CoderCLI:
                 continue
             if user_input not in self._history or (self._history and self._history[-1] != user_input):
                 self._history.append(user_input)
-            self._route(user_input)
+            try:
+                self._route(user_input)
+            except Exception as _exc:
+                import traceback as _tb
+                import datetime as _dt
+                print(f"\n[crash] {type(_exc).__name__}: {_exc}")
+                _tb.print_exc()
+                if self.messages:
+                    _save_dir = os.path.join(
+                        BCODER_DIR if os.path.isdir(BCODER_DIR) else HOME_BCODER_DIR,
+                        "autosave"
+                    )
+                    _stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    _fpath = os.path.join(_save_dir, f"{_stamp}.txt")
+                    try:
+                        os.makedirs(_save_dir, exist_ok=True)
+                        with open(_fpath, "w", encoding="utf-8") as _f:
+                            for _m in self.messages:
+                                _f.write(f"=== {_m['role']} ===\n{_m['content']}\n\n")
+                        print(f"[crash] context auto-saved → {_fpath}")
+                    except OSError as _e:
+                        print(f"[crash] could not save context: {_e}")
             self._print_status()
             if user_input.startswith("/"):
                 import shlex as _shlex
@@ -2651,11 +2882,21 @@ class CoderCLI:
             user_input = fix_command(user_input, auto=auto, extra_cmds=list(self._aliases.keys()))
             if self._vars and "{{" in user_input:
                 user_input = _apply_params(user_input, self._vars)
-            # expand $ to last output, ~ to last input
+            # expand $ to last output, ~ to last input, @ to file picker
             if "$" in user_input:
                 user_input = user_input.replace("$", self._last_output)
             if "~" in user_input:
                 user_input = user_input.replace("~", self._last_input)
+            if "@/" in user_input:
+                resolved = self._resolve_at_dir(user_input)
+                if resolved is None:
+                    return
+                user_input = resolved
+            if "@" in user_input:
+                resolved = self._resolve_at(user_input)
+                if resolved is None:
+                    return
+                user_input = resolved
             cmd_root = user_input.split()[0]
             if cmd_root not in self._HISTORY_SKIP:
                 self.cmd_history.append(user_input)
@@ -2725,6 +2966,8 @@ class CoderCLI:
             self._cmd_map(user_input)
         elif user_input.startswith("/readln") or user_input.startswith("/read"):
             self._cmd_read(user_input)
+        elif user_input.startswith("/view"):
+            self._cmd_view(user_input)
         elif user_input.startswith("/insert"):
             _ha = self._extract_hook_args(user_input)
             if self._run_hook("before_insert", _ha):
@@ -2751,6 +2994,8 @@ class CoderCLI:
             self._cmd_prompt(user_input)
         elif user_input.startswith("/translate"):
             self._cmd_translate(user_input)
+        elif user_input.startswith("/visual"):
+            self._cmd_visual(user_input)
         elif user_input.startswith("/web"):
             self._cmd_web(user_input)
         elif user_input.startswith("/flow"):
@@ -3093,6 +3338,31 @@ advanced_tools =
                 print("usage: /ctx savepoint [set|rollback|compact|show]")
             return
         if parts[1] == "clear":
+            if len(parts) > 2 and parts[2] == "view":
+                # /ctx clear view [last] [N|all]
+                rest = parts[3:]
+                from_end = rest and rest[0] == "last"
+                if from_end:
+                    rest = rest[1:]
+                if rest and rest[0] == "all":
+                    n = None  # all
+                elif rest and rest[0].isdigit():
+                    n = int(rest[0])
+                else:
+                    n = 1
+                img_indices = [i for i, m in enumerate(self.messages) if "images" in m]
+                if not img_indices:
+                    print("[ctx clear view] no images in context")
+                    return
+                targets = img_indices if n is None else (
+                    img_indices[-n:] if from_end else img_indices[:n]
+                )
+                for i in targets:
+                    del self.messages[i]["images"]
+                direction = "last" if from_end else "oldest"
+                count_label = "all" if n is None else str(len(targets))
+                print(f"[ctx clear view] stripped images from {count_label} {direction} message(s)")
+                return
             if len(parts) > 2 and parts[2].isdigit():
                 n = int(parts[2])
                 if n <= 0:
@@ -3906,6 +4176,71 @@ advanced_tools =
             except (OSError, ValueError) as e:
                 _err(e)
 
+    # ── /view ──────────────────────────────────────────────────────────────────
+
+    def _cmd_view(self, user_input: str):
+        import base64
+        tokens = user_input.split()
+        if len(tokens) < 2:
+            print("usage: /view [--keep] <image> [image2 ...] [prompt]")
+            print("       supported: png jpg jpeg gif webp bmp")
+            print("       --keep  retain image in context after reply (default: strip)")
+            return
+        tokens = tokens[1:]
+        keep = "--keep" in tokens
+        if keep:
+            tokens = [t for t in tokens if t != "--keep"]
+        IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+        # split into image paths and trailing prompt words
+        img_paths = []
+        prompt_words = []
+        for t in tokens:
+            ext = os.path.splitext(t)[1].lower()
+            if ext in IMG_EXTS or os.path.isfile(t):
+                img_paths.append(t)
+            else:
+                prompt_words.append(t)
+        if not img_paths:
+            print("[view] no image files found in arguments")
+            return
+        b64_images = []
+        labels = []
+        for path in img_paths:
+            if not os.path.isfile(path):
+                print(f"[view] file not found: {path}")
+                continue
+            try:
+                with open(path, "rb") as f:
+                    b64_images.append(base64.b64encode(f.read()).decode())
+                labels.append(os.path.basename(path))
+            except OSError as e:
+                _err(e)
+        if not b64_images:
+            return
+        has_prompt = bool(prompt_words)
+        prompt = " ".join(prompt_words) if has_prompt else f"[image: {', '.join(labels)}]"
+        msg = {"role": "user", "content": prompt, "images": b64_images}
+        if self._auto_apply:
+            print(f"[image: {', '.join(labels)}] {prompt}")
+        else:
+            self.messages.append(msg)
+            if has_prompt:
+                self._sep("AI")
+                reply = self._stream_chat(self.messages)
+                print()
+                if reply:
+                    self.last_reply = reply
+                    self._last_output = reply
+                    self.messages.append({"role": "assistant", "content": reply})
+                if not keep:
+                    # strip base64 from context — keep only the text prompt
+                    for m in self.messages:
+                        if "images" in m:
+                            del m["images"]
+            else:
+                _ok(f"context: injected image(s): {', '.join(labels)}"
+                    + ("" if keep else "  (use --keep to retain; default strips on next reply)"))
+
     def _cmd_edit(self, user_input: str):
         tokens = user_input.split()
         if len(tokens) < 3:
@@ -4210,6 +4545,7 @@ advanced_tools =
                     print(f"  detail: {body[:500]}")
             return
         print()
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         m = re.search(r'```(?:\w+)?\n(.*?)\n```', raw, re.DOTALL)
         new_content = m.group(1) if m else raw.strip()
         new_slice = [l if l.endswith('\n') else l + '\n' for l in new_content.splitlines()]
@@ -5442,6 +5778,160 @@ advanced_tools =
         parser.feed(resp.text)
         return parser.results[:n]
 
+    # ── /visual ─────────────────────────────────────────────────────────────
+
+    _VISUAL_CFG = os.path.join(os.path.expanduser("~"), ".1bcoder", "visual.json")
+
+    def _visual_load_cfg(self) -> dict:
+        try:
+            with open(self._VISUAL_CFG, encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            print(f"[visual] cannot read config: {e}")
+            return {}
+
+    def _visual_save_cfg(self, cfg: dict):
+        os.makedirs(os.path.dirname(self._VISUAL_CFG), exist_ok=True)
+        with open(self._VISUAL_CFG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    def _visual_run(self, b64_image: str, prompt: str) -> str:
+        """Send image + prompt to the configured vision model. Returns text description."""
+        import urllib.request as _ur, json as _j
+        cfg = self._visual_load_cfg()
+        if not cfg:
+            raise RuntimeError("visual model not configured — run /visual setup first")
+        host  = cfg.get("host",  "localhost:11434")
+        model = cfg.get("model", "moondream:v2")
+        timeout = int(cfg.get("timeout", 120))
+        msg = {"role": "user", "content": prompt, "images": [b64_image]}
+        if host.startswith("openai://"):
+            base = host[len("openai://"):]
+            url  = f"http://{base}/v1/chat/completions"
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+            ]
+            payload = _j.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": content}],
+                "stream": False,
+            }, ensure_ascii=False).encode("utf-8")
+            req = _ur.Request(url, payload, {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer lm-studio",
+            })
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                return _j.loads(resp.read())["choices"][0]["message"]["content"].strip()
+        else:
+            base = host[len("ollama://"):] if host.startswith("ollama://") else host
+            url  = f"http://{base}/api/chat"
+            payload = _j.dumps({
+                "model": model,
+                "messages": [msg],
+                "stream": False,
+            }, ensure_ascii=False).encode("utf-8")
+            req = _ur.Request(url, payload, {"Content-Type": "application/json"})
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                return _j.loads(resp.read())["message"]["content"].strip()
+
+    def _cmd_visual(self, user_input: str):
+        import base64
+        parts = user_input.split()
+        sub   = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub == "status":
+            cfg = self._visual_load_cfg()
+            if not cfg:
+                print("[visual] not configured — run /visual setup first")
+                return
+            print(f"  host    : {cfg.get('host',  'localhost:11434')}")
+            print(f"  model   : {cfg.get('model', 'moondream:v2')}")
+            print(f"  timeout : {cfg.get('timeout', 120)}s")
+            return
+
+        if sub == "setup":
+            raw = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+            if not raw:
+                print("usage: /visual setup host:<url> model:<name> [timeout:<s>] [profile:<name>]")
+                print("  e.g.  /visual setup host:localhost:11434 model:moondream:v2")
+                print("        /visual setup profile:moondream")
+                return
+            params = {}
+            for token in raw.split():
+                if ':' in token:
+                    k, _, v = token.partition(':')
+                    params[k.lower()] = v
+            cfg = self._visual_load_cfg()
+            if 'host'    in params: cfg['host']    = params['host']
+            if 'model'   in params: cfg['model']   = params['model']
+            if 'timeout' in params: cfg['timeout'] = int(params['timeout'])
+            if 'profile' in params:
+                prof = _load_profile(params['profile'])
+                if not prof:
+                    print(f"[visual] profile '{params['profile']}' not found")
+                    return
+                cfg['host']  = prof[0][0]
+                cfg['model'] = prof[0][1]
+            self._visual_save_cfg(cfg)
+            print(f"[visual] saved — host:{cfg.get('host')} model:{cfg.get('model')}")
+            return
+
+        if sub == "explain":
+            auto_inject = self._auto_apply or "-y" in parts
+            tokens = [t for t in parts[2:] if t != "-y"]
+            IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+            img_paths, prompt_words = [], []
+            for t in tokens:
+                if os.path.splitext(t)[1].lower() in IMG_EXTS or os.path.isfile(t):
+                    img_paths.append(t)
+                else:
+                    prompt_words.append(t)
+            # fall back to last image in main context if no file given
+            b64 = None
+            label = ""
+            if img_paths:
+                path = img_paths[0]
+                if not os.path.isfile(path):
+                    print(f"[visual] file not found: {path}")
+                    return
+                with open(path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                label = os.path.basename(path)
+            else:
+                for m in reversed(self.messages):
+                    if "images" in m:
+                        b64 = m["images"][0]
+                        label = "(image from context)"
+                        break
+            if not b64:
+                print("[visual] no image — provide a file path or inject with /view first")
+                return
+            prompt = " ".join(prompt_words) if prompt_words else "Describe this image in detail."
+            cfg = self._visual_load_cfg()
+            vis_model = cfg.get("model", "moondream:v2")
+            print(f"{_LBLUE}─── {vis_model} ───{_R}", flush=True)
+            try:
+                description = self._visual_run(b64, prompt)
+            except Exception as e:
+                print(f"[visual] error: {e}")
+                return
+            print(description)
+            self._last_output = description
+            inject_text = f"[visual description of {label}]\n{description}"
+            if auto_inject:
+                self.messages.append({"role": "user", "content": inject_text})
+                _ok("[visual] description injected into context")
+            else:
+                ans = self._confirm("Inject description into context? [Y/n]", ctx_add=inject_text)
+                if not ans:
+                    self.messages.append({"role": "user", "content": inject_text})
+            return
+
+        print("usage: /visual setup | status | explain <image> [prompt] [-y]")
+
     def _cmd_web(self, user_input: str):
         """
 /web search <term> [-> varname]   Search DuckDuckGo; optionally save URL list to variable.
@@ -5553,6 +6043,22 @@ advanced_tools =
                         print(f"  {f[:-3]:<20} {desc}  {tag}")
             if not shown:
                 print("[flow] no flows found")
+            return
+
+        if sub == "help":
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                print("usage: /flow help <name>"); return
+            path = _find_flow(name)
+            if not path:
+                print(f"[flow] '{name}' not found — use /flow list"); return
+            try:
+                src = open(path, encoding="utf-8").read()
+                import ast as _ast
+                doc = _ast.get_docstring(_ast.parse(src)) or ""
+                print(doc if doc else f"[flow] '{name}' has no docstring")
+            except Exception as e:
+                print(f"[flow] could not read {name}: {e}")
             return
 
         name = sub
@@ -9103,6 +9609,39 @@ Config stored in ~/.1bcoder/translate.json
         if not task:
             print("usage: /agent [-t N] [-y] <task> | /agent <name> [-t N] [-y] <task>")
             print("  configure: .1bcoder/agent.txt  |  .1bcoder/agents/<name>.txt")
+            print("  /agent list  — show all available named agents")
+            return
+
+        if task.strip() == "list":
+            seen = {}  # name → (label, description)
+            for label, d in (("global", GLOBAL_AGENTS_DIR), ("local", AGENTS_DIR)):
+                if not os.path.isdir(d):
+                    continue
+                for fname in sorted(os.listdir(d)):
+                    if not fname.endswith(".txt"):
+                        continue
+                    name = fname[:-4]
+                    desc = ""
+                    try:
+                        with open(os.path.join(d, fname), encoding="utf-8") as f:
+                            for line in f:
+                                ls = line.strip()
+                                if ls.startswith("description"):
+                                    _, _, v = ls.partition("=")
+                                    desc = v.strip()
+                                    break
+                    except OSError:
+                        pass
+                    seen[name] = (label, desc)
+            if not seen:
+                print("[agent] no named agents found")
+                return
+            print("Named agents  (* = local project,  g = global ~/.1bcoder):\n")
+            for name, (label, desc) in sorted(seen.items()):
+                tag = "*" if label == "local" else "g"
+                suffix = f"  —  {desc}" if desc else ""
+                print(f"  [{tag}] /{name}{suffix}")
+            print()
             return
 
         # check if first non-flag word is a named agent
