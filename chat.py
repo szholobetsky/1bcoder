@@ -42,12 +42,15 @@ def _info(msg: str): print(f"{_CYAN}{msg}{_R}")
 def _warn(msg: str): print(f"{_YELL}{msg}{_R}")
 
 
-def _multiline_input() -> str:
+def _multiline_input() -> tuple:
     """Open a multi-line text editor in the terminal.
 
     Uses prompt_toolkit if available (Alt+Enter / Esc→Enter to submit).
     Falls back to a line-by-line collector terminated by '/end' on its own line.
-    Returns the composed text, or empty string on Ctrl+C / cancel.
+    Returns (text, prompt_name_or_None):
+      prompt_name is None  — do not save as /prompt
+      prompt_name is ""    — save as /prompt, name not yet known (caller should ask)
+      prompt_name is <str> — save as /prompt with this name
     """
     try:
         from prompt_toolkit import prompt as _pt_prompt
@@ -55,33 +58,47 @@ def _multiline_input() -> str:
 
         kb = _KB()
         _QUICKSAVE_FILE = os.path.join('.1bcoder', 'task.txt')
+        _prompt_flag = [False]  # set by Ctrl+T
 
         @kb.add('c-d')
         def _submit(event):
+            event.current_buffer.validate_and_handle()
+
+        @kb.add('c-t')
+        def _save_as_prompt(event):
+            _prompt_flag[0] = True
             event.current_buffer.validate_and_handle()
 
         @kb.add('enter')
         def _enter_or_end(event):
             buf = event.current_buffer
             current_line = buf.document.current_line.strip()
-            if current_line in ('/end', '/save') or current_line.startswith('/save '):
+            if (current_line in ('/end', '/save') or current_line.startswith('/save ')
+                    or current_line == '/prompt' or current_line.startswith('/prompt ')):
                 buf.validate_and_handle()
             else:
                 buf.newline()
 
-        print(f"[multiline — Enter = new line · Ctrl+D or /end to submit · /save to save to .1bcoder/task.txt · /save filename.txt for custom name · Ctrl+C to cancel]")
+        print("[multiline — Enter = new line · Ctrl+D or /end to submit"
+              " · /save [file] to save · Ctrl+T or /prompt [name] to save as /prompt"
+              " · Ctrl+C to cancel]")
         try:
             text = _pt_prompt('··· ', multiline=True, key_bindings=kb)
         except KeyboardInterrupt:
             print()
-            return ""
+            return "", None
 
-        # strip trailing empty lines, check for /end or /save command
+        # strip trailing empty lines, check for /end, /save, /prompt commands
         lines = text.split('\n')
         while lines and lines[-1].strip() == '':
             lines.pop()
 
         save_filename = None
+        prompt_name = None
+
+        if _prompt_flag[0]:
+            prompt_name = ""  # Ctrl+T: save as prompt, name unknown
+
         if lines:
             last = lines[-1].strip()
             if last == '/end':
@@ -91,6 +108,12 @@ def _multiline_input() -> str:
                 lines.pop()
             elif last.startswith('/save '):
                 save_filename = last[6:].strip()
+                lines.pop()
+            elif last == '/prompt':
+                prompt_name = ""
+                lines.pop()
+            elif last.startswith('/prompt '):
+                prompt_name = last[8:].strip()
                 lines.pop()
 
         text = '\n'.join(lines)
@@ -104,21 +127,29 @@ def _multiline_input() -> str:
             with open(save_filename, 'w', encoding='utf-8') as _f:
                 _f.write(text)
             print(f"  [text] saved → {save_filename}")
-        return text
+        return text, prompt_name
 
     except ImportError:
-        print("[multiline — type /end on its own line to submit · Ctrl+C to cancel]")
+        print("[multiline — type /end to submit · /prompt [name] to save as /prompt · Ctrl+C to cancel]")
         lines = []
+        prompt_name = None
         while True:
             try:
                 line = input("··· ")
             except (EOFError, KeyboardInterrupt):
                 print()
-                return ""
-            if line.strip() == "/end":
+                return "", None
+            stripped = line.strip()
+            if stripped == "/end":
+                break
+            if stripped == "/prompt":
+                prompt_name = ""
+                break
+            if stripped.startswith("/prompt "):
+                prompt_name = stripped[8:].strip()
                 break
             lines.append(line)
-        return "\n".join(lines)
+        return "\n".join(lines), prompt_name
 
 
 def _fts_rank(terms: list, file_contents: dict, top_k: int = 10) -> list:
@@ -414,6 +445,9 @@ Commands
       /end                  — submit without saving (type on its own line, then Enter)
       /save                 — save to .1bcoder/task.txt and submit
       /save <filename>      — save to custom file and submit
+      Ctrl+T                — save as /prompt (asks for name after editor closes) and submit
+      /prompt <name>        — save as named /prompt and submit (type on its own line)
+      /prompt               — save as /prompt, name will be asked after editor closes
     Ctrl+C cancels without sending.
     If prompt_toolkit is installed: full editing with arrow keys, Home/End, scroll.
     Fallback (no prompt_toolkit): same commands work line by line.
@@ -758,10 +792,13 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /ctx compact savepoint   Summarize only messages since the savepoint, replace them with summary.
 /ctx compact profile: <name>            Use external model (from profile) for summarization.
 /ctx compact savepoint profile: <name>  External model + savepoint scope.
-/ctx save <file>         Save full conversation context to a text file.
+/ctx save <name>         Save full conversation context to .1bcoder/ctx/<name>.txt
+                         If <name> has a path separator, saves to that exact location.
 /ctx load <file>         Restore context from a saved file (appends to current context).
                          If <file> has no path, looks in .1bcoder/ctx/ automatically.
 /ctx list                List files in .1bcoder/ctx/ (project context library).
+/ctx autosave on|off     Enable/disable silent autosave after every LLM response (default: off).
+/ctx autosave show       Show autosave state and current file path.
 /ctx savepoint set       Mark current context position as a savepoint.
 /ctx savepoint rollback  Remove all messages added since the savepoint.
 /ctx savepoint show      Show savepoint position and how many messages have been added since.
@@ -771,7 +808,8 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /ctx compose add all          Add all /proj find results to queue.
 /ctx compose list                Show compose queue with sizes and accumulated total.
 /ctx compose clear               Clear the compose queue.
-/ctx compose run [output.txt]    Merge queue into one file (or load into context if no output given).
+/ctx compose run [output]        Merge queue into one file (or load into context if no output given).
+                                 Bare name → .1bcoder/ctx/<name>.txt  |  path with dir → as-is.
                                  Deduplication: identical message blocks appear only once in output.
 /ctx compose <f1> <f2> ...       Direct compose without queue — merge files immediately.
     Files are resolved: bare name → .1bcoder/ctx/ → .1bcoder/projects/<key>/
@@ -779,12 +817,12 @@ Output capture operators (work with any command — LLM reply, tool, proc):
       /proj find isbn              search projects, results are numbered [1], [2], ...
       /ctx compose add 1,3      add result #1 and #3 to queue
       /ctx compose list            review queue
-      /ctx compose run task.ctx    merge → task.ctx
-      /ctx load task.ctx           load into context — LLM wakes up knowing all three files
+      /ctx compose run mytask      merge → .1bcoder/ctx/mytask.txt
+      /ctx load mytask             load into context — LLM wakes up knowing all three files
     e.g.  /ctx compact 1
           /ctx compact 3
           /ctx compose add book-html.txt
-          /ctx compose run task.ctx
+          /ctx compose run mytask
 
 /tempctx <N>               Set agent context limit to N tokens (overrides num_ctx for this agent run).
 /tempctx show              Show agent context size (messages + token estimate).
@@ -2510,6 +2548,26 @@ class CoderCLI:
                 f.write(f"=== {msg['role']} ===\n{msg['content']}\n\n")
         print(f"[autosave] context saved → {fpath}")
 
+    def _do_autosave(self) -> None:
+        """Silently save context after every response. Creates autosave file if no path set."""
+        if not self._ctx_autosave_enabled or not self.messages:
+            return
+        if self._ctx_autosave_path is None:
+            import datetime as _dt
+            stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            save_dir = os.path.join(
+                BCODER_DIR if os.path.isdir(BCODER_DIR) else HOME_BCODER_DIR,
+                "autosave"
+            )
+            os.makedirs(save_dir, exist_ok=True)
+            self._ctx_autosave_path = os.path.join(save_dir, f"{stamp}.txt")
+        try:
+            with open(self._ctx_autosave_path, "w", encoding="utf-8") as f:
+                for msg in self.messages:
+                    f.write(f"=== {msg['role']} ===\n{msg['content']}\n\n")
+        except OSError:
+            pass  # silent — don't interrupt the session
+
     def _print_status(self) -> None:
         """Print a single status line showing model, size, quant, native ctx, and usage."""
         est_tokens = sum(len(m["content"]) for m in self.messages) // 4
@@ -2547,6 +2605,8 @@ class CoderCLI:
         self._proc_before: list = []  # procs that run BEFORE each LLM call
         self._proc_gates:  list = []  # procs that run after reply, PASS/FAIL gate
         self._savepoint  = None    # index into self.messages set by /ctx savepoint
+        self._ctx_autosave_path: str | None = None   # set by /ctx load|save; auto on first message
+        self._ctx_autosave_enabled: bool = False
         self._aliases    = self._load_aliases()  # global + local aliases.txt
         self._script_file = None
         self._proc_active: list[str] = []  # persistent procs (run after every reply)
@@ -2811,6 +2871,7 @@ class CoderCLI:
                 continue
             if user_input not in self._history or (self._history and self._history[-1] != user_input):
                 self._history.append(user_input)
+            _msg_count_before = len(self.messages)
             try:
                 self._route(user_input)
             except Exception as _exc:
@@ -2834,6 +2895,8 @@ class CoderCLI:
                     except OSError as _e:
                         print(f"[crash] could not save context: {_e}")
             self._print_status()
+            if len(self.messages) > _msg_count_before:
+                self._do_autosave()
             if user_input.startswith("/"):
                 import shlex as _shlex
                 _args = user_input.split(None, 1)[1] if " " in user_input else ""
@@ -3262,16 +3325,23 @@ advanced_tools =
             return
         if parts[1] == "save":
             if len(parts) < 3:
-                print("usage: /ctx save <file>")
+                print("usage: /ctx save <name>  (saves to .1bcoder/ctx/<name>.txt)")
                 return
             if not self.messages:
                 print("[context is empty]")
                 return
+            save_path = parts[2]
+            if not os.path.dirname(save_path):
+                if not save_path.endswith(".txt") and not save_path.endswith(".md"):
+                    save_path += ".txt"
+                os.makedirs(CTX_DIR, exist_ok=True)
+                save_path = os.path.join(CTX_DIR, save_path)
             try:
-                with open(parts[2], "w", encoding="utf-8") as f:
+                with open(save_path, "w", encoding="utf-8") as f:
                     for msg in self.messages:
                         f.write(f"=== {msg['role']} ===\n{msg['content']}\n\n")
-                print(f"[context saved to {parts[2]} ({len(self.messages)} messages)]")
+                self._ctx_autosave_path = save_path
+                print(f"[context saved to {save_path} ({len(self.messages)} messages)]")
             except OSError as e:
                 _err(e)
             return
@@ -3301,6 +3371,7 @@ advanced_tools =
                     print(f"[no messages found in {load_path}]")
                     return
                 self.messages.extend(loaded)
+                self._ctx_autosave_path = load_path
                 last_a = next((m["content"] for m in reversed(loaded) if m["role"] == "assistant"), "")
                 if last_a:
                     self.last_reply = last_a
@@ -3502,6 +3573,20 @@ advanced_tools =
                 size = os.path.getsize(os.path.join(CTX_DIR, fname))
                 print(f"  {fname}  ({size:,} bytes)")
             return
+        if parts[1] == "autosave":
+            sub = parts[2] if len(parts) > 2 else "show"
+            if sub == "on":
+                self._ctx_autosave_enabled = True
+                path_note = f" → {self._ctx_autosave_path}" if self._ctx_autosave_path else " (new file on next message)"
+                _ok(f"[ctx autosave] enabled{path_note}")
+            elif sub == "off":
+                self._ctx_autosave_enabled = False
+                _ok("[ctx autosave] disabled")
+            else:
+                state = "on" if self._ctx_autosave_enabled else "off"
+                path_note = self._ctx_autosave_path or "(none)"
+                print(f"[ctx autosave] {state}  file: {path_note}")
+            return
         try:
             self.num_ctx = int(parts[1])
             print(f"[ctx set to {self.num_ctx} tokens]")
@@ -3673,6 +3758,11 @@ advanced_tools =
 
         total_chars = sum(len(m["content"]) for m in all_msgs)
         if output:
+            if not os.path.dirname(output):
+                if not output.endswith(".txt") and not output.endswith(".md"):
+                    output += ".txt"
+                os.makedirs(CTX_DIR, exist_ok=True)
+                output = os.path.join(CTX_DIR, output)
             try:
                 with open(output, "w", encoding="utf-8") as f:
                     for msg in all_msgs:
@@ -5233,7 +5323,7 @@ advanced_tools =
             print("usage: /script list | open [N] | create | show [N] | run <file> | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
 
     def _save_prompt(self, name: str, text: str):
-        """Save text as a named prompt entry to prompts.txt."""
+        """Save text as a named prompt entry to prompts.txt. Newlines stored as \\n."""
         name = name.strip().replace(" ", "-")
         if not os.path.isfile(PROMPTS_FILE):
             entries = []
@@ -5246,7 +5336,7 @@ advanced_tools =
                         continue
                     n, _, t = line.partition(":")
                     if t:
-                        entries.append((n.strip(), t.strip()))
+                        entries.append((n.strip(), t.strip().replace('\\n', '\n')))
         if any(n == name for n, _ in entries):
             ow = self._prompt_input(f"  '{name}' already exists — overwrite? [y/N]:")
             if ow.lower() not in ("y", "yes"):
@@ -5257,8 +5347,10 @@ advanced_tools =
         os.makedirs(os.path.dirname(PROMPTS_FILE), exist_ok=True)
         with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
             for n, t in entries:
-                f.write(f"{n}: {t}\n")
-        print(f"[prompt] saved → {name}: {text}")
+                f.write(f"{n}: {t.replace(chr(10), chr(92) + 'n')}\n")
+        first_line = text.split('\n')[0]
+        suffix = ' …' if '\n' in text else ''
+        print(f"[prompt] saved → {name}: {first_line}{suffix}")
 
     def _cmd_prompt(self, user_input: str):
         """Manage one-line prompt templates stored in prompts.txt.
@@ -5270,7 +5362,7 @@ advanced_tools =
         rest  = parts[2].strip() if len(parts) > 2 else ""
 
         def _load_prompts() -> list:
-            """Return list of (name, text) from prompts.txt."""
+            """Return list of (name, text) from prompts.txt. Unescapes \\n → newline."""
             if not os.path.isfile(PROMPTS_FILE):
                 return []
             entries = []
@@ -5281,7 +5373,7 @@ advanced_tools =
                         continue
                     name, _, text = line.partition(":")
                     if text:
-                        entries.append((name.strip(), text.strip()))
+                        entries.append((name.strip(), text.strip().replace('\\n', '\n')))
             return entries
 
         if sub == "save":
@@ -5301,7 +5393,7 @@ advanced_tools =
                 if not last_user:
                     print("[prompt] no user message in context yet — provide text inline: /prompt save <name> <text>")
                     return
-                text = last_user.splitlines()[0].strip()
+                text = last_user
             name = name or self._prompt_input("  prompt name:")
             if not name:
                 print("[cancelled]")
@@ -5314,7 +5406,9 @@ advanced_tools =
                 print("[prompt] no prompts saved yet — use /prompt save <name> first")
                 return
             for i, (name, text) in enumerate(entries, 1):
-                print(f"  {i}. {name}: {_DIM}{text[:80]}{_R}")
+                first = text.split('\n')[0]
+                suffix = ' …' if '\n' in text else ''
+                print(f"  {i}. {name}: {_DIM}{first[:80]}{suffix}{_R}")
             # accept number inline: /prompt load 3
             if rest.strip().isdigit():
                 raw = rest.strip()
@@ -5354,7 +5448,9 @@ advanced_tools =
                 print("[prompt] no prompts saved yet")
                 return
             for i, (name, text) in enumerate(entries, 1):
-                print(f"  {i}. {name}: {_DIM}{text[:80]}{_R}")
+                first = text.split('\n')[0]
+                suffix = ' …' if '\n' in text else ''
+                print(f"  {i}. {name}: {_DIM}{first[:80]}{suffix}{_R}")
 
         elif sub == "delete":
             name = rest
@@ -5368,7 +5464,7 @@ advanced_tools =
                 return
             with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
                 for n, t in new:
-                    f.write(f"{n}: {t}\n")
+                    f.write(f"{n}: {t.replace(chr(10), chr(92) + 'n')}\n")
             print(f"[prompt] deleted: {name}")
 
         else:
@@ -6444,10 +6540,15 @@ Config stored in ~/.1bcoder/translate.json
 
     def _cmd_note(self):
         """Open multi-line editor, then send the composed text to the AI."""
-        text = _multiline_input()
+        text, prompt_name = _multiline_input()
         if not text.strip():
             print("[note] empty — nothing sent")
             return
+        if prompt_name is not None:
+            if not prompt_name:
+                prompt_name = self._prompt_input("  prompt name:").strip().replace(" ", "-")
+            if prompt_name:
+                self._save_prompt(prompt_name, text)
         self.messages.append({"role": "user", "content": text})
         self._sep("AI")
         reply = self._stream_chat(self.messages)
@@ -9799,6 +9900,12 @@ def main():
     parser.add_argument("--param", metavar="KEY=VALUE", action="append", default=[],
                         help="Script parameter substitution (repeatable). "
                              "e.g. --param file=calc.py --param range=1-4")
+    parser.add_argument("-p", "--pipe", dest="print_prompt", nargs="?", const="",
+                        metavar="PROMPT",
+                        help="Non-interactive mode: send PROMPT and print response to stdout. "
+                             "Reads from stdin if no prompt given. Enables pipeline use.")
+    parser.add_argument("--ctx", metavar="FILE",
+                        help="Load context from file before starting (e.g. myctx/ctx.txt)")
     args = parser.parse_args()
     _bootstrap_global_dir()
 
@@ -9897,7 +10004,31 @@ def main():
             print(f"  {i}. {m}")
         model = _pick_model(models)
 
-    CoderCLI(base_url, model, models, provider).run()
+    if args.print_prompt is not None:
+        cli = CoderCLI(base_url, model, models, provider)
+        if cfg.get("role"):
+            cli._role = cfg["role"]
+        if args.ctx:
+            cli._cmd_ctx(f"/ctx load {args.ctx}")
+
+        prompt = args.print_prompt
+        if not sys.stdin.isatty():
+            stdin_data = sys.stdin.read()
+            prompt = (stdin_data + "\n\n" + prompt).strip() if prompt else stdin_data
+
+        if not prompt:
+            print("error: no prompt — pass text after -p or pipe via stdin", file=sys.stderr)
+            sys.exit(1)
+
+        cli.messages = [{"role": "user", "content": prompt}]
+        cli._stream_chat(cli.messages)
+        print()
+        sys.exit(0)
+    else:
+        cli = CoderCLI(base_url, model, models, provider)
+        if args.ctx:
+            cli._cmd_ctx(f"/ctx load {args.ctx}")
+        cli.run()
 
 
 if __name__ == "__main__":
