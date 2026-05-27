@@ -44,6 +44,16 @@ import argparse
 DEFAULT_MAP = os.path.join('.1bcoder', 'map.txt')
 
 
+def _truncate(text: str, max_lines: int) -> str:
+    if max_lines <= 0:
+        return text
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    hidden = len(lines) - max_lines
+    return '\n'.join(lines[:max_lines]) + f'\n\n[truncated: {hidden} lines hidden — use --max-lines to see more]'
+
+
 # ── parse ───────────────────────────────────────────────────────────────────────
 
 def parse_map(map_path: str) -> tuple:
@@ -145,12 +155,13 @@ def compute_cohesion(links_map: dict, k: int = 5) -> tuple:
 
 # ── find ────────────────────────────────────────────────────────────────────────
 
-def find_map(map_path: str, query: str) -> tuple:
+def find_map(map_path: str, query: str, max_lines: int = 0) -> tuple:
     """Search map.txt with filter syntax.
 
     Returns (hits, rendered_string).
     hits  — list of matching block strings (empty list means full map returned).
     rendered_string — the text to display / inject.
+    max_lines — hard cap on output lines (0 = unlimited).
     """
     with open(map_path, encoding='utf-8') as f:
         content = f.read()
@@ -220,7 +231,7 @@ def find_map(map_path: str, query: str) -> tuple:
             if not b.startswith('#')
             for r in [process_block(b)] if r is not None]
 
-    return hits, '\n'.join(hits)
+    return hits, _truncate('\n'.join(hits), max_lines)
 
 
 # ── trace ───────────────────────────────────────────────────────────────────────
@@ -301,10 +312,11 @@ def trace_deps(map_path: str, identifier: str, max_depth: int = 8, leaves_only: 
     return '\n'.join(lines_out)
 
 
-def trace_map(map_path: str, identifier: str, max_depth: int = 8) -> str:
+def trace_map(map_path: str, identifier: str, max_depth: int = 8, max_lines: int = 0) -> str:
     """BFS backwards through the call graph from a defined identifier.
 
     Returns a rendered string, or None if the identifier is not found in defines.
+    max_lines — hard cap on output lines (0 = unlimited).
     """
     defines_map, links_map = parse_map(map_path)
 
@@ -347,7 +359,7 @@ def trace_map(map_path: str, identifier: str, max_depth: int = 8) -> str:
                 visited.add(caller)
                 queue.append((caller, depth + 1))
 
-    return '\n'.join(lines_out)
+    return _truncate('\n'.join(lines_out), max_lines)
 
 
 def _resolve_id(token: str, defines_map: dict):
@@ -628,9 +640,13 @@ def main():
     p_find = sub.add_parser('find', help='Filter map blocks by filename/content')
     p_find.add_argument('query', nargs='*',
                         help='Filter tokens (term, !term, \\term, \\!term, \\\\!term)')
+    p_find.add_argument('--max-lines', type=int, default=200, metavar='N',
+                        help='Hard cap on output lines (default: 200, 0 = unlimited)')
 
     p_trace = sub.add_parser('trace', help='Follow call chain backwards from an identifier')
     p_trace.add_argument('identifier', help='Identifier name to trace')
+    p_trace.add_argument('--max-lines', type=int, default=200, metavar='N',
+                         help='Hard cap on output lines (default: 200, 0 = unlimited)')
 
     p_idiff = sub.add_parser('idiff', help='ORPHAN_DRIFT + GHOST ALERT between two map snapshots')
     p_idiff.add_argument('--prev', required=True, metavar='FILE',
@@ -645,7 +661,7 @@ def main():
 
     if args.cmd == 'find':
         query = ' '.join(args.query)
-        hits, result = find_map(args.map, query)
+        hits, result = find_map(args.map, query, max_lines=args.max_lines)
         if not query:
             print(result)
         elif hits:
@@ -656,7 +672,7 @@ def main():
             sys.exit(1)
 
     elif args.cmd == 'trace':
-        result = trace_map(args.map, args.identifier)
+        result = trace_map(args.map, args.identifier, max_lines=args.max_lines)
         if result is None:
             print(f"[map] '{args.identifier}' not found in any defines", file=sys.stderr)
             print(f"hint:  try: python map_query.py find \\{args.identifier}", file=sys.stderr)
