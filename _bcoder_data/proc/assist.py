@@ -1,17 +1,41 @@
-"""assist — before-proc that reads the last agent reply and asks another LLM
-for a one-sentence hint on where to go next.
+"""assist — before-proc: ask a second LLM for a one-sentence search hint each turn.
 
-Outputs ACTION: /parallel $ profile: <name> ctx: last
-$ is set to the hint prompt before the action is dispatched by the before-proc handler.
+Reads the last agent reply, builds a focused "what to search next?" prompt,
+and dispatches it to a parallel LLM profile. The hint is injected as [context]
+into the next agent turn — helping the agent stay on track.
+
+This is a meta-cognitive aid: a fast cheap LLM watches the main agent's
+reasoning and suggests course corrections before the next turn begins.
+
+Arguments:
+  profile: <name>   1bcoder profile to use for the hint LLM (default: short)
+                    Recommended: short, nemotron-mini, qwen3:0.6b (fast and cheap)
 
 Usage in agent file:
-    before =
-        assist
-        assist profile: ten_experts
+  before =
+      assist                        # uses built-in "short" profile
+      assist profile: ten_experts   # custom profile
 
 Usage from session:
-    /proc before on assist
-    /proc before on assist profile: ten_experts
+  /proc before on assist
+  /proc before on assist profile: ten_experts
+
+Output per turn:
+  CAPTURE: <hint prompt>
+  ACTION:  /parallel $  profile: <name>  ctx: last
+
+Examples:
+  > /proc before on assist
+  > /agent run research.txt
+  # → before each turn, a second LLM suggests one focused search direction
+  # → reduces turns wasted on tangents in long agent runs
+
+  > /proc before on assist profile: short
+  # → use the built-in "short" profile (fast single-turn LLM)
+
+  Tip: combine with action-required gate for focused, efficient agents:
+    before = assist
+    gates  = action-required
 """
 import sys, os
 

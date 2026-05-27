@@ -1,9 +1,33 @@
 """
-grounding-check — verify that identifiers mentioned in the LLM reply
-exist in map.txt. Flags likely hallucinations.
+grounding-check — verify that identifiers in the LLM reply exist in map.txt.
 
-Designed for /proc on (persistent mode): runs silently after every reply,
-prints a warning line if grounding score is low.
+Compares CamelCase and snake_case identifiers mentioned in the reply against
+symbols known from the project map. Low overlap score signals the model may
+be hallucinating class or function names that do not exist in the codebase.
+
+Requires: /map index run first (produces .1bcoder/map.txt)
+Designed for /proc on (persistent mode): runs silently after every reply.
+
+Usage:
+  /map index                      # build project map first (once per session)
+  /proc on grounding-check        # enable persistent check
+  /proc off                       # disable
+
+Output:
+  [grounding] ████████░░ 82%  (9/11 identifiers known)
+  [grounding] WARNING: low grounding — verify before acting    (if score < 50%)
+  [grounding] unknown: FooService, barMethod, ...              (suspicious names)
+
+Examples:
+  > /map index
+  > /proc on grounding-check
+  > ask "how does UserService.authenticate work?"
+  # → high score: model is talking about real code symbols
+  # → low score: model is hallucinating class/method names
+
+  > ask "refactor PaymentProcessor to use the new gateway"
+  # → before applying /edit or /patch, check the grounding score
+  # → unknown identifiers in the reply = likely hallucination risk
 """
 import sys, re, os
 

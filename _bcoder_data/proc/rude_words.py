@@ -1,11 +1,31 @@
 """rude_words — persistent guard: alert when LLM reply contains profanity.
 
-Usage:
-    /proc on rude_words            # English word list
-    /proc on rude_words ua         # add Ukrainian word list
+Designed for shared or professional environments where LLM output must stay
+clean before it is displayed, logged, or forwarded. Only alerts — does not
+block. The user decides what to do next.
 
-The guard only alerts — it does not block. The user decides what to do next.
-Extend WORDS below with your own terms.
+Language sets:
+  (default)   English profanity list
+  ua          + Ukrainian politically charged terms
+
+Usage:
+  /proc on rude_words            # English word list
+  /proc on rude_words ua         # add Ukrainian word list
+  /proc off                      # disable
+
+To add custom words: edit WORDS_EN or WORDS_UA in the file itself.
+
+Examples:
+  > /proc on rude_words
+  > ask "explain this error in plain language"
+  # → ALERT if the model uses profanity in the explanation
+
+  > /proc on rude_words ua
+  # → also watches for Ukrainian politically charged terms in replies
+
+  > /proc on rude_words
+  > /agent run customer-support.txt
+  # → guard replies before they are shown to end users
 """
 import sys
 import re

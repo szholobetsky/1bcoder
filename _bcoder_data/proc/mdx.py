@@ -1,6 +1,36 @@
 """
-mdx — render last LLM reply as Markdown in the browser.
-Usage: /proc run mdx
+mdx — render last LLM reply as Markdown + LaTeX + Mermaid in the browser.
+
+Generates a temporary HTML file and opens it in the default browser.
+Auto-fixes common Mermaid issues (bare multi-word node names).
+
+Supports:
+  Markdown     via marked.js    — headers, tables, code blocks
+  LaTeX math   via KaTeX        — $inline$ and $$block$$ expressions
+  Diagrams     via Mermaid      — ```mermaid flowchart, sequence, class, etc.
+
+Usage:
+  /proc run mdx              # render last LLM reply in browser
+  /proc run mdx <file>       # render any .md file in browser
+  /proc run mdx translated   # render last translated reply (after /translate)
+
+Examples:
+  > ask "show the authentication flow as a Mermaid sequence diagram"
+  > /proc run mdx
+  # → browser opens with the rendered diagram
+
+  > ask "derive the time complexity of merge sort step by step"
+  > /proc run mdx
+  # → LaTeX math expressions rendered with proper notation
+
+  > /proc run mdx architecture.md
+  # → open any markdown file in the full browser renderer
+
+  > /translate last
+  > /proc run mdx translated
+  # → render the translated version in the browser
+
+  See also: md — renders in terminal (no LaTeX, no Mermaid, no browser)
 """
 import sys, re, tempfile, webbrowser
 

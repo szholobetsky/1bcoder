@@ -1,11 +1,30 @@
 """tempctx-cut — persistent guard for agent loops: cut agent context when near limit.
 
-Reads BCODER_AGENT_CTX_PCT set by 1bcoder when running inside an agent loop.
-Falls back to BCODER_CTX_PCT if not in agent mode.
+Reads BCODER_AGENT_CTX_PCT (set per turn during /agent run). Falls back to
+BCODER_CTX_PCT if not running inside an agent. Emits ACTION:/tempctx cut
+to compress the agent's working context without touching the main session.
 
 Usage:
-    /proc on tempctx-cut          # default threshold: 75%
-    /proc on tempctx-cut 60       # custom threshold %
+  /proc on tempctx-cut           # default threshold: 75%
+  /proc on tempctx-cut 60        # custom threshold %
+  /proc off                      # disable
+
+Output when triggered:
+  ALERT: agent context at N% — running /tempctx cut
+  ACTION: /tempctx cut
+
+Examples:
+  > /proc on tempctx-cut 70
+  > /agent run deep-analysis.txt
+  # → agent's temporary context is compressed automatically at 70%
+
+  > /proc on tempctx-cut
+  > /proc on ctx_cut 90
+  # → dual guard: tempctx for agent loop + ctx_cut for main session
+
+  Difference from ctx_cut:
+    ctx_cut       — guards the main session context (BCODER_CTX_PCT)
+    tempctx-cut   — guards the agent's temporary context (BCODER_AGENT_CTX_PCT)
 """
 import sys
 import os

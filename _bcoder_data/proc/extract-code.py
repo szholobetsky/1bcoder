@@ -1,16 +1,34 @@
 """
-extract-code — extract code blocks from last LLM reply.
+extract-code — extract fenced code blocks from last LLM reply.
 
-Finds all fenced code blocks (``` ... ```) and prints them cleanly.
-If exactly one block is found and a filename is mentioned nearby,
-emits ACTION:/save <file> so the code can be saved directly.
+Finds all ``` ... ``` and ~~~ ... ~~~ blocks and prints them cleanly
+with block labels. If exactly one block is found and a filename is
+mentioned nearby, emits ACTION:/save <file> to save it automatically
+(run mode only).
 
-stdout params:
-  code_count=N          number of blocks found
-  lang=<language>       language of first block (if specified)
-  file=<filename>       nearby filename (if detected, single block only)
+Usage:
+  /proc run extract-code
 
-ACTION: /save <file>    emitted when: 1 block + 1 filename clearly mentioned
+Output params:
+  code_count=N           number of blocks found
+  lang=<language>        language tag of first block (python, java, etc.)
+  file=<filename>        nearby filename if unambiguously detected
+
+ACTION:
+  /save <file>           emitted when: 1 block + 1 unambiguous filename
+
+Examples:
+  > ask "write a Flask hello world app in app.py"
+  > /proc run extract-code
+  # → prints the code block, then saves to app.py automatically
+
+  > ask "show me config.yaml and auth.py side by side"
+  > /proc run extract-code
+  # → prints both blocks, reports multiple files, no auto-save
+
+  > /var set lang lang
+  > echo {{lang}}
+  # → capture detected language (python, sql, etc.) as a variable
 """
 import sys, re
 

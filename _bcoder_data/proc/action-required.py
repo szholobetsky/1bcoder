@@ -1,15 +1,38 @@
-"""action-required — gate proc that fails if the agent reply contains neither
-an ACTION: command nor a completion signal.
+"""action-required — gate that fails if agent reply has no ACTION: and no done signal.
 
-If a likely command is found in the text (e.g. /read, /find), includes it
-in the FAIL message as a formatting hint to help the model self-correct.
+Forces the agent to always either issue a concrete command (ACTION: /...)
+or explicitly declare task completion. Prevents the agent from stalling in
+a "thinking out loud" loop without taking any real action.
+
+If a likely command is found in the text (e.g. /read, /find used mid-sentence),
+the FAIL message includes a formatting hint to help the model self-correct.
+
+Recognized completion signals (case-insensitive):
+  "task is done"  "task is complete"  "all done"  "done."  "finished."
+  "no further action"  "nothing more to do"
 
 Usage in agent file:
-    gates =
-        action-required
+  gates =
+      action-required
 
 Usage from session:
-    /proc gate on action-required
+  /proc gate on action-required
+
+Output:
+  FAIL: no ACTION: command and no completion signal [— did you mean: ACTION: /read]
+  FAIL: use ACTION: /command to act or write 'task is done' to finish
+
+Examples:
+  > /proc gate on action-required
+  > /agent run refactor.txt
+  # → agent must issue a command or say done each turn
+  # → pure commentary is rejected and the step retried
+
+  Pair with pattern-gate for stricter agents:
+    gates =
+        action-required
+        pattern-gate "I need to" "no planning — act or say done"
+        pattern-gate "I would"   "no conditional thoughts — act or say done"
 """
 import sys, re
 

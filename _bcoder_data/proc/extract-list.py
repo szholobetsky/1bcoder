@@ -1,15 +1,34 @@
 """
-extract-list — convert a vertical list in the last LLM reply to a comma-separated line.
+extract-list — convert a vertical list in the LLM reply to a comma-separated line.
 
-Finds the first bullet/numbered list block in the reply and joins items
-into: item1, item2, item3 ...
+Finds the first bullet or numbered list block and joins items onto one line.
+Useful for piping into /var, /parallel, or agent templates that expect
+a comma-separated list rather than a rendered bullet list.
 
-Strips:  - / * / 1. / 2) / (3) prefixes
-Skips:   blank lines, headers, non-list paragraphs
+Recognized prefixes: -  *  +  1.  2)  (3)
+Stops at first blank line after the list starts.
 
-stdout params:
-  list=<comma separated items>
+Usage:
+  /proc run extract-list
+
+Output params:
+  list=<item1, item2, item3, ...>
   count=N
+
+Examples:
+  > ask "list the top 5 Python web frameworks"
+  > /proc run extract-list
+  # → Flask, Django, FastAPI, Tornado, Starlette
+  # → list=Flask, Django, FastAPI, Tornado, Starlette
+  # → count=5
+
+  > /var set frameworks list
+  # → saves the comma-separated string into the 'frameworks' variable
+
+  > ask "what steps are needed to deploy this?"
+  > /proc run extract-list
+  > /var set steps list
+  > /agent run deploy.txt   # agent sees the steps as a compact variable
 """
 import sys, re
 

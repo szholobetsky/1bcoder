@@ -564,7 +564,8 @@ Commands
           /prompt load
           /prompt load 2
 
-/proc list              List available post-processors (.py files in proc dir).
+/proc list              List available post-processors with one-line descriptions.
+/proc help <name>       Show full docstring / usage for a processor.
 /proc run <name> [-f <file>]  Run processor against last LLM reply (or file with -f).
 /proc run <name> translated   Run processor against last translated reply (from /translate).
 /proc on <name>         Persistent mode: run processor after every LLM reply automatically.
@@ -2168,7 +2169,7 @@ _CMD_SPEC = {
                       "clear", "reset", "reapply", "refresh", "apply"]),
     "/map":      dict(file_idx=None, kw_idx=1, keywords=["index", "find", "trace", "deps", "diff", "idiff", "keyword"]),
     "/prompt":   dict(file_idx=None, kw_idx=1, keywords=["save", "load", "list", "delete"]),
-    "/proc":     dict(file_idx=None, kw_idx=1, keywords=["list", "run", "on", "off", "new"]),
+    "/proc":     dict(file_idx=None, kw_idx=1, keywords=["list", "run", "help", "on", "off", "new"]),
     "/team":     dict(file_idx=None, kw_idx=1, keywords=["list", "show", "new", "run"]),
     "/var":      dict(file_idx=None, kw_idx=1, keywords=["set", "get", "del", "def", "extract", "save", "load"]),
     "/config":   dict(file_idx=None, kw_idx=1, keywords=["save", "load", "show", "auto", "del"]),
@@ -6413,18 +6414,50 @@ Config stored in ~/.1bcoder/translate.json
         rest  = parts[2].strip() if len(parts) > 2 else ""
 
         if sub == "list":
+            import ast as _ast
             active_names = {p.split()[0] for p in self._proc_active}
-            all_files = set()
-            for d in (PROC_DIR, LOCAL_PROC_DIR):
+            all_files: dict[str, str] = {}
+            for d in (LOCAL_PROC_DIR, PROC_DIR):
                 if os.path.isdir(d):
-                    all_files.update(f for f in os.listdir(d) if f.endswith(".py"))
+                    for f in os.listdir(d):
+                        if f.endswith(".py") and f not in all_files:
+                            all_files[f] = os.path.join(d, f)
             if not all_files:
                 print("[proc] no processors found — use /proc new <name> to create one")
                 return
             for f in sorted(all_files):
                 name_no_ext = f[:-3]
                 marker = " *" if name_no_ext in active_names or f in active_names else ""
-                print(f"  {name_no_ext}{marker}")
+                try:
+                    src = open(all_files[f], encoding="utf-8").read()
+                    doc = _ast.get_docstring(_ast.parse(src)) or ""
+                    first = doc.strip().splitlines()[0] if doc.strip() else ""
+                    # strip leading "procname — " or "procname: " prefix if present
+                    for sep in (" — ", " - ", ": "):
+                        if first.lower().startswith(name_no_ext.lower() + sep):
+                            first = first[len(name_no_ext) + len(sep):]
+                            break
+                except Exception:
+                    first = ""
+                tag = " [local]" if all_files[f].startswith(LOCAL_PROC_DIR) else ""
+                print(f"  {name_no_ext:<22} {first}{marker}{tag}")
+
+        elif sub == "help":
+            name = rest.split()[0] if rest else ""
+            if not name:
+                print("usage: /proc help <name>"); return
+            fname = name if name.endswith(".py") else name + ".py"
+            path = next((os.path.join(d, fname) for d in (LOCAL_PROC_DIR, PROC_DIR)
+                         if os.path.isfile(os.path.join(d, fname))), None)
+            if not path:
+                print(f"[proc] '{name}' not found — use /proc list"); return
+            try:
+                import ast as _ast
+                src = open(path, encoding="utf-8").read()
+                doc = _ast.get_docstring(_ast.parse(src)) or ""
+                print(doc if doc else f"[proc] '{name}' has no docstring")
+            except Exception as e:
+                print(f"[proc] could not read {name}: {e}")
 
         elif sub == "run":
             if not rest:
@@ -6534,7 +6567,7 @@ Config stored in ~/.1bcoder/translate.json
                 print("[proc] no persistent processor active")
 
         else:
-            print("usage: /proc list | run <name> | on <name> | off | new <name>")
+            print("usage: /proc list | help <name> | run <name> | on <name> | off | new <name>")
 
     # ── /text ───────────────────────────────────────────────────────────────────
 

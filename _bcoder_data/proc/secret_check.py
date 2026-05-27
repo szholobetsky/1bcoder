@@ -1,11 +1,29 @@
 """secret_check — persistent guard: alert when reply contains sensitive keywords.
 
-Usage:
-    /proc on secret_check                      # default keyword list
-    /proc on secret_check client=acme,token    # add custom keywords (comma-separated)
-
-Extend KEYWORDS below or pass extras as argv.
+Watches LLM replies for well-known company/brand names and custom terms that
+may indicate the model is leaking training examples or client-specific data.
 Only alerts — does not block. The user decides what to do next.
+
+Built-in keywords: google, microsoft, anthropic, openai, amazon, apple,
+  facebook, meta, nvidia, oracle, salesforce, stripe
+
+Usage:
+  /proc on secret_check                         # built-in keyword list
+  /proc on secret_check client=acme,invoice     # add custom keywords
+  /proc off                                     # disable
+
+Arguments:
+  argv[n]   one or more comma-separated extra keywords: word1,word2,word3
+
+Examples:
+  > /proc on secret_check client=mycompany,projectname
+  > ask about authentication flow
+  # → ALERT if reply mentions "mycompany" or "projectname"
+
+  > /proc on secret_check apikey,password,secret
+  # → alert if LLM unexpectedly outputs credential-like terms
+
+  Extend the KEYWORDS list in the file itself for persistent custom terms.
 """
 import sys
 import re

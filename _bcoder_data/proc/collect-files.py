@@ -1,12 +1,30 @@
 """
-collect-files — extract file paths from LLM reply and append to a list file.
+collect-files — accumulate file paths from LLM replies across multiple turns.
 
-Good for /proc on (persistent mode): accumulates mentioned files across
-multiple turns. Results go to .1bcoder/collected-files.txt
+Appends newly mentioned file paths to .1bcoder/collected-files.txt after
+each reply. Deduplicates — same path is never written twice. Silent on
+turns with no paths; designed for /proc on (persistent mode).
 
-After collection, use:
-  /read .1bcoder/collected-files.txt   to review
-  /parallel /read <files>              to load all at once
+Usage:
+  /proc on  collect-files                          # default output file
+  /proc on  collect-files .1bcoder/my-list.txt     # custom output path
+  /proc off                                        # stop accumulating
+
+After collection:
+  /read .1bcoder/collected-files.txt     # review the full collected list
+  /parallel /read <files>                # load all collected files at once
+
+Examples:
+  > /proc on collect-files
+  > ask "which files handle authentication?"
+  > ask "which files are involved in the payment flow?"
+  > /proc off
+  > /read .1bcoder/collected-files.txt
+  # → combined deduplicated list from both replies
+
+  Difference from extract-files:
+    extract-files  — one-shot, shows files, auto-opens single result
+    collect-files  — persistent, silently accumulates across many turns
 """
 import sys, re, os
 
