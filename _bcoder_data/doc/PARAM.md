@@ -19,6 +19,7 @@ These are handled by 1bcoder directly and are not forwarded to the model API.
 | `ask_show` | 500 | Characters shown in terminal when output is truncated. |
 | `run_timeout` | 30 | Timeout in seconds for `/run` shell commands. Set to `0` to disable (no timeout). Useful for long-running CLI tools like `simargl search`. |
 | `log` | `false` | Print full request details before each LLM call: URL, model, message count, options. Also prints HTTP response headers on error. Useful for debugging 500 errors or unexpected model behaviour. |
+| `keep_alive` | *(not set)* | **Ollama only.** How long to keep the model loaded after a response. `-1` = never unload. `"5m"` = 5 minutes (Ollama default). `"0"` = unload immediately. Set `-1` to prevent KV-cache eviction during long sessions. |
 
 ---
 
@@ -133,6 +134,9 @@ An alternative to top_p/top_k that targets a specific perplexity level.
 
 # Keep reasoning in context for chained agents
 /param think_exclude false
+
+# Prevent Ollama from evicting KV-cache between requests (fixes slowdown after 10k+ tokens)
+/param keep_alive -1
 
 # Reset everything
 /param clear

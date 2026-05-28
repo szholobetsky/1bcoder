@@ -867,10 +867,14 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 
 /clear          Clear conversation context, reset params, clear /var variables, and reload model metadata.
                 Use this to fully reset session state when the model starts behaving oddly.
+/clear kv       Evict the Ollama KV cache by unloading the model (keep_alive=0). Ollama-only.
+                Use before benchmarks or tests that require a completely clean inference state.
+                The model will be reloaded on the next request.
 
-/model [-sc]            Switch AI model interactively (type number from list).
-/model <name> [-sc]     Switch directly by model name (e.g. /model gemma3:1b).
+/model [-sc] [-cc]      Switch AI model interactively (type number from list).
+/model <name> [-sc] [-cc]  Switch directly by model name (e.g. /model gemma3:1b).
                         -sc / save-context: keep context when switching.
+                        -cc / clear-cache:  evict KV cache of the old model before switching (Ollama only).
 
 /host <url> [-sc]   Switch host and provider on the fly.
                     -sc / save-context: keep context when switching.
@@ -1141,6 +1145,7 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /help                   Show full help.
 /help <command>         Show help for one command (e.g. /help map, /help fix).
 /help <command> ctx     Same but also inject the text into AI context.
+/help all ctx           Inject the entire help reference into AI context — then ask the model anything about available commands.
 
 /doc list               List documentation articles in doc/.
 /doc <name>             Show article rendered as Markdown.
@@ -1148,6 +1153,8 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /doc <name> ctx         Add article to AI context.
 
 /exit           Quit.
+
+/help all ctx   Inject the entire help reference into AI context — then ask the model anything about available commands.
 
 Ctrl+C      - interrupt AI response mid-stream.
 Enter       - submit message.
@@ -2392,6 +2399,27 @@ class CoderCLI:
         if self._meta_ctx:
             self.num_ctx = self._meta_ctx
 
+    def _evict_kv_cache(self) -> None:
+        """Unload the model from Ollama to evict the KV cache.
+
+        Sends keep_alive=0 with no prompt — Ollama unloads the model immediately.
+        The next request will reload the model with a completely clean KV cache.
+        Ollama-only; prints a warning for other providers.
+        """
+        if self.provider != "ollama":
+            print("[kv] KV eviction is Ollama-only (current provider: openai)")
+            return
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/generate",
+                json={"model": self.model, "keep_alive": 0},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            print(f"[kv] model '{self.model}' unloaded — KV cache cleared")
+        except Exception as e:
+            print(f"[kv] failed to evict: {e}")
+
     def _short_model(self) -> str:
         """Truncate model name to fit a narrow terminal.
 
@@ -2756,13 +2784,18 @@ class CoderCLI:
             else:
                 opts = {"num_ctx": self.num_ctx}
                 opts.update(self.params)
+                keep_alive = opts.pop("keep_alive", None)
+                ollama_body = {"model": self.model, "messages": messages, "stream": True,
+                               "options": opts}
+                if keep_alive is not None:
+                    ollama_body["keep_alive"] = keep_alive
                 if self.log_requests:
                     print(f"  [log] POST {self.base_url}/api/chat")
-                    print(f"  [log] model={self.model} messages={len(messages)} options={opts}")
+                    print(f"  [log] model={self.model} messages={len(messages)} options={opts}"
+                          + (f" keep_alive={keep_alive}" if keep_alive is not None else ""))
                 with requests.post(
                     f"{self.base_url}/api/chat",
-                    json={"model": self.model, "messages": messages, "stream": True,
-                          "options": opts},
+                    json=ollama_body,
                     stream=True, timeout=self.timeout,
                 ) as resp:
                     resp.raise_for_status()
@@ -3014,14 +3047,18 @@ class CoderCLI:
             self._cmd_format(user_input)
         elif user_input.startswith("/param"):
             self._cmd_param(user_input)
-        elif user_input == "/clear":
-            self.messages.clear()
-            self.last_reply = ""
-            self.params.clear()
-            self._vars.clear()
-            self._last_proc_stdout = ""
-            self._load_model_meta()   # re-detect num_ctx, forces Ollama model reload
-            print("[context cleared]")
+        elif user_input in ("/clear", "/clear kv"):
+            kv = user_input == "/clear kv"
+            if kv:
+                self._evict_kv_cache()
+            else:
+                self.messages.clear()
+                self.last_reply = ""
+                self.params.clear()
+                self._vars.clear()
+                self._last_proc_stdout = ""
+                self._load_model_meta()   # re-detect num_ctx, forces Ollama model reload
+                print("[context cleared]")
         elif user_input.startswith("/model"):
             self._cmd_model(user_input)
         elif user_input.startswith("/host"):
@@ -3822,8 +3859,14 @@ advanced_tools =
 
     def _cmd_model(self, user_input: str = ""):
         tokens = user_input.split()
-        save_ctx = "-sc" in tokens or "save-context" in tokens
-        args = [t for t in tokens[1:] if t not in ("-sc", "save-context")]
+        save_ctx  = "-sc" in tokens or "save-context" in tokens
+        clear_kv  = "-cc" in tokens or "clear-cache" in tokens
+        flag_strs = {"-sc", "save-context", "-cc", "clear-cache"}
+        args = [t for t in tokens[1:] if t not in flag_strs]
+
+        # evict KV cache of the current model before switching
+        if clear_kv:
+            self._evict_kv_cache()
 
         # refresh model list from server
         try:
@@ -3845,7 +3888,8 @@ advanced_tools =
                 print(f"[switched to {self.model}, context cleared]")
             else:
                 print(f"[switched to {self.model}, context kept]")
-            self.cmd_history.append(f"/model {name}" + (" -sc" if save_ctx else ""))
+            flags = (" -sc" if save_ctx else "") + (" -cc" if clear_kv else "")
+            self.cmd_history.append(f"/model {name}{flags}")
             return
 
         # interactive selection by number
@@ -3866,7 +3910,8 @@ advanced_tools =
                     print(f"[switched to {self.model}, context cleared]")
                 else:
                     print(f"[switched to {self.model}, context kept]")
-                self.cmd_history.append(f"/model {self.model}" + (" -sc" if save_ctx else ""))
+                flags = (" -sc" if save_ctx else "") + (" -cc" if clear_kv else "")
+                self.cmd_history.append(f"/model {self.model}{flags}")
             else:
                 print("invalid choice")
         except ValueError:
@@ -8322,6 +8367,15 @@ Config stored in ~/.1bcoder/translate.json
 
         cmd = parts[1].lstrip('/')
         ctx = len(parts) > 2 and parts[2].strip() == "ctx"
+
+        # /help all ctx — inject full help into context
+        if cmd == "all":
+            if ctx:
+                self.messages.append({"role": "user", "content": f"[help: all commands]\n{HELP_TEXT}"})
+                print(f"[help] full help injected into context ({len(HELP_TEXT):,} chars)")
+            else:
+                print(HELP_TEXT)
+            return
 
         # find paragraphs whose first line starts with /<cmd>
         paragraphs = HELP_TEXT.split('\n\n')
