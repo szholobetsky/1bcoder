@@ -13,8 +13,14 @@ system =
     One ACTION per turn.
     When done, write a clear summary answer. Do not write any ACTION when done.
 
+    IMPORTANT: never wrap the /web search query in quotes. Write keywords as plain words.
+    Wrong:  ACTION: /web search "lenovo m75q gen 2 price ukraine"
+    Right:  ACTION: /web search lenovo m75q gen 2 price ukraine
+
     Strategy:
-    1. Start with ACTION: /web search <question>
+    1. Start with ACTION: /web search keyword1 keyword2 keyword*
+       DuckDuckGo operators: "exact phrase", -exclude, OR, AND, site:, filetype:, intitle:, inurl:, region:
+       Use quotes only around specific phrases, not around the whole query.
     2. Review the search results (titles, URLs, snippets)
     3. Pick the most relevant URLs and fetch them with ACTION: /web fetch <url>
     4. Fetch up to 3 pages total — stop earlier if you already have enough to answer

@@ -12,6 +12,7 @@ import os
 import sys
 import io
 import json
+import time
 import argparse
 import threading
 import subprocess
@@ -1296,6 +1297,102 @@ def read_file(path, start=None, end=None, line_numbers=True):
         return "".join(lines), total
 
 
+# ── /sec helpers ─────────────────────────────────────────────────────────────
+
+def _sec_find_start(lines: list, pattern: str):
+    """Return 0-based index of first line matching pattern. 'line N' → line N-1."""
+    pat = pattern.strip()
+    if pat.lower().startswith("line "):
+        try:
+            return int(pat.split()[1]) - 1
+        except (IndexError, ValueError):
+            return None
+    pat_lower = pat.lower()
+    for i, line in enumerate(lines):
+        if pat_lower in line.lower():
+            return i
+    return None
+
+
+def _sec_md(lines: list, start: int):
+    """md mode: # heading hierarchy. Returns (start, end) 0-based inclusive."""
+    # if start line isn't a heading, walk back to enclosing heading
+    while start >= 0 and not lines[start].strip().startswith('#'):
+        start -= 1
+    if start < 0:
+        return None, None
+    stripped = lines[start].strip()
+    level = len(stripped) - len(stripped.lstrip('#'))
+    for i in range(start + 1, len(lines)):
+        s = lines[i].strip()
+        if s.startswith('#') and (len(s) - len(s.lstrip('#'))) <= level:
+            return start, i - 1
+    return start, len(lines) - 1
+
+
+def _sec_ind(lines: list, start: int):
+    """ind mode: leading-spaces depth."""
+    base = len(lines[start]) - len(lines[start].lstrip())
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if not ln.strip():
+            continue
+        if (len(ln) - len(ln.lstrip())) <= base:
+            return start, i - 1
+    return start, len(lines) - 1
+
+
+def _sec_brace(lines: list, start: int):
+    """brace mode: balanced {, [, ( counting."""
+    balance = 0
+    opened = False
+    for i in range(start, len(lines)):
+        for ch in lines[i]:
+            if ch in '{[(':
+                balance += 1
+                opened = True
+            elif ch in '}])':
+                balance -= 1
+        if opened and balance <= 0:
+            return start, i
+    return start, len(lines) - 1
+
+
+def _sec_plan(lines: list, prefix: str):
+    """plan mode: 1.2.3 dot-notation prefix. Collect all matching lines."""
+    import re as _re
+    p = prefix.strip()
+    start = end = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s == p or s.startswith(p + '.') or s.startswith(p + ' '):
+            if start is None:
+                start = i
+            end = i
+    return start, end
+
+
+def _sec_mplan(lines: list, start: int):
+    """mplan mode: markdown numbered list with indented sub-bullets.
+    Top-level: lines matching /^\\d+[.)]/  Sub-levels: deeper indentation."""
+    import re as _re
+    ln = lines[start]
+    base_indent = len(ln) - len(ln.lstrip())
+    is_numbered = bool(_re.match(r'^\d+[.)]\s', ln.strip()))
+    for i in range(start + 1, len(lines)):
+        l = lines[i]
+        if not l.strip():
+            continue
+        indent = len(l) - len(l.lstrip())
+        s = l.strip()
+        if indent <= base_indent and s:
+            if is_numbered and _re.match(r'^\d+[.)]\s', s):
+                return start, i - 1
+            elif not is_numbered and indent < base_indent:
+                return start, i - 1
+    return start, len(lines) - 1
+
+
 def edit_line(path, lineno, new_content):
     with open(path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -2143,10 +2240,10 @@ def _map_patch_remove(map_path: str, rel_prefix: str) -> int:
 # ── command fixer ──────────────────────────────────────────────────────────────
 
 _KNOWN_CMDS = [
-    "/read", "/readln", "/view", "/insert", "/edit", "/save", "/run", "/script", "/mcp",
+    "/read", "/readln", "/sec", "/view", "/insert", "/edit", "/save", "/run", "/script", "/mcp",
     "/parallel", "/patch", "/fix", "/fim", "/bkup", "/diff", "/agent", "/tree",
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
-    "/host", "/help", "/init", "/clear", "/exit",
+    "/host", "/help", "/init", "/clear", "/stats", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
     "/doc", "/tempctx", "/proj", "/text", "/role", "/ask", "/translate",
     "/web", "/flow", "/visual",
@@ -2223,13 +2320,15 @@ def _fix_path(path: str) -> str | None:
     return _fuzzy_fix(path, candidates, cutoff=0.65)
 
 
-def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None) -> str:
+def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
+                dynamic_kw: dict | None = None) -> str:
     """Check a 1bcoder command for common typos and fix them.
 
-    Checks: command name, file path, subcommand/keyword.
+    Checks: command name, file path, subcommand/keyword, dynamic names (flows/procs/scripts/hooks).
     auto=True  — fix silently with a yellow warning (agent mode).
     auto=False — show the fix and ask Y/n (human mode).
     extra_cmds — additional command names to consider (e.g. active aliases).
+    dynamic_kw — {cmd_root: [valid_names]} for /flow, /proc, /script, /hook.
     Returns the (possibly corrected) command string.
     """
     if not cmd.startswith("/"):
@@ -2288,6 +2387,28 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None) ->
                     if len(prefix_matches) == 1 and prefix_matches[0] != tok:
                         fixes[last_i] = (tokens[last_i], prefix_matches[0])
                         tokens[last_i] = prefix_matches[0]
+
+    # 5. dynamic names: /flow <name>, /proc run/on <name>, /script run <name>, /hook before/after <cmd> <script>
+    if dynamic_kw and cmd_root in dynamic_kw:
+        names = dynamic_kw[cmd_root]
+        name_idx = None
+        if cmd_root == "/flow":
+            # index 1 is the flow name, unless it's a meta-subcommand
+            if len(tokens) > 1 and tokens[1] not in ("list", "help"):
+                name_idx = 1
+        elif cmd_root in ("/proc", "/script"):
+            if len(tokens) > 2 and tokens[1] in ("run", "on", "before", "gate", "help", "show", "open"):
+                name_idx = 2
+        elif cmd_root == "/hook":
+            if len(tokens) > 3 and tokens[1] in ("before", "after"):
+                name_idx = 3
+        if name_idx is not None and name_idx not in fixes and len(tokens) > name_idx:
+            tok = tokens[name_idx]
+            if not tok.startswith("-") and not tok.startswith("@"):
+                fixed_name = _fuzzy_fix(tok, names, cutoff=0.65)
+                if fixed_name:
+                    fixes[name_idx] = (tok, fixed_name)
+                    tokens[name_idx] = fixed_name
 
     if not fixes:
         return cmd
@@ -2597,6 +2718,121 @@ class CoderCLI:
         except OSError:
             pass  # silent — don't interrupt the session
 
+    def _cmd_stats(self, user_input: str = "") -> None:
+        s = self._stats
+        parts = user_input.split()
+        if len(parts) > 1 and parts[1] == "reset":
+            self._stats = self._new_stats()
+            print("[stats] reset")
+            return
+
+        W = 54
+        DIM, R, BOLD = "\033[2m", "\033[0m", "\033[1m"
+
+        def _fmt(n): return f"{n:,}"
+
+        def _dur(secs):
+            secs = int(secs)
+            h, m, s2 = secs // 3600, (secs % 3600) // 60, secs % 60
+            if h:   return f"{h}h {m:02d}m"
+            if m:   return f"{m}m {s2:02d}s"
+            return  f"{s2}s"
+
+        def _cmd_table(cmd_dict, bucket):
+            rows = sorted(((v.get(bucket, 0), k) for k, v in cmd_dict.items()
+                           if v.get(bucket, 0) > 0), reverse=True)
+            if not rows:
+                return
+            line, col = "  ", 0
+            for count, cmd in rows:
+                entry = f"{cmd}  {count}   "
+                if col and col + len(entry) > W - 2:
+                    print(line.rstrip())
+                    line, col = "  ", 0
+                line += entry
+                col += len(entry)
+            if line.strip():
+                print(line.rstrip())
+
+        elapsed = time.time() - self._session_start
+        total_cmds = sum(v.get("manual", 0) + v.get("auto", 0)
+                         for v in s["cmds"].values())
+        manual_cmds = sum(v.get("manual", 0) for v in s["cmds"].values())
+        auto_cmds   = sum(v.get("auto",   0) for v in s["cmds"].values())
+
+        print(f"{DIM}{'─'*W}{R}")
+        print(f"{BOLD} Session  {_dur(elapsed)}{R}"
+              + (f"  {DIM}│  {_fmt(total_cmds)} commands{R}" if total_cmds else ""))
+        print(f"{DIM}{'─'*W}{R}")
+
+        if total_cmds:
+            print(f"  commands   {_fmt(total_cmds)}"
+                  f"  {DIM}(manual {manual_cmds}  │  auto {auto_cmds}){R}")
+
+        llm_line = f"  LLM calls  {_fmt(s['requests'])}"
+        if s['tokens_gen']:
+            approx = "  " + DIM + "≈" + R if s['requests'] and not s['tokens_prompt'] else ""
+            llm_line += f"  │  gen {_fmt(s['tokens_gen'])} t{approx}"
+        if s['tokens_prompt']:
+            llm_line += f"  │  prompt {_fmt(s['tokens_prompt'])} t"
+        print(llm_line)
+
+        if s['tokens_cached']:
+            cache_pct = s['tokens_cached'] * 100 // max(s['tokens_prompt'] + s['tokens_cached'], 1)
+            print(f"  cached     {_fmt(s['tokens_cached'])} t  {DIM}({cache_pct}%  Ollama KV){R}")
+
+        extras = []
+        if s['files_read']: extras.append(f"files read {s['files_read']}")
+        if s['run_calls']:  extras.append(f"/run {s['run_calls']}")
+        if s['ctx_clear']:  extras.append(f"ctx clear {s['ctx_clear']}")
+        if s['ctx_compact']:extras.append(f"compact {s['ctx_compact']}")
+        if s['mcp_calls']:  extras.append(f"MCP {s['mcp_calls']} ({_fmt(s['mcp_bytes'])}b)")
+        if extras:
+            print(f"  {('  │  ').join(extras)}")
+
+        if manual_cmds:
+            print(f"\n{DIM}{'─'*4} manual  {manual_cmds} {'─'*(W-14)}{R}")
+            _cmd_table(s["cmds"], "manual")
+
+        if auto_cmds:
+            print(f"\n{DIM}{'─'*4} auto  {auto_cmds} {'─'*(W-12)}{R}")
+            _cmd_table(s["cmds"], "auto")
+
+        if s['by_model']:
+            print(f"\n{DIM}{'─'*4} by model {'─'*(W-11)}{R}")
+            for model, m in s['by_model'].items():
+                cache_part = f"  │  cached {_fmt(m['tokens_cached'])}" if m.get('tokens_cached') else ""
+                print(f"  {model}")
+                print(f"    {_fmt(m['requests'])} req"
+                      f"  │  gen {_fmt(m['tokens_gen'])}"
+                      f"  │  prompt {_fmt(m['tokens_prompt'])}{cache_part}")
+
+        if s['by_host']:
+            print(f"\n{DIM}{'─'*4} by host {'─'*(W-11)}{R}")
+            for host, h in s['by_host'].items():
+                print(f"  {host}")
+                print(f"    {_fmt(h['requests'])} req  │  gen {_fmt(h['tokens_gen'])}")
+
+        print(f"{DIM}{'─'*W}{R}")
+
+    @staticmethod
+    def _new_stats() -> dict:
+        return {
+            "requests":      0,   # LLM calls
+            "tokens_gen":    0,   # tokens generated (eval_count / estimated)
+            "tokens_prompt": 0,   # prompt tokens evaluated (Ollama: prompt_eval_count)
+            "tokens_cached": 0,   # prompt tokens served from KV cache (Ollama only)
+            "files_read":    0,   # /read calls (per file)
+            "run_calls":     0,   # /run calls
+            "mcp_calls":     0,   # /mcp call
+            "mcp_bytes":     0,   # total bytes in mcp call results
+            "ctx_clear":     0,   # /ctx clear (full or partial)
+            "ctx_compact":   0,   # /ctx compact
+            "cmds":          {},  # cmd → {"manual": N, "auto": N}
+            "by_model":      {},  # model → {requests, tokens_gen, tokens_prompt, tokens_cached}
+            "by_host":       {},  # host  → {requests, tokens_gen}
+        }
+
     def _print_status(self) -> None:
         """Print a single status line showing model, size, quant, native ctx, and usage."""
         est_tokens = sum(len(m["content"]) for m in self.messages) // 4
@@ -2606,7 +2842,8 @@ class CoderCLI:
         if self._meta_ctx:
             parts.append(_fmt_ctx(self._meta_ctx))
         meta = f" [{' '.join(parts)}]" if parts else ""
-        print(f"\033[2m {model_str}{meta}  │  ctx {est_tokens} / {self.num_ctx} ({pct}%)\033[0m")
+        tps_str = f"  │  {self._last_tps:.1f} t/s" if self._last_tps else ""
+        print(f"\033[2m {model_str}{meta}  │  ctx {est_tokens} / {self.num_ctx} ({pct}%){tps_str}\033[0m")
         print()
 
     def __init__(self, base_url, model, models, provider="ollama"):
@@ -2643,6 +2880,7 @@ class CoderCLI:
         self._role: str = "You are a software developer assistant."  # /role — system persona prepended to every chat request
         self._last_proc_stdout: str = ""   # saved last proc output for /var set
         self._last_output: str = ""        # universal last output (LLM, tool, proc) — $ and -> capture
+        self._last_tps: float | None = None  # generation speed from last _stream_chat call
         self._last_input:  str = ""        # last user message or command — ~ expansion
         self._hooks: dict = {}             # /hook — before/after command triggers
         self._mcp: dict = {}
@@ -2652,6 +2890,8 @@ class CoderCLI:
         self._history: list[str] = []
         self.cmd_history: list[str] = []   # all /commands typed this session
         self.log_requests: bool = False    # /param log true — print request body + error detail
+        self._stats: dict = self._new_stats()
+        self._session_start: float = time.time()
         # enable readline history if available
         try:
             import readline
@@ -2715,6 +2955,11 @@ class CoderCLI:
         if self._role and not (messages and messages[0].get("role") == "system"):
             messages = [{"role": "system", "content": self._role}] + list(messages)
         chunks = []
+        self._last_tps = None
+        _t_start = time.time()
+        _stat_gen    = 0   # tokens generated
+        _stat_prompt = 0   # prompt tokens evaluated
+        _stat_cached = 0   # prompt tokens from KV cache
         def _print(c):
             sys.stdout.write(c); sys.stdout.flush()
         try:
@@ -2844,6 +3089,16 @@ class CoderCLI:
                                         _had_thinking = True
                                         chunk = chunk[start + len('<think>'):]
                         if data.get("done"):
+                            _ec  = data.get("eval_count", 0)
+                            _ed  = data.get("eval_duration", 0)
+                            _pc  = data.get("prompt_eval_count", 0)
+                            if _ec and _ed:
+                                self._last_tps = _ec / (_ed / 1e9)
+                            _stat_gen    = _ec or 0
+                            _stat_prompt = _pc or 0
+                            # estimated total prompt tokens; cached = total - evaluated
+                            _est_prompt = sum(len(m.get("content") or "") for m in messages) // 4
+                            _stat_cached = max(0, _est_prompt - _stat_prompt)
                             break
         except KeyboardInterrupt:
             print("\n[interrupted]")
@@ -2862,6 +3117,27 @@ class CoderCLI:
         reply = "".join(chunks)
         if not self.think_in_ctx:
             reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL).strip()
+        if self._last_tps is None and reply:
+            _elapsed = time.time() - _t_start
+            if _elapsed > 0.01:
+                self._last_tps = (len(reply) / 4) / _elapsed
+        if reply is not None and reply != "":
+            if _stat_gen == 0 and reply:
+                _stat_gen = len(reply) // 4   # fallback estimate for OpenAI
+            self._stats["requests"]      += 1
+            self._stats["tokens_gen"]    += _stat_gen
+            self._stats["tokens_prompt"] += _stat_prompt
+            self._stats["tokens_cached"] += _stat_cached
+            bm = self._stats["by_model"].setdefault(
+                self.model, {"requests": 0, "tokens_gen": 0, "tokens_prompt": 0, "tokens_cached": 0})
+            bh = self._stats["by_host"].setdefault(
+                self.base_url, {"requests": 0, "tokens_gen": 0})
+            bm["requests"]      += 1
+            bm["tokens_gen"]    += _stat_gen
+            bm["tokens_prompt"] += _stat_prompt
+            bm["tokens_cached"] += _stat_cached
+            bh["requests"]      += 1
+            bh["tokens_gen"]    += _stat_gen
         return reply
 
     # ── REPL ──────────────────────────────────────────────────────────────────
@@ -2976,7 +3252,12 @@ class CoderCLI:
         if user_input.startswith("/"):
             user_input = self._ALIASES.get(user_input.split()[0], user_input)  # hardcoded shorthands
             user_input = self._expand_alias(user_input)                         # user-defined aliases
-            user_input = fix_command(user_input, auto=auto, extra_cmds=list(self._aliases.keys()))
+            _dyn_roots = {"/flow", "/proc", "/script", "/hook"}
+            _cmd0 = user_input.split()[0]
+            _dyn_target = _cmd0 if _cmd0 in _dyn_roots else _fuzzy_fix(_cmd0, list(_dyn_roots), cutoff=0.7)
+            _dyn_kw = {_dyn_target: self._list_names(_dyn_target)} if _dyn_target else None
+            user_input = fix_command(user_input, auto=auto, extra_cmds=list(self._aliases.keys()),
+                                     dynamic_kw=_dyn_kw)
             if self._vars and "{{" in user_input:
                 user_input = _apply_params(user_input, self._vars)
             # expand $ to last output, ~ to last input, @ to file picker
@@ -3013,9 +3294,15 @@ class CoderCLI:
             _ok(f"[var] {capture_var} captured ({len(captured)} chars)")
             return
 
+        if user_input.startswith("/"):
+            _e = self._stats["cmds"].setdefault(cmd_root, {"manual": 0, "auto": 0})
+            _e["auto" if auto else "manual"] += 1
+
         if user_input == "/exit":
             self._autosave_prompt()
             sys.exit(0)
+        elif user_input.startswith("/stats"):
+            self._cmd_stats(user_input)
         elif user_input == "/about":
             self._cmd_about()
         elif user_input.startswith("/help"):
@@ -3067,6 +3354,8 @@ class CoderCLI:
             self._cmd_map(user_input)
         elif user_input.startswith("/readln") or user_input.startswith("/read"):
             self._cmd_read(user_input)
+        elif user_input.startswith("/sec"):
+            self._cmd_sec(user_input)
         elif user_input.startswith("/view"):
             self._cmd_view(user_input)
         elif user_input.startswith("/insert"):
@@ -3191,7 +3480,11 @@ class CoderCLI:
                         print("[translation failed]")
                 else:
                     for _proc in self._proc_active:
-                        self._run_proc(_proc, auto=True)
+                        proc_out = self._run_proc(_proc, auto=True)
+                        if proc_out:
+                            for _line in proc_out.splitlines():
+                                if _line.startswith("ACTION:"):
+                                    self._route(_line[7:].strip(), auto=True)
             elif self.messages:
                 self.messages.pop()
 
@@ -3480,10 +3773,12 @@ advanced_tools =
                 actual = min(n, len(self.messages))
                 del self.messages[-actual:]
                 self.last_reply = ""
+                self._stats["ctx_clear"] += 1
                 print(f"[ctx clear] removed last {actual} message(s), {len(self.messages)} remaining")
                 return
             self.messages.clear()
             self.last_reply = ""
+            self._stats["ctx_clear"] += 1
             print(f"[context cleared — params and num_ctx ({self.num_ctx}) preserved]")
             return
         if parts[1] == "compose":
@@ -3510,6 +3805,7 @@ advanced_tools =
                     return
                 del self.messages[-n:]
                 self.messages.append({"role": "assistant", "content": f"[compact of {n} message(s)]\n{summary}"})
+                self._stats["ctx_compact"] += 1
                 _ok(f"[ctx compact] {n} message(s) → 1 summary")
                 self._last_output = summary
                 return
@@ -3595,6 +3891,7 @@ advanced_tools =
                 self.messages.clear()
                 self.messages.append({"role": "user", "content": f"[session summary]\n{summary}"})
                 _ok(f"[ctx compact] context replaced with summary ({len(summary)} chars)")
+            self._stats["ctx_compact"] += 1
             self._last_output = summary
             return
         if parts[1] == "list":
@@ -4300,6 +4597,7 @@ advanced_tools =
         for path in tokens:
             try:
                 content, total = read_file(path, start, end, line_numbers=ln)
+                self._stats["files_read"] += 1
                 label = path + (f" lines {start}-{end}" if start else f" ({total} lines)")
                 if self._auto_apply:
                     # inside agent: print to stdout so Tee captures it for agent_msgs
@@ -4311,6 +4609,98 @@ advanced_tools =
                 print(f"file not found: {path}")
             except (OSError, ValueError) as e:
                 _err(e)
+
+    # ── /sec ───────────────────────────────────────────────────────────────────
+
+    def _cmd_sec(self, user_input: str):
+        MODES = ("md", "mplan", "ind", "brace", "plan")
+        EXT_MODE = {
+            ".md": "md", ".markdown": "md",
+            ".py": "ind", ".yaml": "ind", ".yml": "ind", ".toml": "ind",
+            ".java": "brace", ".js": "brace", ".ts": "brace", ".tsx": "brace",
+            ".jsx": "brace", ".cpp": "brace", ".c": "brace", ".cs": "brace",
+            ".go": "brace", ".json": "brace", ".rs": "brace",
+        }
+        parts = user_input.split(None, 3)
+        if len(parts) < 3:
+            print("usage: /sec [mode] <file> <pattern | line N>")
+            print("  md     — # heading hierarchy")
+            print("  mplan  — markdown numbered list with indented sub-bullets")
+            print("  ind    — indentation depth (Python, YAML)")
+            print("  brace  — balanced {}[]() (Java, JSON, C++)")
+            print("  plan   — dot-notation prefix (1.2.3)")
+            print("  mode is optional — auto-detected from file extension")
+            print("  e.g.  /sec doc.md ### 2")
+            print("        /sec md doc.md ### 2")
+            print("        /sec main.py def calculate")
+            print("        /sec App.java class UserService")
+            print("        /sec plan plan.txt 1.2.2")
+            print("        /sec doc.md line 8")
+            return
+
+        # detect whether second token is a mode or a filename
+        tokens_all = user_input.split(None, 4)  # /sec [mode?] file pattern...
+        if parts[1] in MODES:
+            if len(tokens_all) < 4:
+                print("[sec] missing pattern")
+                return
+            mode     = tokens_all[1]
+            filepath = tokens_all[2]
+            pattern  = " ".join(tokens_all[3:])
+        else:
+            # no explicit mode — auto-detect from extension
+            if len(tokens_all) < 3:
+                print("[sec] missing pattern")
+                return
+            filepath = tokens_all[1]
+            pattern  = " ".join(tokens_all[2:])
+            ext  = os.path.splitext(filepath)[1].lower()
+            mode = EXT_MODE.get(ext, "ind")
+            print(f"{_DIM}[sec] auto mode: {mode} (ext={ext or 'none'}){_R}")
+
+        if mode not in MODES:
+            print(f"[sec] unknown mode '{mode}'. Use: {', '.join(MODES)}")
+            return
+        if not os.path.isabs(filepath):
+            filepath = os.path.join(WORKDIR, filepath)
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            print(f"[sec] file not found: {filepath}")
+            return
+        except OSError as e:
+            _err(e); return
+
+        if mode == "plan":
+            start, end = _sec_plan(lines, pattern)
+        else:
+            start = _sec_find_start(lines, pattern)
+            if start is None:
+                print(f"[sec] pattern not found: {pattern!r}")
+                return
+            if mode == "md":
+                start, end = _sec_md(lines, start)
+            elif mode == "mplan":
+                start, end = _sec_mplan(lines, start)
+            elif mode == "ind":
+                start, end = _sec_ind(lines, start)
+            elif mode == "brace":
+                start, end = _sec_brace(lines, start)
+
+        if start is None:
+            print("[sec] section not found")
+            return
+
+        section = lines[start:end + 1]
+        content = "".join(f"{start + 1 + i:4}: {ln}" for i, ln in enumerate(section))
+        label = f"{os.path.basename(filepath)} [{mode}] lines {start+1}-{end+1}"
+        msg = f"[file: {label}]\n```\n{content}```"
+        if self._auto_apply:
+            print(msg)
+        else:
+            self.messages.append({"role": "user", "content": msg})
+            _ok(f"context: injected {label} ({end - start + 1} lines)")
 
     # ── /view ──────────────────────────────────────────────────────────────────
 
@@ -5083,6 +5473,7 @@ advanced_tools =
 
     def _cmd_run(self, shell_cmd: str):
         print(f"$ {shell_cmd}")
+        self._stats["run_calls"] += 1
         run_timeout = self.params.get("run_timeout", 30)
         try:
             proc = subprocess.run(
@@ -5627,6 +6018,13 @@ advanced_tools =
         if params and not auto:
             print(f"  {_DIM}params: {params}{_R}")
 
+        # ── auto-apply num_ctx if proc emits it ─────────────────────────────────
+        if "num_ctx" in params:
+            try:
+                self.num_ctx = int(params["num_ctx"])
+            except ValueError:
+                pass
+
         # ── ACTION line — one-shot mode only ────────────────────────────────────
         if not auto:
             action_line = None
@@ -6143,6 +6541,33 @@ advanced_tools =
 
     # ── /flow ───────────────────────────────────────────────────────────────
 
+    def _list_names(self, cmd_root: str) -> list[str]:
+        """Return sorted list of valid names for /flow, /proc, /script, /hook."""
+        dirs, ext = [], ""
+        if cmd_root == "/flow":
+            dirs = [os.path.join(d, "flows")
+                    for d in (BCODER_DIR, HOME_BCODER_DIR, INSTALL_BCODER_DIR)]
+            ext = ".py"
+        elif cmd_root == "/proc":
+            dirs = [LOCAL_PROC_DIR, PROC_DIR]
+            ext = ".py"
+        elif cmd_root in ("/script", "/hook"):
+            dirs = [SCRIPTS_DIR, GLOBAL_SCRIPTS_DIR]
+            ext = ".txt"
+        seen: set = set()
+        names: list = []
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for f in sorted(os.listdir(d)):
+                if f.startswith("_"):
+                    continue
+                name = f[:-len(ext)] if ext and f.endswith(ext) else f
+                if name not in seen and (not ext or f.endswith(ext)):
+                    seen.add(name)
+                    names.append(name)
+        return names
+
     def _cmd_flow(self, user_input: str):
         """
 /flow <name> [args]   Run a flow from _bcoder_data/flows/<name>.py.
@@ -6605,9 +7030,14 @@ Config stored in ~/.1bcoder/translate.json
             print(f"[proc] created: {path}")
 
         elif sub == "" or sub == "proc":
-            if self._proc_active:
+            any_active = self._proc_active or self._proc_before or self._proc_gates
+            if any_active:
                 for p in self._proc_active:
-                    print(f"[proc] active: {p}")
+                    print(f"[proc] active (after reply): {p}")
+                for p in self._proc_before:
+                    print(f"[proc] before (before call): {p}")
+                for p in self._proc_gates:
+                    print(f"[proc] gate (PASS/FAIL): {p}")
             else:
                 print("[proc] no persistent processor active")
 
@@ -7921,6 +8351,8 @@ Config stored in ~/.1bcoder/translate.json
                 return
             try:
                 result = client.call_tool(tool_name, arguments)
+                self._stats["mcp_calls"] += 1
+                self._stats["mcp_bytes"] += len(str(result))
                 print(f"[mcp] {tool_name}:")
                 print(result)
                 if not self._auto_apply:
@@ -9234,11 +9666,14 @@ Config stored in ~/.1bcoder/translate.json
         msgs_offset = 1 + len(self.messages)   # stable: self.messages not modified during loop
         self._in_agent   = True
         self._agent_msgs = agent_msgs          # expose to /tempctx
+        import itertools as _itertools
+        _turn_iter = _itertools.count(1) if max_turns == -1 else range(1, max_turns + 1)
+        _turns_label = "∞" if max_turns == -1 else str(max_turns)
         try:
-            for turn in range(1, max_turns + 1):
+            for turn in _turn_iter:
                 est_tokens = sum(len(m["content"]) for m in agent_msgs) // 4
                 ctx_pct    = est_tokens * 100 // self.num_ctx
-                print(f"\n{_CYAN}{_BOLD}[{label}] ── turn {turn}/{max_turns}{_R}{_DIM} " +
+                print(f"\n{_CYAN}{_BOLD}[{label}] ── turn {turn}/{_turns_label}{_R}{_DIM} " +
                       "─" * 20 + f"  ctx {est_tokens}/{self.num_ctx} ({ctx_pct}%)" + _R)
                 if est_tokens >= int(self.num_ctx * 0.85):
                     _warn(f"[{label}] context {ctx_pct}% full — stopping to avoid overflow")
@@ -9349,9 +9784,9 @@ Config stored in ~/.1bcoder/translate.json
                                     proc_failures.append(line[5:].strip())
                 failures = proc_failures
                 if failures:
-                        feedback = ("[gate failures — fix before continuing]\n"
+                        feedback = ("[reminder: your last reply was rejected — you must either issue a command or declare done]\n"
                                     + "\n".join(f"- {f}" for f in failures)
-                                    + "\nUse ACTION: to fix the issues above.")
+                                    + "\nWrite ACTION: /command to continue working, or write 'task is done' to finish.")
                         print(f"{_DIM}[{label}] gates: {len(failures)} failure(s) — retrying{_R}")
                         # restore current plan step so agent retries it
                         if step is not None:
@@ -9599,7 +10034,7 @@ Config stored in ~/.1bcoder/translate.json
             auto_exec = auto_apply = True
             task = re.sub(r'(?:^|\s)-y(?=\s|$)', ' ', task).strip()
         while True:
-            m = re.match(r'^-t\s+(\d+)\s*(.*)', task, re.DOTALL)
+            m = re.match(r'^-t\s+(-?\d+)\s*(.*)', task, re.DOTALL)
             if m:
                 max_turns = int(m.group(1))
                 task = m.group(2).strip()
