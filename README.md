@@ -1813,7 +1813,7 @@ For human input, the corrected command is shown with `[fix?]` and you are asked 
 
 ## Part of the SIMARGL toolkit
 
-1bcoder is one of five tools that together form an **intellectual development support system**:
+1bcoder is one of six tools that together form an **intellectual development support system**:
 
 | Tool | Role |
 |---|---|
@@ -1822,12 +1822,14 @@ For human input, the corrected command is shown with `[fix?]` and you are asked 
 | **[1bcoder](https://github.com/szholobetsky/1bcoder)** | AI coding assistant for small local models — surgical context management, agents, parallel inference, proc scripts |
 | **[yasna](https://github.com/szholobetsky/yasna)** | Session memory — indexes conversations from all AI agents so you can find what was discussed, when, and where |
 | **[radogast](https://github.com/szholobetsky/radogast)** | Context drift monitor — measures how far an AI agent's conversation has drifted from the original task |
+| **[vyrii](https://github.com/szholobetsky/vyrii)** | Local AI web UI — chat, translate, web research, RAG, and file management via Gradio; powered by Ollama or any OpenAI-compatible backend |
 
 - **simargl** answers: *what code is related to this task?*
 - **svitovyd** answers: *how is the code structured and what depends on what?*
 - **1bcoder** answers: *how do I work with local models efficiently?*
 - **yasna** answers: *where did I already discuss this?*
 - **radogast** answers: *is the AI agent still on track toward the goal?*
+- **vyrii** answers: *how do I access all of this through a browser?*
 
 Together they cover the full development loop: understand the codebase, find relevant history, work with AI locally, remember what was decided, and verify the context stays on target.
 
