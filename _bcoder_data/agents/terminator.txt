@@ -1,0 +1,88 @@
+# Supervised coding agent — external ladder supervision for small models (1B-3B).
+# Implements §3 MVP of AUTOMATICAL_AGENTS_LOGICAL_EXTERNAL_APPROACH.
+#
+# Gate order per turn:
+#   gates (pre-action):
+#     1. action-required  — model must have issued an ACTION: call
+#     2. ladder           — context must be building toward task terms
+#   [ACTIONs executed here]
+#   gates_post (post-action):
+#     3. autocheck        — verify the change worked (tests pass, output correct)
+#
+# agent_ctx = 8000 keeps context tight — small models lose thread past 4-6K tokens.
+# max_turns = 30 allows up to 15 action+verify cycles before giving up.
+#
+# To add autocheck, add to gates_post section below, e.g.:
+#   autocheck cmd:"pytest" ok:exit0
+#   autocheck cmd:"python calc.py" keyword:passed
+#
+# See also: /coder (no ladder gate, simpler), /advance (manual confirm, 7B+)
+#
+# Usage:
+#   /agent terminator <task description>
+#   /terminator <task description>
+description = Supervised agent with external ladder tracking. Gates ensure context builds toward task. Best for 1B-3B.
+max_turns = 30
+auto_exec = true
+auto_apply = true
+
+params =
+    agent_ctx = 8000
+    num_predict = 300
+    retry_cap = 3
+
+gates =
+    action-required
+    ladder
+
+gates_post =
+
+system =
+    You are a coding assistant working under external supervision.
+    A gate checks your progress after each turn — it verifies that
+    your actions are building evidence toward the task goal.
+
+    To call a tool, write ACTION: on its own line followed by the command.
+    One ACTION per turn. Wait for [tool result] before the next ACTION.
+    When the task is complete, write a short summary and end with: task is done.
+
+    How to write files:
+    - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
+      ("code" means: extract the ``` ``` block written above in this reply)
+    - To FIX part of a file: ACTION: /fim <file> <line or start-end> description of the fix
+      e.g.  ACTION: /fim calc.py 5 fix the division by zero
+            ACTION: /fim calc.py 3-7 fix the loop condition
+            ACTION: /fim calc.py 1-5 fix indentation errors
+    - To INSERT code at a line: write the code block, then ACTION: /insert <file> <line> code
+
+    Rules:
+    - /readln a file before editing it (shows line numbers needed for /fim)
+    - /run to test after applying a fix
+    - If you get a FAIL message — read it carefully, fix the issue, and try again.
+    - Do not declare done until the task requirement is met.
+
+    Available tools:
+    {tool_list}
+
+tools =
+    read
+    readln
+    tree
+    find
+    save
+    fim
+    patch
+    insert
+    run
+    diff
+    map index
+    map find
+    map trace
+    map keyword
+
+examples =
+    /agent terminator write a REST endpoint POST /alerts in alerts.py with validation
+    /agent terminator fix the failing test in test_score.py
+    /agent terminator implement the Haversine distance function in geo_utils.py
+    /agent terminator add JWT authentication to the login endpoint
+    /agent terminator write unit tests for UserRepository covering create and find methods

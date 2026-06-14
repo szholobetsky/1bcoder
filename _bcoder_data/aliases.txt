@@ -18,6 +18,15 @@
 /svitovyd   = /run svitovyd {{args}}
 /svi        = /run svitovyd {{args}}
 
+/coder      = /agent coder {{args}}
+/terminator = /agent terminator {{args}}
+/codex      = /agent codex {{args}}
+
+/save_code  = /save {{args}} code
+/patch_code = /patch {{args}} code
+
+/rag      = /flow rag {{args}}
+
 /small    = /parallel {{args}}  profile: small
 /explain  = /parallel {{args}}  profile: explain
 /thinking = /parallel {{args}}  profile: thinking

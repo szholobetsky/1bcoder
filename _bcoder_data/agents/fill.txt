@@ -1,5 +1,15 @@
-# Fill agent — reads current NaN variables and fills them from project context
-# Usage: /fill  or  /agent fill
+# Fill agent — reads current NaN variables and fills them from project context.
+# Runs automatically when session variables are undefined (NaN).
+# First loads .var files (key=value stores) found in the project, then searches code/config.
+# .var file format: first line is "# <description>"; rest are key=value pairs.
+# Only sets a variable if the value was actually found — never guesses.
+# Reports which variables could not be filled at the end.
+# Use /var set <name> =<value> manually if you know the value and want to skip the search.
+# See also: /var get (list all variables), /var load <file> (load a .var file manually)
+#
+# Usage:
+#   /fill                   (fills all NaN variables in the current session)
+#   /agent fill             (same, explicit agent invocation)
 description = Fill agent. Reads NaN variables, researches the project, sets each value.
 max_turns = 15
 auto_exec = true
@@ -47,3 +57,7 @@ tools =
     read
     tree
     find
+
+examples =
+    /fill
+    /agent fill

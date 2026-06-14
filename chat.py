@@ -17,6 +17,7 @@ import argparse
 import threading
 import subprocess
 import difflib
+import shlex
 import warnings
 warnings.filterwarnings("ignore", message="urllib3", category=Warning)
 import requests
@@ -41,6 +42,16 @@ def _ok(msg: str):   print(f"{_GREEN}{msg}{_R}")
 def _err(msg: str):  print(f"{_RED}error: {msg}{_R}")
 def _info(msg: str): print(f"{_CYAN}{msg}{_R}")
 def _warn(msg: str): print(f"{_YELL}{msg}{_R}")
+
+def _input(prompt: str = "") -> str:
+    """sys.stdin.readline() wrapper — bypasses pyreadline3 on Windows so special
+    characters (@, >, ~, `, < etc.) are not swallowed at the prompt."""
+    print(prompt, end="", flush=True)
+    try:
+        return sys.stdin.readline().rstrip("\n")
+    except (EOFError, KeyboardInterrupt):
+        raise
+
 
 
 def _multiline_input() -> tuple:
@@ -136,7 +147,7 @@ def _multiline_input() -> tuple:
         prompt_name = None
         while True:
             try:
-                line = input("··· ")
+                line = _input("··· ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 return "", None
@@ -886,6 +897,36 @@ Output capture operators (work with any command — LLM reply, tool, proc):
           /host openai://localhost:4000            (LiteLLM)
           /host openai://localhost:1234 -sc
 
+/profile list
+    Show all saved profiles (local + global). Local overrides global for same name.
+/profile show <name>
+    Print the raw profile string (source file indicated).
+/profile add <name>
+    Append current host+model as a new worker in profile <name>.
+    Creates the profile if it does not exist.
+/profile save <name>
+    Save current host+model as profile <name> (single worker).
+    Creates new profile or overwrites existing.
+
+/switch <name>     Switch to profile <name>. Current connection is saved for restore.
+/switch profile    Show numbered list of profiles and prompt to select one.
+/switch restore    Restore the connection saved before the last /switch.
+Note: /switch always keeps the conversation context (-sc).
+
+/rag index [@r]       Build file-level vector index in cwd or in a registered project (@r = picker).
+/rag search <query>   Search indexed files in cwd (--mode file). Results injected into context.
+                      Use @r anywhere in command to pick a registered project interactively.
+/rag list             Show all registered RAG projects from global registry.
+/rag add [name] [path]  Register cwd (or given path) as a named RAG project.
+/rag remove <name>    Remove project from registry.
+/rag init             Run simargl init wizard in cwd.
+/rag ingest           Run simargl ingest in cwd (task DB mode).
+/rag status           Show simargl status for cwd.
+    Workflow: /rag init  →  /rag index  →  /rag search <query>
+    e.g.  /rag add myapp /my/project/home
+          /rag search "fix authentication bug" @r
+          @r = rag project picker (shows numbered list)
+
 /mcp connect <name> <command> [--cwd <dir>]
     Start an MCP server and connect to it. --cwd sets the working directory for the subprocess.
     e.g.  /mcp connect fs npx -y @modelcontextprotocol/server-filesystem .
@@ -1078,10 +1119,13 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /agent list
     List all named agents from .1bcoder/agents/ (* = local project) and ~/.1bcoder/agents/ (g = global).
     Shows name and description for each agent.
+/agent help <name>
+    Show full details for a named agent: description, notes, tools, gates, hooks, examples.
 /agent <name> [-t N] [-y] <task> [plan: step1, step2, ...] [file: steps.md]
     Run a named agent defined in .1bcoder/agents/<name>.txt (local overrides global).
-    Agent file defines: system prompt, tools, max_turns, auto_exec, aliases, params, before, gates.
+    Agent file defines: system prompt, tools, max_turns, auto_exec, aliases, params, before, gates, hooks, examples.
     e.g.  /agent list
+          /agent help coder
           /agent ask what does this project do
           /agent advance refactor the auth module
           /agent dbsearcher find all users created this week
@@ -1466,7 +1510,7 @@ def ai_fix(base_url, model, content, label, hint="", on_chunk=None, provider="ol
     return None, raw
 
 
-def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, provider="ollama"):
+def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, provider="ollama", params=None):
     """FIM-based fix: marks line range in the whole file, asks model for corrected file.
     If start is None: no marker — whole file passed with hint only (agent fallback mode)."""
     if start is None:
@@ -1485,10 +1529,21 @@ def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, pro
         user_msg = f"{hint}\n\n{user_msg}"
     msgs = [{"role": "user", "content": user_msg}]
     chunks = []
+    # num_predict: use file size * 1.5 as ceiling so model can output the corrected file,
+    # but ignore the agent's tight num_predict (e.g. 300) which would cut off mid-file.
+    file_tokens   = max(len("".join(file_lines)) // 4, 256)
+    fim_predict   = max(file_tokens + file_tokens // 2, 512)
+    fim_options   = {k: v for k, v in (params or {}).items()
+                     if k not in ("num_predict", "agent_ctx")}
+    fim_options["num_predict"] = fim_predict
     if provider == "openai":
+        oa_body = {"model": model, "messages": msgs, "stream": True,
+                   "max_tokens": fim_predict}
+        oa_body.update({k: v for k, v in fim_options.items()
+                        if k in ("temperature", "top_p", "seed")})
         with requests.post(
             f"{base_url}/v1/chat/completions",
-            json={"model": model, "messages": msgs, "stream": True},
+            json=oa_body,
             stream=True, timeout=120,
         ) as resp:
             resp.raise_for_status()
@@ -1496,7 +1551,8 @@ def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, pro
     else:
         with requests.post(
             f"{base_url}/api/chat",
-            json={"model": model, "messages": msgs, "stream": True},
+            json={"model": model, "messages": msgs, "stream": True,
+                  "options": fim_options},
             stream=True, timeout=120,
         ) as resp:
             resp.raise_for_status()
@@ -2246,7 +2302,7 @@ _KNOWN_CMDS = [
     "/host", "/help", "/init", "/clear", "/stats", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
     "/doc", "/tempctx", "/proj", "/text", "/role", "/ask", "/translate",
-    "/web", "/flow", "/visual",
+    "/web", "/flow", "/visual", "/profile", "/switch", "/rag",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -2284,6 +2340,9 @@ _CMD_SPEC = {
     "/visual":    dict(file_idx=None, kw_idx=1, keywords=["setup", "status", "explain"]),
     "/web":       dict(file_idx=None, kw_idx=1, keywords=["search", "fetch"]),
     "/flow":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
+    "/profile":   dict(file_idx=None, kw_idx=1, keywords=["list", "show", "add", "save"]),
+    "/switch":    dict(file_idx=None, kw_idx=1, keywords=["restore", "profile"]),
+    "/rag":       dict(file_idx=None, kw_idx=1, keywords=["index", "search", "list", "add", "remove", "init", "ingest", "status"]),
 }
 
 
@@ -2397,7 +2456,9 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
             if len(tokens) > 1 and tokens[1] not in ("list", "help"):
                 name_idx = 1
         elif cmd_root in ("/proc", "/script"):
-            if len(tokens) > 2 and tokens[1] in ("run", "on", "before", "gate", "help", "show", "open"):
+            if len(tokens) > 3 and tokens[1] == "gate" and tokens[2] in ("on", "off"):
+                name_idx = 3
+            elif len(tokens) > 2 and tokens[1] in ("run", "on", "before", "help", "show", "open"):
                 name_idx = 2
         elif cmd_root == "/hook":
             if len(tokens) > 3 and tokens[1] in ("before", "after"):
@@ -2432,7 +2493,7 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
 
     if not auto:
         try:
-            ans = input("  apply? [Y/n]: ").strip().lower()
+            ans = _input("  apply? [Y/n]: ").strip().lower()
             if ans in ("n", "no"):
                 return cmd
         except (EOFError, KeyboardInterrupt):
@@ -2601,7 +2662,7 @@ class CoderCLI:
             print("[picker] no files found")
             return None
         try:
-            raw = input("pick: ").strip()
+            raw = _input("pick: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -2651,7 +2712,7 @@ class CoderCLI:
             return user_input
         mapping = self._dir_picker(".")
         try:
-            raw = input("pick dir: ").strip()
+            raw = _input("pick dir: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -2674,12 +2735,107 @@ class CoderCLI:
             result = result[:m.start()] + replacement + result[m.end():]
         return result
 
+    def _resolve_at_profile(self, user_input: str) -> str | None:
+        """Replace @p token with a profile name chosen from a picker."""
+        m = re.search(r'@p\b', user_input)
+        if not m:
+            return user_input
+        profiles = _list_profiles()
+        if not profiles:
+            print("[picker] no profiles found")
+            return None
+        for i, (pname, wlist, comment, source) in enumerate(profiles, 1):
+            tag = f"  # {comment}" if comment else ""
+            print(f"  {i}. {pname} ({source}){tag}")
+            for host, model, outfile in wlist:
+                print(f"        {host}  |  {model}  |  {outfile}")
+        try:
+            raw = _input("pick profile: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            print(f"[picker] expected a number, got: {raw}")
+            return None
+        if not (1 <= n <= len(profiles)):
+            print(f"[picker] no profile #{n}")
+            return None
+        chosen = profiles[n - 1][0]
+        return user_input[:m.start()] + chosen + user_input[m.end():]
+
+    def _resolve_at_rag(self, user_input: str) -> str | None:
+        """Replace @r token with a RAG project path chosen from a picker."""
+        m = re.search(r'@r\b', user_input)
+        if not m:
+            return user_input
+        rag_file = os.path.join(os.path.expanduser("~"), ".1bcoder", "rag_projects.txt")
+        local_file = os.path.join(".1bcoder", "rag_projects.txt")
+        projects: list[tuple[str, str]] = []
+        for pfile in [local_file, rag_file]:
+            if not os.path.exists(pfile):
+                continue
+            with open(pfile, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "#" in line:
+                        line = line.partition("#")[0].strip()
+                    if ":" not in line:
+                        continue
+                    name, _, path = line.partition(":")
+                    name, path = name.strip(), path.strip()
+                    if name and path:
+                        projects.append((name, path))
+            break
+        if not projects and os.path.exists(rag_file):
+            with open(rag_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "#" in line:
+                        line = line.partition("#")[0].strip()
+                    if ":" not in line:
+                        continue
+                    name, _, path = line.partition(":")
+                    name, path = name.strip(), path.strip()
+                    if name and path:
+                        projects.append((name, path))
+        if not projects:
+            print("[picker] no RAG projects registered. Use: /rag add <name>")
+            return None
+        for i, (name, path) in enumerate(projects, 1):
+            exists = "[ok]" if os.path.isdir(path) else "[!]"
+            print(f"  {i}. {name}  {exists}  {path}")
+        try:
+            raw = _input("pick project: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            print(f"[picker] expected a number, got: {raw}")
+            return None
+        if not (1 <= n <= len(projects)):
+            print(f"[picker] no project #{n}")
+            return None
+        _, chosen_path = projects[n - 1]
+        return user_input[:m.start()] + f'--path {chosen_path}' + user_input[m.end():]
+
     def _autosave_prompt(self) -> None:
         """Ask user whether to save context; save to .1bcoder/autosave/ if confirmed."""
         if not self.messages:
             return
         try:
-            ans = input("Save context before action? [Y/n] ").strip().lower()
+            ans = _input("Save context before action? [Y/n] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -2868,11 +3024,13 @@ class CoderCLI:
         self._agent_msgs: list = [] # reference to active agent_msgs list (set in _run_agent_loop)
         self._agent_ctx:  int  = 0  # agent context limit (0 = use num_ctx); set via /tempctx N
         self._current_task: str = ""  # current agent task string — exposed as BCODER_TASK to procs
-        self._proc_before: list = []  # procs that run BEFORE each LLM call
-        self._proc_gates:  list = []  # procs that run after reply, PASS/FAIL gate
+        self._proc_before:      list = []  # procs that run BEFORE each LLM call
+        self._proc_gates:       list = []  # procs that run after reply, PASS/FAIL gate (pre-action)
+        self._proc_gates_post:  list = []  # procs that run after ACTIONs executed (post-action)
         self._savepoint  = None    # index into self.messages set by /ctx savepoint
         self._ctx_autosave_path: str | None = None   # set by /ctx load|save; auto on first message
         self._ctx_autosave_enabled: bool = False
+        self._switch_saved: dict | None = None  # saved by /switch for /switch restore
         self._aliases    = self._load_aliases()  # global + local aliases.txt
         self._script_file = None
         self._proc_active: list[str] = []  # persistent procs (run after every reply)
@@ -2918,7 +3076,7 @@ class CoderCLI:
             pct       = min(100, after_tok * 100 // self.num_ctx)
             print(f"  {_DIM}+{_fmt_ctx(new_toks)} tok → {_fmt_ctx(after_tok)}/{_fmt_ctx(self.num_ctx)} ({pct}%){_R}")
         try:
-            ans = input(prompt + " ").strip().lower()
+            ans = _input(prompt + " ").strip().lower()
             return ans in ("", "y", "yes")
         except (EOFError, KeyboardInterrupt):
             print()
@@ -2926,7 +3084,7 @@ class CoderCLI:
 
     def _prompt_input(self, prompt: str) -> str:
         try:
-            return input(prompt + " ").strip()
+            return _input(prompt + " ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return ""
@@ -3154,7 +3312,7 @@ class CoderCLI:
         print("  /help for all commands   /init to create .1bcoder/ folder")
         print("  Ctrl+C interrupts stream   /exit to quit")
         print("  <cmd> -> var  capture output into variable   $ = last output   ~ = last input")
-        print("  @ = file picker (type number)             @/ = dir prefix picker")
+        print("  @ = file picker   @/ = dir prefix picker   @p = profile picker   @r = rag project picker")
         print("  tip: /agent ask <question> to analyze code   /read <file> to load   /tree to explore")
         print()
         _auto_cfg = {}
@@ -3173,7 +3331,7 @@ class CoderCLI:
         self._print_status()
         while True:
             try:
-                user_input = input("> ").strip()
+                user_input = _input("> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -3265,6 +3423,16 @@ class CoderCLI:
                 user_input = user_input.replace("$", self._last_output)
             if "~" in user_input:
                 user_input = user_input.replace("~", self._last_input)
+            if "@p" in user_input:
+                resolved = self._resolve_at_profile(user_input)
+                if resolved is None:
+                    return
+                user_input = resolved
+            if "@r" in user_input:
+                resolved = self._resolve_at_rag(user_input)
+                if resolved is None:
+                    return
+                user_input = resolved
             if "@/" in user_input:
                 resolved = self._resolve_at_dir(user_input)
                 if resolved is None:
@@ -3350,6 +3518,10 @@ class CoderCLI:
             self._cmd_model(user_input)
         elif user_input.startswith("/host"):
             self._cmd_host(user_input)
+        elif user_input.startswith("/profile"):
+            self._cmd_profile(user_input)
+        elif user_input.startswith("/switch"):
+            self._cmd_switch(user_input)
         elif user_input.startswith("/map"):
             self._cmd_map(user_input)
         elif user_input.startswith("/readln") or user_input.startswith("/read"):
@@ -4241,6 +4413,152 @@ advanced_tools =
         except requests.exceptions.HTTPError as e:
             _err(e)
 
+    # ── /profile ───────────────────────────────────────────────────────────────
+
+    def _cmd_profile(self, user_input: str):
+        tokens = user_input.split()
+        sub    = tokens[1].lower() if len(tokens) > 1 else ""
+
+        if sub == "list":
+            profiles = _list_profiles()
+            if not profiles:
+                print("[profile] no profiles found")
+                return
+            for pname, wlist, comment, source in profiles:
+                tag = f"  # {comment}" if comment else ""
+                print(f"  {pname} ({source}){tag}")
+                for host, model, outfile in wlist:
+                    print(f"      {host}  |  {model}  |  {outfile}")
+            return
+
+        if sub == "show":
+            pname = tokens[2] if len(tokens) > 2 else ""
+            if not pname:
+                print("usage: /profile show <name>")
+                return
+            found = False
+            for pf, source in ((PROFILES_FILE, "local"), (GLOBAL_PROFILES_FILE, "global")):
+                if not os.path.exists(pf):
+                    continue
+                with open(pf, encoding="utf-8") as f:
+                    content = f.read()
+                import re as _re
+                m = _re.search(rf'^{_re.escape(pname)}:\s*\n((?:[ \t]+\S.*\n?)+)',
+                               content, _re.MULTILINE)
+                if m:
+                    print(f"[profile:{pname}] ({source}: {pf})")
+                    for line in m.group(1).splitlines():
+                        print(f"  {line.strip()}")
+                    found = True
+                    break
+            if not found:
+                print(f"[profile] '{pname}' not found")
+            return
+
+        if sub == "add":
+            pname = tokens[2] if len(tokens) > 2 else ""
+            if not pname:
+                print("usage: /profile add <name>")
+                return
+            existing     = _load_profile(pname) or []
+            safe_model   = self.model.replace(":", "-").replace("/", "-")
+            default_file = f"ans/{safe_model}.txt"
+            outfile      = self._prompt_input(f"  output file [{default_file}]:").strip() or default_file
+            existing.append((self.base_url, self.model, outfile))
+            replaced = _save_profile(pname, existing)
+            print(f"[profile] added {self.base_url}|{self.model}|{outfile} "
+                  f"to '{pname}' ({'updated' if replaced else 'created'})")
+            return
+
+        if sub == "save":
+            pname = tokens[2] if len(tokens) > 2 else ""
+            if not pname:
+                print("usage: /profile save <name>")
+                return
+            safe_model   = self.model.replace(":", "-").replace("/", "-")
+            default_file = f"ans/{safe_model}.txt"
+            outfile      = self._prompt_input(f"  output file [{default_file}]:").strip() or default_file
+            replaced     = _save_profile(pname, [(self.base_url, self.model, outfile)])
+            print(f"[profile] {'updated' if replaced else 'saved'} '{pname}' → "
+                  f"{self.base_url}|{self.model}|{outfile}")
+            return
+
+        # unknown subcommand — print usage
+        print("usage: /profile list | show <name> | add <name> | save <name>")
+        print("       Profiles stored in .1bcoder/profiles.txt")
+
+    # ── /switch ────────────────────────────────────────────────────────────────
+
+    def _cmd_switch(self, user_input: str):
+        tokens = user_input.split()
+        sub    = tokens[1].lower() if len(tokens) > 1 else ""
+
+        if sub == "restore":
+            if self._switch_saved is None:
+                print("[switch] nothing to restore")
+                return
+            saved = self._switch_saved
+            if saved["provider"] == "ollama":
+                raw_host = saved["base_url"]
+            else:
+                raw_host = ("openai://"
+                            + saved["base_url"]
+                            .removeprefix("http://")
+                            .removeprefix("https://"))
+            self._cmd_host(f"/host {raw_host} -sc")
+            self._cmd_model(f"/model {saved['model']} -sc")
+            print(f"[switch] restored → {saved['model']}")
+            self._switch_saved = None
+            return
+
+        if sub == "profile":
+            profiles = _list_profiles()
+            if not profiles:
+                print("[switch] no profiles found")
+                return
+            for i, (pname, wlist, comment, source) in enumerate(profiles, 1):
+                tag = f"  # {comment}" if comment else ""
+                print(f"  {i}. {pname} ({source}){tag}")
+                for host, model, outfile in wlist:
+                    print(f"        {host}  |  {model}  |  {outfile}")
+            raw = self._prompt_input("  type number:").strip()
+            if not raw:
+                print("[cancelled]")
+                return
+            try:
+                idx = int(raw) - 1
+                if not (0 <= idx < len(profiles)):
+                    print("invalid choice")
+                    return
+            except ValueError:
+                print("type a number")
+                return
+            pname, wlist, _, _ = profiles[idx]
+            host, model, _ = wlist[0]
+            self._switch_saved = {"base_url": self.base_url, "provider": self.provider, "model": self.model}
+            self._cmd_host(f"/host {host} -sc")
+            self._cmd_model(f"/model {model} -sc")
+            print(f"[switch] → {pname} ({model}) | restore with /switch restore")
+            return
+
+        if not sub:
+            print("usage: /switch <profile-name> | /switch profile | /switch restore")
+            return
+
+        workers = _load_profile(sub)
+        if not workers:
+            print(f"[switch] profile '{sub}' not found")
+            profiles = _list_profiles()
+            if profiles:
+                print("  known profiles: " + ", ".join(p[0] for p in profiles))
+            return
+
+        host, model, _ = workers[0]
+        self._switch_saved = {"base_url": self.base_url, "provider": self.provider, "model": self.model}
+        self._cmd_host(f"/host {host} -sc")
+        self._cmd_model(f"/model {model} -sc")
+        print(f"[switch] → {sub} ({model}) | restore with /switch restore")
+
     # ── /tree ──────────────────────────────────────────────────────────────────
 
     def _cmd_tree(self, user_input: str):
@@ -5059,7 +5377,7 @@ advanced_tools =
             sys.stdout.write(c)
             sys.stdout.flush()
         try:
-            raw = ai_fill(self.base_url, self.model, slice_lines, rel_start, rel_end, hint, on_chunk, self.provider)
+            raw = ai_fill(self.base_url, self.model, slice_lines, rel_start, rel_end, hint, on_chunk, self.provider, self.params)
         except KeyboardInterrupt:
             print("\n[interrupted]")
             return
@@ -5121,11 +5439,15 @@ advanced_tools =
         if os.path.isabs(script_name):
             script_path = script_name if os.path.isfile(script_name) else None
         else:
+            fname = script_name if (script_name.endswith(".py") or "." in script_name) else script_name + ".py"
             search_dirs = (LOCAL_PROC_DIR, PROC_DIR, SCRIPTS_DIR, GLOBAL_SCRIPTS_DIR)
             for d in search_dirs:
-                p = os.path.join(d, script_name)
-                if os.path.isfile(p):
-                    script_path = p
+                for candidate in (script_name, fname):
+                    p = os.path.join(d, candidate)
+                    if os.path.isfile(p):
+                        script_path = p
+                        break
+                if script_path:
                     break
 
         if not script_path:
@@ -5916,7 +6238,10 @@ advanced_tools =
         auto=False — manual /proc run: confirm ACTION, ask to inject result.
         Returns captured stdout or "" on failure.
         """
-        parts = name.split()
+        try:
+            parts = shlex.split(name)
+        except ValueError:
+            parts = name.split()
         name_only = parts[0]
         extra_args = [a for a in parts[1:] if a != "translated"]
         use_translated = "translated" in parts[1:]
@@ -5955,6 +6280,17 @@ advanced_tools =
             agent_limit = self._agent_ctx or ctx_max
             proc_env["BCODER_AGENT_CTX_USED"] = str(agent_used)
             proc_env["BCODER_AGENT_CTX_PCT"]  = str(int(agent_used * 100 / agent_limit) if agent_limit else 0)
+            # dump live agent context for procs that need it (e.g. autocheck radogast)
+            import json as _json
+            _ctx_dir = os.path.join(WORKDIR, ".1bcoder", "temp")
+            os.makedirs(_ctx_dir, exist_ok=True)
+            _ctx_file = os.path.join(_ctx_dir, f"agent_ctx_{os.getpid()}.json")
+            try:
+                with open(_ctx_file, "w", encoding="utf-8") as _f:
+                    _json.dump(self._agent_msgs, _f, ensure_ascii=False)
+                proc_env["BCODER_AGENT_CTX_FILE"] = _ctx_file
+            except Exception:
+                pass
         try:
             result = subprocess.run(
                 [sys.executable, path] + extra_args,
@@ -6951,25 +7287,36 @@ Config stored in ~/.1bcoder/translate.json
                     rest = " ".join(tokens)
             self._run_proc(rest, auto=False, input_text=file_input)
 
-        elif sub in ("on", "before", "gate"):
-            # /proc on <name>      — after each reply
-            # /proc before on <name> — before each LLM call
-            # /proc gate on <name>   — PASS/FAIL gate after each reply
+        elif sub in ("on", "before", "gate", "postaction"):
+            # /proc on <name>               — after each reply
+            # /proc before on <name>        — before each LLM call
+            # /proc gate on <name>          — PASS/FAIL gate before ACTIONs
+            # /proc gate postaction on <name> — PASS/FAIL gate after ACTIONs executed
             if sub in ("before", "gate"):
-                # expect: /proc before on <name> or /proc gate on <name>
+                # expect: /proc before on <name> or /proc gate on <name> [or /proc gate postaction on <name>]
                 rest_parts = rest.split(None, 1)
+                if rest_parts[0] == "postaction" and len(rest_parts) > 1:
+                    sub = "postaction"
+                    rest = rest_parts[1]
+                    rest_parts = rest.split(None, 1)
                 if rest_parts[0] != "on" or len(rest_parts) < 2:
                     print(f"usage: /proc {sub} on <name> [args...]")
                     return
                 rest = rest_parts[1]
-            target_list = (self._proc_before if sub == "before"
-                           else self._proc_gates if sub == "gate"
+            target_list = (self._proc_before      if sub == "before"
+                           else self._proc_gates_post if sub == "postaction"
+                           else self._proc_gates   if sub == "gate"
                            else self._proc_active)
-            label_str   = ("before each LLM call" if sub == "before"
-                           else "gate (PASS/FAIL after reply)" if sub == "gate"
+            label_str   = ("before each LLM call"          if sub == "before"
+                           else "gate postaction (after ACTIONs)" if sub == "postaction"
+                           else "gate (PASS/FAIL before ACTIONs)" if sub == "gate"
                            else "after every reply")
-            name_part = rest.split()[0]
-            extra_args = rest.split()[1:]
+            try:
+                _rest_parts = shlex.split(rest)
+            except ValueError:
+                _rest_parts = rest.split()
+            name_part = _rest_parts[0]
+            extra_args = _rest_parts[1:]
             fname = name_part if name_part.endswith(".py") else name_part + ".py"
             path = next((os.path.join(d, fname) for d in (PROC_DIR, LOCAL_PROC_DIR)
                          if os.path.isfile(os.path.join(d, fname))), None)
@@ -6982,7 +7329,7 @@ Config stored in ~/.1bcoder/translate.json
             print(f"[proc] persistent: {name_part}{suffix} ({label_str})")
 
         elif sub == "off":
-            all_lists = [self._proc_active, self._proc_before, self._proc_gates]
+            all_lists = [self._proc_active, self._proc_before, self._proc_gates, self._proc_gates_post]
             if not any(all_lists):
                 print("[proc] no persistent processors active")
             elif rest:
@@ -6999,9 +7346,10 @@ Config stored in ~/.1bcoder/translate.json
             else:
                 names = [p.split()[0] for lst in all_lists for p in lst]
                 print(f"[proc] stopped: {', '.join(names)}")
-                self._proc_active = []
-                self._proc_before = []
-                self._proc_gates  = []
+                self._proc_active      = []
+                self._proc_before      = []
+                self._proc_gates       = []
+                self._proc_gates_post  = []
 
         elif sub == "new":
             name = rest or self._prompt_input("  processor name:")
@@ -7030,14 +7378,16 @@ Config stored in ~/.1bcoder/translate.json
             print(f"[proc] created: {path}")
 
         elif sub == "" or sub == "proc":
-            any_active = self._proc_active or self._proc_before or self._proc_gates
+            any_active = self._proc_active or self._proc_before or self._proc_gates or self._proc_gates_post
             if any_active:
                 for p in self._proc_active:
                     print(f"[proc] active (after reply): {p}")
                 for p in self._proc_before:
                     print(f"[proc] before (before call): {p}")
                 for p in self._proc_gates:
-                    print(f"[proc] gate (PASS/FAIL): {p}")
+                    print(f"[proc] gate (before ACTIONs): {p}")
+                for p in self._proc_gates_post:
+                    print(f"[proc] gate postaction (after ACTIONs): {p}")
             else:
                 print("[proc] no persistent processor active")
 
@@ -9257,7 +9607,7 @@ Config stored in ~/.1bcoder/translate.json
                     if auto_yes or self._auto_apply:
                         break
                     continue
-                ans = input("  [Y]es add + next / [s]kip next / [l]oop N / [n]o stop: ").strip().lower()
+                ans = _input("  [Y]es add + next / [s]kip next / [l]oop N / [n]o stop: ").strip().lower()
                 if ans in ("y", "yes", ""):
                     collected.append(result)
                     blocked |= intermediates
@@ -9272,7 +9622,7 @@ Config stored in ~/.1bcoder/translate.json
                     if n_str.isdigit() and int(n_str) > 0:
                         auto_loop = int(n_str)
                     else:
-                        n_str = input("  how many paths? ").strip()
+                        n_str = _input("  how many paths? ").strip()
                         auto_loop = int(n_str) if n_str.isdigit() else 1
                     # collect current path and start looping
                     collected.append(result)
@@ -9443,7 +9793,7 @@ Config stored in ~/.1bcoder/translate.json
         """
         while True:
             try:
-                answer = input("  execute? [Y/n/e/f/q]: ").strip()
+                answer = _input("  execute? [Y/n/e/f/q]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 return ('quit', None)
             al = answer.lower()
@@ -9474,14 +9824,14 @@ Config stored in ~/.1bcoder/translate.json
                 if _clipped:
                     print(f"  {_DIM}[copied to clipboard — paste with Ctrl+V]{_R}")
                 try:
-                    new_cmd = input("  edit> ").strip()
+                    new_cmd = _input("  edit> ").strip()
                 except (EOFError, KeyboardInterrupt):
                     return ('quit', None)
                 return ('run', new_cmd if new_cmd else cmd)
             if al == 'f':
                 print(f"  {_DIM}feedback to AI (blank = cancel):{_R}")
                 try:
-                    fb = input("  > ").strip()
+                    fb = _input("  > ").strip()
                 except (EOFError, KeyboardInterrupt):
                     return ('quit', None)
                 if fb:
@@ -9660,6 +10010,9 @@ Config stored in ~/.1bcoder/translate.json
         ACTION_RE   = re.compile(r'ACTION:\s*(/\S+(?:[ \t]+[^\n]+)?)', re.MULTILINE)
         plan_steps  = list(plan_steps) if plan_steps else []
         total_plan  = len(plan_steps)
+        retry_cap   = int(self.params.get("retry_cap", 0))  # 0 = disabled
+        autoexit    = str(self.params.get("autoexit", "")).lower() in ("true", "1", "yes")
+        consec_fails = 0  # consecutive gate-failure turns; reset on any passing turn
         if plan_context:
             agent_msgs.append({"role": "user", "content": f"[plan context]\n{plan_context}"})
             plan_context = ""
@@ -9728,13 +10081,13 @@ Config stored in ~/.1bcoder/translate.json
                 reply = self._stream_chat(agent_msgs)
                 if reply is None:   # keyboard interrupt sentinel
                     try:
-                        choice = input("  Response interrupted. Retry current turn? [Y/n/q]: ").strip().lower()
+                        choice = _input("  Response interrupted. Retry current turn? [Y/n/q]: ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
                         choice = "q"
                     if choice == "q":
                         break
                     try:
-                        note = input("  Add comment if needed: ").strip()
+                        note = _input("  Add comment if needed: ").strip()
                     except (EOFError, KeyboardInterrupt):
                         note = ""
                     if choice == "n":       # skip — mark as interrupted, continue
@@ -9773,7 +10126,7 @@ Config stored in ~/.1bcoder/translate.json
                                 if _line.startswith("FAIL:"):
                                     proc_failures.append(_line[5:].strip())
 
-                # gate procs — PASS/FAIL validators (also merged with proc_failures)
+                # gate procs — PASS/FAIL validators, chained: stop on first FAIL
                 if use_procs and self._proc_gates:
                     for _gp in self._proc_gates:
                         gp_out = self._run_proc(_gp, auto=True)
@@ -9782,12 +10135,20 @@ Config stored in ~/.1bcoder/translate.json
                             for line in gp_out.splitlines():
                                 if line.startswith("FAIL:"):
                                     proc_failures.append(line[5:].strip())
+                        if proc_failures:
+                            break  # first failing gate stops the chain
                 failures = proc_failures
                 if failures:
+                        consec_fails += 1
+                        if retry_cap > 0 and consec_fails >= retry_cap:
+                            _warn(f"[{label}] retry_cap={retry_cap} reached after {consec_fails} consecutive gate failures — stopping")
+                            print(f"  Last failure: {failures[0]}")
+                            print(f"  ESCALATE: agent cannot proceed. Review the failure above and restart with a more specific task.")
+                            break
                         feedback = ("[reminder: your last reply was rejected — you must either issue a command or declare done]\n"
                                     + "\n".join(f"- {f}" for f in failures)
                                     + "\nWrite ACTION: /command to continue working, or write 'task is done' to finish.")
-                        print(f"{_DIM}[{label}] gates: {len(failures)} failure(s) — retrying{_R}")
+                        print(f"{_DIM}[{label}] gates: {len(failures)} failure(s) — retrying ({consec_fails}/{retry_cap if retry_cap else '?'}){_R}")
                         # restore current plan step so agent retries it
                         if step is not None:
                             plan_steps.insert(0, step)
@@ -9799,16 +10160,46 @@ Config stored in ~/.1bcoder/translate.json
                         agent_msgs.append({"role": "user", "content": feedback})
                         continue  # force next turn regardless of actions
 
+                consec_fails  = 0  # gates passed — reset consecutive failure counter
                 model_actions = ACTION_RE.findall(reply)
                 actions       = model_actions + proc_actions
                 if not actions:
                     if plan_steps:
                         print(f"{_DIM}[{label}] no ACTION — {len(plan_steps)} plan step(s) remaining, continuing{_R}")
                         continue
+                    # before declaring done — run postaction gates to verify
+                    if use_procs and self._proc_gates_post:
+                        post_failures: list[str] = []
+                        post_success:  list[str] = []
+                        for _gp in self._proc_gates_post:
+                            gp_out = self._run_proc(_gp, auto=True)
+                            if gp_out:
+                                for line in gp_out.splitlines():
+                                    if line.startswith("FAIL:"):
+                                        post_failures.append(line[5:].strip())
+                                    elif line.startswith("SUCCESS:"):
+                                        post_success.append(line)
+                            if post_failures:
+                                break
+                        if post_failures:
+                            consec_fails += 1
+                            if retry_cap > 0 and consec_fails >= retry_cap:
+                                _warn(f"[{label}] retry_cap={retry_cap} reached — stopping")
+                                print(f"  Last failure: {post_failures[0]}")
+                                print(f"  ESCALATE: agent cannot proceed.")
+                                break
+                            feedback = ("[postaction gate failed — task is NOT done yet]\n"
+                                        + "\n".join(f"- {f}" for f in post_failures)
+                                        + "\nFix the issue above and issue another ACTION.")
+                            print(f"{_DIM}[{label}] postaction gates failed — agent must continue ({consec_fails}/{retry_cap if retry_cap else '?'}){_R}")
+                            agent_msgs.append({"role": "user", "content": feedback})
+                            continue
+                        for _s in post_success:
+                            print(f"{_DIM}[{label}] {_s}{_R}")
                     print(f"{_DIM}[{label}] no ACTION and no plan steps remaining — done{_R}")
                     if on_done:
                         self._route(on_done)
-                    ans = input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                    ans = _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
                     if ans == "a":
                         self.messages.extend(agent_msgs[msgs_offset:])
                         _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
@@ -9827,7 +10218,7 @@ Config stored in ~/.1bcoder/translate.json
                         self._route(_pa, auto=True)
                     if on_done:
                         self._route(on_done)
-                    ans = input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                    ans = _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
                     if ans == "a":
                         self.messages.extend(agent_msgs[msgs_offset:])
                         _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
@@ -9875,6 +10266,52 @@ Config stored in ~/.1bcoder/translate.json
 
                 if stop_agent:
                     break
+
+                # postaction gates — run AFTER ACTIONs executed; FAIL sends feedback and retries
+                if use_procs and self._proc_gates_post:
+                    post_failures: list[str] = []
+                    post_success:  list[str] = []
+                    for _gp in self._proc_gates_post:
+                        gp_out = self._run_proc(_gp, auto=True)
+                        if gp_out:
+                            for line in gp_out.splitlines():
+                                if line.startswith("FAIL:"):
+                                    post_failures.append(line[5:].strip())
+                                elif line.startswith("SUCCESS:"):
+                                    post_success.append(line)
+                        if post_failures:
+                            break
+                    if post_failures:
+                        consec_fails += 1
+                        if retry_cap > 0 and consec_fails >= retry_cap:
+                            _warn(f"[{label}] retry_cap={retry_cap} reached after {consec_fails} consecutive gate failures — stopping")
+                            print(f"  Last failure: {post_failures[0]}")
+                            print(f"  ESCALATE: agent cannot proceed. Review the failure above and restart with a more specific task.")
+                            break
+                        feedback = ("[postaction gate failed — your last change did not satisfy the check]\n"
+                                    + "\n".join(f"- {f}" for f in post_failures)
+                                    + "\nReview the failure above, fix the issue, and issue another ACTION.")
+                        print(f"{_DIM}[{label}] postaction gates: {len(post_failures)} failure(s) — retrying ({consec_fails}/{retry_cap if retry_cap else '?'}){_R}")
+                        tool_results.append(feedback)
+                    elif autoexit and post_success:
+                        for _s in post_success:
+                            print(f"{_DIM}[{label}] {_s}{_R}")
+                        print(f"[{label}] autoexit — task verified complete")
+                        if on_done:
+                            self._route(on_done)
+                        ans = _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                        if ans == "a":
+                            self.messages.extend(agent_msgs[msgs_offset:])
+                            _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
+                        elif ans == "s":
+                            last = next((m for m in reversed(agent_msgs) if m["role"] == "assistant"), None)
+                            if last:
+                                self.messages.append({"role": "user", "content": f"[{label} result]\n{last['content']}"})
+                                _ok(f"[{label}] last reply added to context")
+                        else:
+                            print(f"[{label}] nothing added to context")
+                        break
+
                 combined = "\n\n".join(tool_results) if tool_results else "[all tools skipped]"
                 agent_msgs.append({"role": "user", "content": combined})
 
@@ -9892,6 +10329,14 @@ Config stored in ~/.1bcoder/translate.json
         finally:
             self._in_agent    = False
             self._agent_msgs  = []
+            # clean up PID-scoped context dump
+            import json as _json
+            _ctx_file = os.path.join(WORKDIR, ".1bcoder", "temp", f"agent_ctx_{os.getpid()}.json")
+            try:
+                if os.path.exists(_ctx_file):
+                    os.remove(_ctx_file)
+            except Exception:
+                pass
 
     # ── named agents ───────────────────────────────────────────────────────────
 
@@ -9915,14 +10360,19 @@ Config stored in ~/.1bcoder/translate.json
             "aliases":     {},
             "procs":       [],     # procs activated after each reply
             "before":      [],     # procs activated before each LLM call
-            "gates":       [],     # procs that gate exit: must return PASS
+            "gates":       [],     # procs that gate reply before ACTIONs: must return PASS
+            "gates_post":  [],     # procs that gate after ACTIONs executed: must return PASS
+            "hooks":       [],     # event hooks: ["before save bkup", ...]
+            "notes":       [],     # # comment lines — shown in /agent info, not sent to model
+            "examples":    [],     # examples = section — shown in /agent info
             "vars":        {},     # session vars set for duration of agent run; {{task}} = task string
             "on_done":     "",     # slash command executed once on natural loop termination
             "params":      {},     # model params overrides for duration of agent run (num_predict, temperature…)
         }
-        tools, aliases, procs, before, gates = [], {}, [], [], []
+        tools, aliases, procs, before, gates, gates_post, hooks, examples = [], {}, [], [], [], [], [], []
+        notes = []
         agent_vars, agent_params, system_lines = {}, {}, []
-        in_tools = in_aliases = in_procs = in_before = in_gates = False
+        in_tools = in_aliases = in_procs = in_before = in_gates = in_gates_post = in_hooks = in_examples = False
         in_vars = in_params = in_system = False
         tools_declared = False  # True if tools = section was seen (even empty)
         for raw in open(path, encoding="utf-8"):
@@ -9933,9 +10383,10 @@ Config stored in ~/.1bcoder/translate.json
                 if in_system:
                     system_lines.append("")
                 else:
-                    in_tools = in_aliases = in_procs = in_vars = False
+                    in_tools = in_aliases = in_procs = in_vars = in_gates_post = False
                 continue
             if stripped.startswith("#"):
+                notes.append(stripped[1:].strip())
                 continue   # comments don't break blocks
             if line.startswith(" ") or line.startswith("\t"):
                 if in_system:
@@ -9948,6 +10399,12 @@ Config stored in ~/.1bcoder/translate.json
                     before.append(stripped)
                 elif in_gates:
                     gates.append(stripped)
+                elif in_gates_post:
+                    gates_post.append(stripped)
+                elif in_hooks:
+                    hooks.append(stripped)
+                elif in_examples:
+                    examples.append(stripped)
                 elif in_vars and "=" in stripped:
                     k, _, v = stripped.partition("=")
                     agent_vars[k.strip()] = v.strip()
@@ -9972,7 +10429,7 @@ Config stored in ~/.1bcoder/translate.json
                     aliases[k] = v.strip()
                 continue
             # top-level key = value line — ends any open block
-            in_tools = in_aliases = in_procs = in_before = in_gates = False
+            in_tools = in_aliases = in_procs = in_before = in_gates = in_gates_post = in_hooks = in_examples = False
             in_vars = in_params = in_system = False
             if "=" not in stripped:
                 continue
@@ -9990,6 +10447,8 @@ Config stored in ~/.1bcoder/translate.json
                 cfg["auto_apply"] = val.lower() in ("true", "1", "yes")
             elif key == "auto_exec":
                 cfg["auto_exec"] = val.lower() in ("true", "1", "yes")
+            elif key == "autoexit":
+                cfg["params"]["autoexit"] = val.lower() in ("true", "1", "yes")
             elif key == "on_done":
                 cfg["on_done"] = val
             elif key == "tools":
@@ -10003,6 +10462,12 @@ Config stored in ~/.1bcoder/translate.json
                 in_before = True
             elif key == "gates":
                 in_gates = True
+            elif key == "gates_post":
+                in_gates_post = True
+            elif key == "hooks":
+                in_hooks = True
+            elif key == "examples":
+                in_examples = True
             elif key == "vars":
                 in_vars = True
             elif key == "params":
@@ -10019,6 +10484,14 @@ Config stored in ~/.1bcoder/translate.json
             cfg["before"] = before
         if gates:
             cfg["gates"] = gates
+        if gates_post:
+            cfg["gates_post"] = gates_post
+        if hooks:
+            cfg["hooks"] = hooks
+        if notes:
+            cfg["notes"] = notes
+        if examples:
+            cfg["examples"] = examples
         if agent_vars:
             cfg["vars"] = agent_vars
         if agent_params:
@@ -10144,9 +10617,11 @@ Config stored in ~/.1bcoder/translate.json
         # apply agent-scoped vars, aliases, and procs for the duration of this run
         saved_vars    = dict(self._vars)
         saved_aliases = dict(self._aliases)
-        saved_procs   = list(self._proc_active)
-        saved_before  = list(self._proc_before)
-        saved_gates   = list(self._proc_gates)
+        saved_procs      = list(self._proc_active)
+        saved_before     = list(self._proc_before)
+        saved_gates      = list(self._proc_gates)
+        saved_gates_post = list(self._proc_gates_post)
+        saved_hooks   = dict(self._hooks)
         saved_params  = dict(self.params)
         # resolve vars: {{task}} → task string, other {{name}} → existing session vars
         for k, v in cfg["vars"].items():
@@ -10178,6 +10653,16 @@ Config stored in ~/.1bcoder/translate.json
             p_resolved = _apply_params(p, self._vars) if self._vars else p
             if p_resolved not in self._proc_gates:
                 self._proc_gates.append(p_resolved)
+        for p in cfg["gates_post"]:
+            p_resolved = _apply_params(p, self._vars) if self._vars else p
+            if p_resolved not in self._proc_gates_post:
+                self._proc_gates_post.append(p_resolved)
+        for h in cfg["hooks"]:
+            # format: "before|after <cmd> <script>"
+            parts_h = h.split(None, 2)
+            if len(parts_h) == 3:
+                timing, cmd_h, script_h = parts_h
+                self._hooks[f"{timing}_{cmd_h}"] = script_h
         on_done = _apply_params(cfg["on_done"], self._vars) if self._vars else cfg["on_done"]
         self._current_task = task
         try:
@@ -10188,9 +10673,11 @@ Config stored in ~/.1bcoder/translate.json
             self._current_task = ""
             self._vars        = saved_vars
             self._aliases     = saved_aliases
-            self._proc_active = saved_procs
-            self._proc_before = saved_before
-            self._proc_gates  = saved_gates
+            self._proc_active      = saved_procs
+            self._proc_before      = saved_before
+            self._proc_gates       = saved_gates
+            self._proc_gates_post  = saved_gates_post
+            self._hooks       = saved_hooks
             self.params       = saved_params
             self._agent_ctx   = saved_agent_ctx
 
@@ -10264,6 +10751,56 @@ Config stored in ~/.1bcoder/translate.json
                 tag = "*" if label == "local" else "g"
                 suffix = f"  —  {desc}" if desc else ""
                 print(f"  [{tag}] /{name}{suffix}")
+            print()
+            return
+
+        if task.startswith("help"):
+            name_arg = task[4:].strip()
+            if not name_arg:
+                print("usage: /agent help <name>")
+                return
+            path = self._find_agent_def(name_arg)
+            if not path:
+                print(f"[agent] not found: {name_arg}")
+                return
+            cfg = self._load_agent_def(path)
+            tag = "*" if AGENTS_DIR in path else "g"
+            print(f"\n[{tag}] /{name_arg}  —  {cfg['description'] or '(no description)'}\n")
+            if cfg["notes"]:
+                for n in cfg["notes"]:
+                    print(f"  # {n}")
+                print()
+            tw = 10
+            print(f"  {'max_turns':<{tw}}: {cfg['max_turns']}    auto_exec: {cfg['auto_exec']}    auto_apply: {cfg['auto_apply']}")
+            if cfg["tools"] is not None:
+                tool_str = ", ".join(cfg["tools"])
+                # wrap at 70 chars
+                line, out = "", []
+                for t in cfg["tools"]:
+                    if len(line) + len(t) + 2 > 60:
+                        out.append(line.rstrip(", "))
+                        line = ""
+                    line += t + ", "
+                if line:
+                    out.append(line.rstrip(", "))
+                print(f"  {'tools':<{tw}}: {out[0]}")
+                for l in out[1:]:
+                    print(f"  {'':<{tw}}  {l}")
+            else:
+                print(f"  {'tools':<{tw}}: (default)")
+            for section, label in [("gates", "gates"), ("before", "before"), ("procs", "procs"), ("hooks", "hooks")]:
+                items = cfg[section]
+                if items:
+                    print(f"  {label:<{tw}}: {items[0]}")
+                    for item in items[1:]:
+                        print(f"  {'':<{tw}}  {item}")
+            if cfg["params"]:
+                params_str = "  ".join(f"{k}={v}" for k, v in cfg["params"].items())
+                print(f"  {'params':<{tw}}: {params_str}")
+            if cfg["examples"]:
+                print(f"\n  Examples:")
+                for ex in cfg["examples"]:
+                    print(f"    {ex}")
             print()
             return
 
@@ -10399,7 +10936,7 @@ def _pick_model(models: list) -> str:
     """Interactively prompt user to pick a model by number. Exits on Ctrl+C."""
     while True:
         try:
-            raw = input("Pick [1]: ").strip() or "1"
+            raw = _input("Pick [1]: ").strip() or "1"
             idx = int(raw) - 1
             if 0 <= idx < len(models):
                 return models[idx]

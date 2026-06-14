@@ -1,6 +1,17 @@
 # Chunked file scanner — file content is pre-loaded into each plan step.
-# Usage: /agent scan <theme> plan: <file> -n [N]
-#        /scan <theme> plan: <file> -n [N]       (via alias)
+# Splits a large file into chunks and has the model extract only theme-relevant content.
+# num_predict=150 keeps each step short; agent_ctx=4000 prevents context overflow on large files.
+# scan-save proc accumulates extracts into scan_file (.1bcoder/scan_result.txt by default).
+# tempctx-cut proc trims context after each step so the window stays clean.
+# on_done automatically calls /compact to produce a final focused summary.
+# -n [N] controls chunk size in lines (default depends on /scan alias configuration).
+# Use this for: log files, large config files, long chat exports, anything too big to read at once.
+# See also: /compact (used at the end), /ask (for code files that fit in context)
+#
+# Usage:
+#   /scan <theme> plan: <file>
+#   /scan <theme> plan: <file> -n 50       (50-line chunks)
+#   /agent scan <theme> plan: <file> -n [N]
 description = Reads a file chunk by chunk and extracts info relevant to a theme.
 max_turns = 40
 auto_exec = true
@@ -29,3 +40,11 @@ system =
     If nothing is relevant — write exactly: nothing
 
     Theme: {{theme}}
+
+examples =
+    /scan error messages plan: app.log -n 50
+    /scan database queries plan: server.log -n 100
+    /scan authentication logic plan: chat.py -n 80
+    /scan configuration options plan: config.yaml
+    /scan API endpoint definitions plan: openapi.json -n 60
+    /scan failing tests plan: pytest_output.txt -n 30

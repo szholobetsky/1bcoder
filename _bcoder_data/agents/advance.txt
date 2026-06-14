@@ -1,5 +1,14 @@
-# Autonomous coding agent with full toolset — for larger models (7B+)
-# Usage: /advance <task>  or  /agent advance <task>
+# Autonomous coding agent with full toolset — for larger models (7B+).
+# auto_exec=false means every ACTION is shown for manual confirmation before running.
+# Has bkup tool: model can save backups itself before destructive edits.
+# Supports all edit strategies: save (full replace), patch (search/replace), fim (targeted fix), insert (line).
+# Use /readln before editing to get line numbers for patch/fim/insert.
+# Pair with gates: /proc gate on action-required + /proc gate on autocheck pytest
+# See also: /coder (auto_exec=true, for 1B-3B), /ask (read-only research)
+#
+# Usage:
+#   /advance <task>
+#   /agent advance <task>
 description = Autonomous coding agent with full toolset. Best for 7B+ models.
 max_turns = 10
 auto_exec = false
@@ -45,3 +54,11 @@ tools =
     tree
     find
     map
+
+examples =
+    /advance add input validation to the login endpoint in auth.py
+    /advance fix the KeyError crash in task_processor.py line 142
+    /advance add a --dry-run flag to the CLI in main.py
+    /advance write unit tests for the calculate_score function in scorer.py
+    /advance refactor the UserRepository class to use dependency injection
+    /advance extract the retry logic in api_client.py into a reusable decorator

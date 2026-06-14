@@ -1,5 +1,14 @@
-# SQLite research agent — SELECT queries only
-# Usage: /sqlite <db_file> <question>  or  /agent sqlite <db_file> <question>
+# SQLite research agent — SELECT queries only, never modifies data.
+# Workflow: auto-detect db → .schema → SELECT → plain text answer.
+# If <db_file> is "?" or omitted, searches for *.db / *.sqlite / *.sqlite3 in the project.
+# Aliases: /schema <db> runs ".schema"; /query <db> "SQL" runs any SELECT.
+# Wraps SQL in double quotes — do not add extra quotes to the SQL.
+# Retries on error automatically (wrong column name, typo, etc.).
+# sqlite3 must be in PATH; on Windows install from sqlite.org or use scoop/choco.
+#
+# Usage:
+#   /sqlite <db_file> <question>
+#   /agent sqlite <db_file> <question>
 description = SQLite research agent. Gets schema, writes SELECT queries, answers in plain text.
 max_turns = 8
 auto_exec = true
@@ -37,3 +46,11 @@ tools =
 aliases =
     /schema = /run sqlite3 {{args}} ".schema"
     /query  = /run sqlite3 {{args}}
+
+examples =
+    /sqlite sonar.db how many tasks are there?
+    /sqlite sonar.db list the 10 most recently modified files
+    /sqlite sonar.db which module has the most associated tasks?
+    /sqlite kafka.db show me the task with the most file changes
+    /sqlite ? what tables exist in this database?
+    /sqlite myapp.db find all users created in the last 7 days

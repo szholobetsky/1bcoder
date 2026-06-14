@@ -1,5 +1,14 @@
-# Planning agent — explores the project and writes a step-by-step plan to plan.txt
-# Usage: /plan <goal>  or  /agent planning <goal>
+# Planning agent — explores the project and writes a step-by-step plan to plan.txt.
+# Read-only like /ask — never edits source files.
+# Output format: # Plan: <goal> / numbered steps / ### Summary / ### Example
+# Plan is saved automatically to plan.txt via on_done when the agent finishes.
+# Best for: designing a feature before coding, splitting a large task into steps.
+# After /planning completes, read plan.txt then run /advance or /coder to execute it.
+# See also: /ask (ad-hoc questions, no plan file), /advance (executes the plan)
+#
+# Usage:
+#   /plan <goal>
+#   /agent planning <goal>
 description = Planning agent. Explores the project, then writes a structured plan saved to plan.txt.
 max_turns = 15
 auto_exec = true
@@ -52,3 +61,11 @@ aliases =
     /kw   = /map keyword extract {{args}} -f -c
     /sym  = /map find {{args}}
     /grep = /find {{args}} -c
+
+examples =
+    /plan add JWT authentication to the REST API
+    /plan refactor the database layer to use SQLAlchemy ORM
+    /plan add pagination to all list endpoints
+    /plan write unit tests for the UserService class
+    /plan extract the email sending logic into a separate module
+    /plan migrate from synchronous to async request handling

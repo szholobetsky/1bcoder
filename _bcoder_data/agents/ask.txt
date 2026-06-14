@@ -1,5 +1,15 @@
-# Read-only research agent for 4B models
-# Usage: /ask <question>  or  /agent ask <question>
+# Read-only research agent for 4B+ models.
+# Explores the project with tree/find/map tools — never edits anything.
+# Best for: "where is X defined?", "how does Y work?", "what files handle Z?"
+# /map keyword extracts real code identifiers from plain English phrases.
+# /map find \keyword shows usages; /map find keyword shows definitions; /map find -keyword shows callers.
+# /map trace keyword1 keyword2 shows the call path between two identifiers.
+# Use /ask before /advance when you need to understand the codebase first.
+# See also: /planning (saves a plan file), /advance (read + write)
+#
+# Usage:
+#   /ask <question>
+#   /agent ask <question>
 description = Read-only research agent. Explores with tree/find/map, never edits files.
 max_turns = 15
 auto_exec = true
@@ -39,3 +49,11 @@ aliases =
     /kw   = /map keyword extract {{args}} -f -c
     /sym  = /map find {{args}}
     /grep = /find {{args}} -c
+
+examples =
+    /ask where is the database connection initialized?
+    /ask how does the authentication middleware work?
+    /ask which files import the UserService class?
+    /ask what does the process_task function do and where is it called?
+    /ask list all API endpoints and their HTTP methods
+    /ask find all TODO comments in the project

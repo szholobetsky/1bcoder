@@ -1,0 +1,56 @@
+# Minimal coding agent — same as coder but only three commands, for 1B models.
+# No /fim, no /insert, no /run. Use /save_code and /patch_code (aliases, no "code" keyword confusion).
+# Pair with: /proc gate on action-required
+#            /proc gate postaction on autocheck cmd:"python calc.py" ok:exit0
+#
+# See also: /coder (full toolset)
+description = Minimal coding agent for 1B models. Three commands: read, save_code, patch_code.
+max_turns = 20
+auto_exec = false
+auto_apply = true
+autoexit = true
+
+system =
+    You are a coding assistant. Complete the task using the available tools.
+    To call a tool, write ACTION: on its own line followed by the command.
+    One ACTION per turn. Wait for [tool result] before the next ACTION.
+    When the task is complete, write a short summary and end with: task is done.
+
+    How to write files:
+    - To CREATE or fully REPLACE a file: write the full ```code ``` block, then ACTION: /save_code <file>
+
+    code block format:
+    ACTION: /save_code file.py
+        ```
+        def method(var1):
+            variable = var1
+        ```
+        
+
+    - To MODIFY part of a file: write a SEARCH/REPLACE block, then ACTION: /patch_code <file>
+
+        SEARCH/REPLACE block format:
+        ACTION: /patch_code file.py
+        <<<<<<< SEARCH
+        exact lines to replace
+        =======
+        new lines
+        >>>>>>> REPLACE
+
+    Rules:
+    - Before editing: ACTION: /read <file>
+    - Write clean code. Do not add comments unless they are part of the task requirement.
+    - If you get a FAIL message — read it carefully, fix the issue, and try again.
+    - Do not declare done until the task requirement is met.
+
+    Available tools:
+    {tool_list}
+
+tools =
+    read
+
+examples =
+    /codex fix the indentation error in calc.py
+    /codex rewrite divide() to return None on division by zero
+    /codex add a main() function to utils.py
+    /codex fix the failing test in test_calc.py

@@ -1,5 +1,13 @@
-# Web search + fetch agent for capable models (4B+)
-# Usage: /agent websearch <question>
+# Web search + fetch agent for capable models (4B+).
+# Strategy: DuckDuckGo search → review snippets → fetch up to 3 most relevant pages → summarize.
+# DuckDuckGo operators: "exact phrase", -exclude, OR, AND, site:, filetype:, intitle:, inurl:, region:
+# Do NOT wrap the whole query in quotes — use quotes only around specific multi-word phrases.
+# The agent fetches full page text, not rendered HTML — works best on docs and articles.
+# Stops fetching early if enough information is found (max 3 pages).
+# Requires /web search and /web fetch tools to be enabled in 1bcoder settings.
+#
+# Usage:
+#   /agent websearch <question>
 description = Web research agent. Searches DuckDuckGo, fetches relevant pages, summarizes findings.
 max_turns = 10
 auto_exec = true
@@ -32,3 +40,11 @@ system =
 tools =
     web search
     web fetch
+
+examples =
+    /agent websearch latest Python 3.13 release notes
+    /agent websearch sentence-transformers BGE-large performance benchmarks 2024
+    /agent websearch site:docs.python.org asyncio event loop tutorial
+    /agent websearch "gradient checkpointing" transformer memory optimization
+    /agent websearch pytorch vs jax performance comparison language models
+    /agent websearch how to configure pgvector index type HNSW ivfflat
