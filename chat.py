@@ -1185,6 +1185,15 @@ Note: /switch always keeps the conversation context (-sc).
           /proj find payment -c
           /config save
 
+/stats                  Show session statistics: LLM calls, tokens, speed (pp/tg), commands.
+/stats reset            Reset all counters for the current session.
+/stats save [file]      Save stats snapshot as Markdown. Default: .1bcoder/stats_<timestamp>.md
+/stats save json [file] Save stats snapshot as JSON.  Default: .1bcoder/stats_<timestamp>.json
+                        JSON is machine-readable — use for health checks or script monitoring.
+    e.g.  /stats save
+          /stats save json
+          /stats save json /tmp/health.json
+
 /init           Create .1bcoder/ scaffold in current directory (safe to re-run).
 
 /help                   Show full help.
@@ -2343,6 +2352,7 @@ _CMD_SPEC = {
     "/profile":   dict(file_idx=None, kw_idx=1, keywords=["list", "show", "add", "save"]),
     "/switch":    dict(file_idx=None, kw_idx=1, keywords=["restore", "profile"]),
     "/rag":       dict(file_idx=None, kw_idx=1, keywords=["index", "search", "list", "add", "remove", "init", "ingest", "status"]),
+    "/stats":     dict(file_idx=None, kw_idx=1, keywords=["reset", "save"]),
 }
 
 
@@ -2874,12 +2884,187 @@ class CoderCLI:
         except OSError:
             pass  # silent — don't interrupt the session
 
+    def _stats_save(self, path: str | None, fmt: str = "md") -> None:
+        import datetime as _dt
+        s = self._stats
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext   = "json" if fmt == "json" else "md"
+        if path:
+            fpath = os.path.expanduser(path)
+            if not os.path.splitext(fpath)[1]:
+                fpath += f".{ext}"
+            elif not fpath.endswith(f".{ext}"):
+                fpath += f".{ext}"
+        else:
+            save_dir = BCODER_DIR if os.path.isdir(BCODER_DIR) else HOME_BCODER_DIR
+            fpath = os.path.join(save_dir, f"stats_{stamp}.{ext}")
+
+        elapsed = time.time() - self._session_start
+        h, rem = divmod(int(elapsed), 3600)
+        m, sec = divmod(rem, 60)
+        dur = f"{h}h {m:02d}m" if h else (f"{m}m {sec:02d}s" if m else f"{sec}s")
+
+        def _spd_row(d, label):
+            n = d.get(f"{label}_n", 0)
+            if not n:
+                return None
+            avg = d.get(f"{label}_sum", 0.0) / n
+            lo  = d.get(f"{label}_min", 0.0)
+            hi  = d.get(f"{label}_max", 0.0)
+            src = "Ollama native" if label == "pp" else ""
+            return f"| {label.upper()} | {lo:.0f} | {avg:.0f} | {hi:.0f} | {n} |"
+
+        lines = [
+            f"# 1bcoder stats — {stamp}",
+            f"",
+            f"Session duration: **{dur}**  |  Model: `{self.model}`  |  Host: `{self.base_url}`",
+            f"",
+            f"## Totals",
+            f"",
+            f"| metric | value |",
+            f"|--------|-------|",
+            f"| LLM calls | {s['requests']:,} |",
+            f"| tokens generated | {s['tokens_gen']:,} |",
+            f"| tokens prompt | {s['tokens_prompt']:,} |",
+            f"| tokens cached (KV) | {s['tokens_cached']:,} |",
+            f"| files read | {s['files_read']} |",
+            f"| /run calls | {s['run_calls']} |",
+            f"| ctx clear | {s['ctx_clear']} |",
+            f"| ctx compact | {s['ctx_compact']} |",
+            f"| MCP calls | {s['mcp_calls']} |",
+        ]
+
+        # global speed
+        spd_rows = [_spd_row(s, lbl) for lbl in ("pp", "tg") if _spd_row(s, lbl)]
+        if spd_rows:
+            lines += [
+                f"",
+                f"## Speed (t/s)",
+                f"",
+                f"| metric | min | avg | max | samples |",
+                f"|--------|-----|-----|-----|---------|",
+            ] + spd_rows
+
+        # by model
+        if s.get("by_model"):
+            lines += ["", "## By model", ""]
+            for model, m in s["by_model"].items():
+                cache_str = f"  cached: {m.get('tokens_cached', 0):,}" if m.get("tokens_cached") else ""
+                lines += [
+                    f"### `{model}`",
+                    f"",
+                    f"| metric | value |",
+                    f"|--------|-------|",
+                    f"| requests | {m['requests']:,} |",
+                    f"| tokens gen | {m['tokens_gen']:,} |",
+                    f"| tokens prompt | {m['tokens_prompt']:,} |",
+                ]
+                if m.get("tokens_cached"):
+                    lines.append(f"| tokens cached | {m['tokens_cached']:,} |")
+                spd_rows = [_spd_row(m, lbl) for lbl in ("pp", "tg") if _spd_row(m, lbl)]
+                if spd_rows:
+                    lines += [
+                        f"",
+                        f"| speed | min | avg | max | samples |",
+                        f"|-------|-----|-----|-----|---------|",
+                    ] + spd_rows
+                lines.append("")
+
+        # by host
+        if s.get("by_host"):
+            lines += ["## By host", ""]
+            for host, h in s["by_host"].items():
+                lines += [
+                    f"### `{host}`",
+                    f"",
+                    f"| metric | value |",
+                    f"|--------|-------|",
+                    f"| requests | {h['requests']:,} |",
+                    f"| tokens gen | {h['tokens_gen']:,} |",
+                ]
+                spd_rows = [_spd_row(h, lbl) for lbl in ("pp", "tg") if _spd_row(h, lbl)]
+                if spd_rows:
+                    lines += [
+                        f"",
+                        f"| speed | min | avg | max | samples |",
+                        f"|-------|-----|-----|-----|---------|",
+                    ] + spd_rows
+                lines.append("")
+
+        if fmt == "json":
+            import json as _json
+            import datetime as _dt2
+
+            def _spd_dict(d, label):
+                n = d.get(f"{label}_n", 0)
+                if not n:
+                    return None
+                return {"min": round(d[f"{label}_min"], 1),
+                        "avg": round(d[f"{label}_sum"] / n, 1),
+                        "max": round(d[f"{label}_max"], 1),
+                        "samples": n}
+
+            def _model_entry(m):
+                e = {"requests": m["requests"], "tokens_gen": m["tokens_gen"],
+                     "tokens_prompt": m["tokens_prompt"], "tokens_cached": m.get("tokens_cached", 0)}
+                for lbl in ("pp", "tg"):
+                    sd = _spd_dict(m, lbl)
+                    if sd:
+                        e[f"speed_{lbl}"] = sd
+                return e
+
+            elapsed = time.time() - self._session_start
+            payload = {
+                "timestamp": _dt2.datetime.now().isoformat(timespec="seconds"),
+                "session_seconds": int(elapsed),
+                "model": self.model,
+                "host": self.base_url,
+                "requests": s["requests"],
+                "tokens_gen": s["tokens_gen"],
+                "tokens_prompt": s["tokens_prompt"],
+                "tokens_cached": s["tokens_cached"],
+                "files_read": s["files_read"],
+                "run_calls": s["run_calls"],
+                "ctx_clear": s["ctx_clear"],
+                "ctx_compact": s["ctx_compact"],
+                "mcp_calls": s["mcp_calls"],
+            }
+            for lbl in ("pp", "tg"):
+                sd = _spd_dict(s, lbl)
+                if sd:
+                    payload[f"speed_{lbl}"] = sd
+            payload["by_model"] = {m: _model_entry(v) for m, v in s.get("by_model", {}).items()}
+            payload["by_host"]  = {h: _model_entry(v) for h, v in s.get("by_host",  {}).items()}
+
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(fpath)), exist_ok=True)
+                with open(fpath, "w", encoding="utf-8") as f:
+                    _json.dump(payload, f, ensure_ascii=False, indent=2)
+                print(f"[stats] saved → {fpath}")
+            except OSError as e:
+                print(f"[stats] save failed: {e}")
+            return
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(fpath)), exist_ok=True)
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"[stats] saved → {fpath}")
+        except OSError as e:
+            print(f"[stats] save failed: {e}")
+
     def _cmd_stats(self, user_input: str = "") -> None:
         s = self._stats
         parts = user_input.split()
         if len(parts) > 1 and parts[1] == "reset":
             self._stats = self._new_stats()
             print("[stats] reset")
+            return
+        if len(parts) > 1 and parts[1] == "save":
+            fmt  = "json" if len(parts) > 2 and parts[2] == "json" else "md"
+            path = parts[3] if fmt == "json" and len(parts) > 3 else \
+                   parts[2] if fmt == "md"   and len(parts) > 2 else None
+            self._stats_save(path, fmt=fmt)
             return
 
         W = 54
@@ -2954,6 +3139,15 @@ class CoderCLI:
             print(f"\n{DIM}{'─'*4} auto  {auto_cmds} {'─'*(W-12)}{R}")
             _cmd_table(s["cmds"], "auto")
 
+        def _spd_line(d, label):
+            n = d.get(f"{label}_n", 0)
+            if not n:
+                return ""
+            avg = d.get(f"{label}_sum", 0.0) / n
+            lo  = d.get(f"{label}_min", 0.0)
+            hi  = d.get(f"{label}_max", 0.0)
+            return f"    {label}  min {lo:6.0f}  avg {avg:6.0f}  max {hi:6.0f}  t/s"
+
         if s['by_model']:
             print(f"\n{DIM}{'─'*4} by model {'─'*(W-11)}{R}")
             for model, m in s['by_model'].items():
@@ -2962,12 +3156,20 @@ class CoderCLI:
                 print(f"    {_fmt(m['requests'])} req"
                       f"  │  gen {_fmt(m['tokens_gen'])}"
                       f"  │  prompt {_fmt(m['tokens_prompt'])}{cache_part}")
+                for lbl in ("pp", "tg"):
+                    ln = _spd_line(m, lbl)
+                    if ln:
+                        print(ln)
 
         if s['by_host']:
             print(f"\n{DIM}{'─'*4} by host {'─'*(W-11)}{R}")
             for host, h in s['by_host'].items():
                 print(f"  {host}")
                 print(f"    {_fmt(h['requests'])} req  │  gen {_fmt(h['tokens_gen'])}")
+                for lbl in ("pp", "tg"):
+                    ln = _spd_line(h, lbl)
+                    if ln:
+                        print(ln)
 
         print(f"{DIM}{'─'*W}{R}")
 
@@ -2985,9 +3187,30 @@ class CoderCLI:
             "ctx_clear":     0,   # /ctx clear (full or partial)
             "ctx_compact":   0,   # /ctx compact
             "cmds":          {},  # cmd → {"manual": N, "auto": N}
-            "by_model":      {},  # model → {requests, tokens_gen, tokens_prompt, tokens_cached}
-            "by_host":       {},  # host  → {requests, tokens_gen}
+            # speed registers: Ollama = native timing; OpenAI = TTFT-based estimate
+            "pp_n": 0, "pp_sum": 0.0, "pp_min": float("inf"), "pp_max": 0.0,
+            "tg_n": 0, "tg_sum": 0.0, "tg_min": float("inf"), "tg_max": 0.0,
+            "by_model":      {},  # model → {requests, tokens_gen, tokens_prompt, tokens_cached, pp_*, tg_*}
+            "by_host":       {},  # host  → {requests, tokens_gen, pp_*, tg_*}
         }
+
+    @staticmethod
+    def _new_speed_bucket() -> dict:
+        return {"pp_n": 0, "pp_sum": 0.0, "pp_min": float("inf"), "pp_max": 0.0,
+                "tg_n": 0, "tg_sum": 0.0, "tg_min": float("inf"), "tg_max": 0.0}
+
+    @staticmethod
+    def _upd_speed(d: dict, pp_tps: float | None, tg_tps: float | None) -> None:
+        if pp_tps and pp_tps > 0:
+            d["pp_n"]   = d.get("pp_n", 0) + 1
+            d["pp_sum"] = d.get("pp_sum", 0.0) + pp_tps
+            d["pp_min"] = min(d.get("pp_min", float("inf")), pp_tps)
+            d["pp_max"] = max(d.get("pp_max", 0.0), pp_tps)
+        if tg_tps and tg_tps > 0:
+            d["tg_n"]   = d.get("tg_n", 0) + 1
+            d["tg_sum"] = d.get("tg_sum", 0.0) + tg_tps
+            d["tg_min"] = min(d.get("tg_min", float("inf")), tg_tps)
+            d["tg_max"] = max(d.get("tg_max", 0.0), tg_tps)
 
     def _print_status(self) -> None:
         """Print a single status line showing model, size, quant, native ctx, and usage."""
@@ -2998,7 +3221,12 @@ class CoderCLI:
         if self._meta_ctx:
             parts.append(_fmt_ctx(self._meta_ctx))
         meta = f" [{' '.join(parts)}]" if parts else ""
-        tps_str = f"  │  {self._last_tps:.1f} t/s" if self._last_tps else ""
+        if self._last_tps and self._last_pp_tps:
+            tps_str = f"  │  pp {self._last_pp_tps:.0f}  tg {self._last_tps:.1f}  t/s"
+        elif self._last_tps:
+            tps_str = f"  │  tg {self._last_tps:.1f} t/s"
+        else:
+            tps_str = ""
         print(f"\033[2m {model_str}{meta}  │  ctx {est_tokens} / {self.num_ctx} ({pct}%){tps_str}\033[0m")
         print()
 
@@ -3038,7 +3266,8 @@ class CoderCLI:
         self._role: str = "You are a software developer assistant."  # /role — system persona prepended to every chat request
         self._last_proc_stdout: str = ""   # saved last proc output for /var set
         self._last_output: str = ""        # universal last output (LLM, tool, proc) — $ and -> capture
-        self._last_tps: float | None = None  # generation speed from last _stream_chat call
+        self._last_tps: float | None = None     # TG speed from last _stream_chat call
+        self._last_pp_tps: float | None = None  # PP (prefill) speed from last _stream_chat call
         self._last_input:  str = ""        # last user message or command — ~ expansion
         self._hooks: dict = {}             # /hook — before/after command triggers
         self._mcp: dict = {}
@@ -3114,11 +3343,18 @@ class CoderCLI:
             messages = [{"role": "system", "content": self._role}] + list(messages)
         chunks = []
         self._last_tps = None
+        self._last_pp_tps = None
         _t_start = time.time()
-        _stat_gen    = 0   # tokens generated
-        _stat_prompt = 0   # prompt tokens evaluated
-        _stat_cached = 0   # prompt tokens from KV cache
+        _t_first: float | None = None   # time of first output token (TTFT)
+        _stat_gen    = 0     # tokens generated
+        _stat_prompt = 0     # prompt tokens evaluated
+        _stat_cached = 0     # prompt tokens from KV cache
+        _stat_pp_tps: float | None = None
+        _stat_tg_tps: float | None = None
         def _print(c):
+            nonlocal _t_first
+            if c and _t_first is None:
+                _t_first = time.time()
             sys.stdout.write(c); sys.stdout.flush()
         try:
             if self.provider == "openai":
@@ -3250,8 +3486,12 @@ class CoderCLI:
                             _ec  = data.get("eval_count", 0)
                             _ed  = data.get("eval_duration", 0)
                             _pc  = data.get("prompt_eval_count", 0)
+                            _pd  = data.get("prompt_eval_duration", 0)
                             if _ec and _ed:
-                                self._last_tps = _ec / (_ed / 1e9)
+                                _stat_tg_tps = _ec / (_ed / 1e9)
+                                self._last_tps = _stat_tg_tps
+                            if _pc and _pd:
+                                _stat_pp_tps = _pc / (_pd / 1e9)
                             _stat_gen    = _ec or 0
                             _stat_prompt = _pc or 0
                             # estimated total prompt tokens; cached = total - evaluated
@@ -3275,10 +3515,22 @@ class CoderCLI:
         reply = "".join(chunks)
         if not self.think_in_ctx:
             reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL).strip()
-        if self._last_tps is None and reply:
+        # OpenAI: derive pp/tg from TTFT (Ollama already set these from native timing above)
+        if self.provider == "openai" and _t_first is not None:
+            _ttft = _t_first - _t_start
+            _tg_time = time.time() - _t_first
+            _est_p = sum(len(m.get("content") or "") for m in messages) // 4
+            if _ttft > 0.01 and _est_p > 0:
+                _stat_pp_tps = _est_p / _ttft
+            _gen_est = _stat_gen or (len(reply) // 4 if reply else 0)
+            if _tg_time > 0.01 and _gen_est > 0:
+                _stat_tg_tps = _gen_est / _tg_time
+                self._last_tps = _stat_tg_tps
+        elif self._last_tps is None and reply:
             _elapsed = time.time() - _t_start
             if _elapsed > 0.01:
                 self._last_tps = (len(reply) / 4) / _elapsed
+        self._last_pp_tps = _stat_pp_tps
         if reply is not None and reply != "":
             if _stat_gen == 0 and reply:
                 _stat_gen = len(reply) // 4   # fallback estimate for OpenAI
@@ -3296,6 +3548,9 @@ class CoderCLI:
             bm["tokens_cached"] += _stat_cached
             bh["requests"]      += 1
             bh["tokens_gen"]    += _stat_gen
+            self._upd_speed(self._stats, _stat_pp_tps, _stat_tg_tps)
+            self._upd_speed(bm, _stat_pp_tps, _stat_tg_tps)
+            self._upd_speed(bh, _stat_pp_tps, _stat_tg_tps)
         return reply
 
     # ── REPL ──────────────────────────────────────────────────────────────────
