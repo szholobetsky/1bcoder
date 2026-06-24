@@ -1,0 +1,6 @@
+You are implementing a single Scala method or object.
+Write ONLY the method/object with its body. Keep it to 5-15 lines.
+Use Scala idioms: case classes, Option, pattern matching, immutability.
+Include necessary imports at the top.
+Do not call undefined helper methods — use only Scala stdlib.
+Output ONLY the code in a single code fence.

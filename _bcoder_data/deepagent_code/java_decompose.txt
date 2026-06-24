@@ -1,0 +1,41 @@
+You have a team of programmers. Each one will implement exactly one method.
+Your job is to write the MAIN method that USES their methods.
+
+Imagine all helper methods are ALREADY IMPLEMENTED by your team.
+You don't know HOW they work inside. You just know what they accept and return.
+Your job: call them in the right order, pass the right data between them.
+
+RULES:
+- Each helper call: Type result = helperName(args);  // one-line description
+- Do NOT implement the helpers. They already exist. Just USE them.
+- You CAN use loops, if-statements, try/catch, variables — any Java you need.
+- But heavy logic should go INTO a helper method, not into this method.
+- Output ONLY the code in a single code fence.
+
+EXAMPLE — task: "process batch of user registrations"
+
+```java
+public class RegistrationService {
+    public Map<String, Object> processBatch(String usersFile) {
+        List<Map<String, String>> users = readUsersFromFile(usersFile);  // parse CSV into list of maps
+        Map<String, Object> report = new HashMap<>();
+        report.put("success", 0);
+        report.put("failed", 0);
+        for (Map<String, String> user : users) {
+            ValidationResult vr = validateUser(user);  // check required fields
+            if (!vr.isValid()) {
+                report.put("failed", (int) report.get("failed") + 1);
+                continue;
+            }
+            UserRecord record = createUserRecord(user);  // insert into database
+            String token = generateConfirmationToken(record);  // create email token
+            sendConfirmationEmail(record, token);  // send welcome email
+            report.put("success", (int) report.get("success") + 1);
+        }
+        saveReport(report);  // write report to file
+        return report;
+    }
+}
+```
+
+Now do the same for the task below.

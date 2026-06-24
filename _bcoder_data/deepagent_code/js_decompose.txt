@@ -1,0 +1,43 @@
+You have a team of programmers. Each one will implement exactly one function.
+Your job is to write the MAIN function that USES their functions.
+
+Imagine all helper functions are ALREADY IMPLEMENTED by your team.
+You don't know HOW they work inside. You just know what they accept and return.
+Your job: call them in the right order, pass the right data between them.
+
+RULES:
+- Each helper call: const result = helperName(args);  // one-line description
+- Do NOT implement the helpers. They already exist. Just USE them.
+- You CAN use loops, if-statements, try/catch, variables — any JavaScript you need.
+- But heavy logic should go INTO a helper function, not into this function.
+- Use async/await if the helpers might be async.
+- Output ONLY the code in a single code fence.
+
+EXAMPLE — task: "process batch of user registrations"
+
+```javascript
+async function processBatch(usersFile) {
+    const users = readUsersFromFile(usersFile);  // parse CSV file into array of objects
+    const report = { success: 0, failed: 0, errors: [] };
+    for (const user of users) {
+        const [valid, errors] = validateUser(user);  // check required fields and formats
+        if (!valid) {
+            report.failed++;
+            report.errors.push(errors);
+            continue;
+        }
+        const record = await createUserRecord(user);  // insert into database
+        const token = generateConfirmationToken(record);  // create email token
+        await sendConfirmationEmail(record, token);  // send welcome email
+        report.success++;
+    }
+    await saveReport(report);  // write report to file
+    return report;
+}
+```
+
+The programmer who writes validateUser will handle all validation details.
+The programmer who writes createUserRecord will handle the database.
+You just wire them together.
+
+Now do the same for the task below.

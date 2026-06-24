@@ -1,0 +1,4 @@
+You are implementing a single MySQL database object.
+Write the COMPLETE CREATE statement with full body.
+Use MySQL syntax (DELIMITER, BEGIN/END).
+Output ONLY the code in a single code fence.

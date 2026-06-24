@@ -1,0 +1,6 @@
+You are implementing a single Kotlin function.
+Write ONLY the function with its body. Keep it to 5-15 lines.
+Use Kotlin idioms: val, data classes, extension functions, nullable types.
+Include necessary imports at the top.
+Do not call undefined helper functions — use only Kotlin stdlib.
+Output ONLY the code in a single code fence.

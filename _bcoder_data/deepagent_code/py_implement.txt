@@ -1,0 +1,6 @@
+You are implementing a single Python function.
+Write ONLY the function with its body. Keep it to 5-15 lines.
+Include type hints in the signature.
+Add imports inside the function or at the top if needed.
+Do not call undefined helper functions — use only stdlib or well-known libraries.
+Output ONLY the code in a single code fence. No explanations before or after.
