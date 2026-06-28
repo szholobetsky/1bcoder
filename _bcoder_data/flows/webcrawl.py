@@ -259,6 +259,7 @@ def _crawl(start_url: str, max_depth: int, url_filter: str | None = None, max_pa
     domain = _urlparse(start_url).netloc
     queue = _deque([(start_url, 0)])
     visited: set[str] = set()
+    seen: set[str] = {start_url}   # prevents duplicate queue entries
     yielded = 0
 
     while queue:
@@ -288,7 +289,8 @@ def _crawl(start_url: str, max_depth: int, url_filter: str | None = None, max_pa
 
         if depth < max_depth:
             for link in _extract_links(tree, url, domain):
-                if link not in visited:
+                if link not in seen:
+                    seen.add(link)
                     queue.append((link, depth + 1))
 
 
@@ -504,13 +506,12 @@ def run(chat, args: str):
     ask_summary = ask
     task      = task_m.group(1) if task_m else ""
 
-    # --filter llm/smart → LLM filter; anything else → URL prefix filter
+    # --filter llm/smart → LLM filter; url-prefix → resolved after start_url; else → literal prefix
     filter_val = filter_m.group(1) if filter_m else None
     llm_filter = filter_val in ("llm", "smart") if filter_val else False
-    url_filter = None if llm_filter else filter_val
+    use_start_as_prefix = filter_val == "url-prefix"
+    url_filter = None if (llm_filter or use_start_as_prefix) else filter_val
 
-    if url_filter:
-        print(f"[webcrawl] filter: only pages under {_normalize_filter(url_filter)}")
     if llm_filter and mode != "llm":
         if not task:
             print("[webcrawl] --filter llm requires --task \"...\""); return
@@ -528,6 +529,11 @@ def run(chat, args: str):
             "  /flow webcrawl <url> --mode llm --task \"your goal\" [--format log|structured] [--out result.csv]"
         )
         return
+
+    if use_start_as_prefix:
+        url_filter = start_url.rstrip("/")
+    if url_filter:
+        print(f"[webcrawl] filter: only pages under {_normalize_filter(url_filter)}")
 
     try:
         from lxml import etree  # noqa: F401

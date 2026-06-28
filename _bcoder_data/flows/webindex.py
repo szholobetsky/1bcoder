@@ -118,6 +118,7 @@ def run(chat, args: str):
             return []
 
     visited = set()
+    seen = {url}   # prevents duplicate queue entries
     queue = [(url, 0)]
     saved = 0
 
@@ -146,7 +147,8 @@ def run(chat, args: str):
 
         if cur_depth < depth:
             for link in _get_links(page_bytes, cur_url, url):
-                if link not in visited:
+                if link not in seen:
+                    seen.add(link)
                     queue.append((link, cur_depth + 1))
 
     print(f"\n[webindex] crawled {saved} pages -> {out_dir}")
@@ -168,6 +170,14 @@ def run(chat, args: str):
         )
         if result.returncode == 0:
             print(f"[webindex] index OK — project '{project}' ready")
+            # register in ~/.1bcoder/rag_projects.txt so /rag list and @r picker find it
+            try:
+                from rag import _save_project as _rag_save
+                _rag_save(project, _os.path.abspath(path), comment="webindex")
+                print(f"[webindex] registered '{project}' in RAG registry")
+            except Exception:
+                _rag_file = _os.path.join(_os.path.expanduser("~"), ".1bcoder", "rag_projects.txt")
+                print(f"[webindex] add manually: echo '{project}: {_os.path.abspath(path)}' >> {_rag_file}")
             print(f"[webindex] use: /flow deepagent_md <task> --rag {project} --rag-store {path}")
             print(f"[webindex]  or: /flow deepagent_md <task> --rag {project}  (if cwd={path})")
             print(f"[webindex] CLI: cd {path} && simargl retrieve \"query\" --mode file --project {project} --source .simargl_web\\{project}")
@@ -179,3 +189,7 @@ def run(chat, args: str):
         print(f"[webindex] then use: /flow deepagent_md <task> --rag {project} --rag-store {path}")
     except Exception as e:
         print(f"[webindex] index failed: {e}")
+
+    summary = f"Indexed {saved} pages from {url} into project '{project}' at {out_dir}"
+    chat.last_reply   = summary
+    chat._last_output = summary
