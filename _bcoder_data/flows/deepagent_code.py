@@ -13,6 +13,8 @@ Usage:
   /flow deepagent_code "CSV tool" --lang py --depth 2 --think --test
   /flow deepagent_code --file task.txt --lang py --depth 2 --think
   /flow deepagent_code "short desc" --file requirements.txt --lang py --depth 2
+  /flow deepagent_code "Syryn BT beacon" --lang py --depth 2 --think --ask --web 1
+  /flow deepagent_code "My app" --lang py --depth 2 --ask --rag my_project
   /flow deepagent_code join code1              ← join existing dir
   /flow deepagent_code join code1 --lang py
 
@@ -27,6 +29,9 @@ Flags:
   --syntax          check syntax after generation, retry on error (max 2)
   --distinct        skip functions with names already generated in other branches
   --ctx N           conversation context messages (default 0)
+  --ask             enrich each leaf with API call examples before generation
+  --web N           fetch top N DDG results for external calls (default 1, requires --ask)
+  --rag project     simargl RAG project name for internal calls (requires --ask)
 """
 import os as _os
 import re as _re
@@ -355,6 +360,21 @@ def _generate_local(chat, system_prompt: str, user_prompt: str) -> str:
     return result or ""
 
 
+def _serialize_ctx(messages: list, n: int) -> str:
+    """Serialize last N user/assistant messages as a readable block for injection."""
+    if not messages or n == 0:
+        return ""
+    recent = [m for m in messages if m.get("role") in ("user", "assistant")][-n:]
+    if not recent:
+        return ""
+    lines = ["[Conversation context — use these details in your implementation]"]
+    for m in recent:
+        role = "User" if m["role"] == "user" else "Assistant"
+        text = m.get("content", "")[:800]
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines) + "\n"
+
+
 def _generate_worker(host: str, model: str, system_prompt: str,
                      user_prompt: str, num_ctx: int, params: dict) -> str:
     import requests as _r
@@ -394,7 +414,8 @@ def _build_decompose_prompt(name: str, signature: str, description: str,
 
 
 def _build_implement_prompt(name: str, signature: str, description: str,
-                            root_task: str, parent_skeleton: str) -> str:
+                            root_task: str, parent_skeleton: str,
+                            use_ask: bool = False) -> str:
     parts = [f"Implement this function.\n"]
     if signature:
         parts.append(f"Function: {signature}")
@@ -404,7 +425,114 @@ def _build_implement_prompt(name: str, signature: str, description: str,
     parts.append(f"Part of: {root_task}")
     if parent_skeleton:
         parts.append(f"\nCalling context (parent skeleton):\n{parent_skeleton}")
+    if use_ask:
+        parts.append(
+            "\nBefore writing code, list the specific API calls, raises, and "
+            "annotations you will use.\nFormat exactly:\n## Calls\n"
+            "ClassName.method(), module.function(), raise ExceptionName\n"
+            "One comma-separated line. Then write the function."
+        )
     return "\n".join(parts)
+
+
+# ── ask: call extraction + context enrichment ────────────────────────────────
+
+def _parse_calls(text: str) -> list:
+    """Extract comma-separated call list from ## Calls section."""
+    for i, line in enumerate(text.splitlines()):
+        if line.strip().startswith("## Calls"):
+            for next_line in text.splitlines()[i + 1:]:
+                next_line = next_line.strip()
+                if next_line:
+                    return [c.strip() for c in next_line.split(",") if c.strip()]
+    return []
+
+
+def _call_root_name(call: str) -> str:
+    """Extract root identifier: 'psutil.net_if_addrs()' → 'psutil', 'raise Foo' → 'Foo'."""
+    call = call.strip().lstrip("@")
+    if call.lower().startswith("raise "):
+        call = call[6:].strip()
+    return _re.split(r'[\s.(]', call)[0]
+
+
+def _is_internal(name: str, project_dir: str) -> bool:
+    """True if a file with this exact stem exists anywhere in project_dir."""
+    from pathlib import Path as _P
+    try:
+        for f in _P(project_dir).rglob("*"):
+            if f.is_file() and f.stem == name:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _enrich_ctx(calls: list, web_n: int, rag_project: str,
+                node_name: str, desc: str, code_dir: str,
+                node_prefix: str, chat) -> str:
+    """Fetch web/RAG examples for calls, compact, save ctx.md. Returns compacted text."""
+    if not calls:
+        return ""
+
+    project_dir = _os.getcwd()
+    internal, external = [], []
+    for call in calls:
+        root = _call_root_name(call)
+        if root and _is_internal(root, project_dir):
+            internal.append(root)
+        elif root:
+            external.append(root)
+
+    try:
+        from .deepagent_md import _web_research, _rag_research
+    except ImportError:
+        try:
+            from deepagent_md import _web_research, _rag_research
+        except ImportError:
+            print("  [ask] deepagent_md not importable, skipping enrichment")
+            return ""
+
+    parts = []
+
+    if external and web_n > 0:
+        query_title = ", ".join(external) + " code example"
+        print(f"  [ask/web] query: {query_title}")
+        try:
+            web_text = _web_research(chat, title=query_title,
+                                     root_task=f"{node_name}: {desc}",
+                                     web_n=web_n)
+            if web_text:
+                parts.append(web_text[:web_n * 1200])
+        except Exception as e:
+            print(f"  [ask/web] error: {e}")
+
+    if internal and rag_project:
+        rag_query = " ".join(internal)
+        print(f"  [ask/rag] query: {rag_query} project: {rag_project}")
+        try:
+            rag_text = _rag_research(rag_query, rag_project,
+                                     store_dir=project_dir, chat=chat)
+            if rag_text:
+                parts.append(rag_text[:2400])
+        except Exception as e:
+            print(f"  [ask/rag] error: {e}")
+
+    if not parts:
+        return ""
+
+    combined = "\n\n".join(parts)
+    compact_system = (
+        "Summarize these code examples into a concise reference under 500 tokens. "
+        "Keep only concrete API usage patterns and signatures, no prose explanations."
+    )
+    compacted = _generate_local(chat, compact_system, combined) or combined[:2000]
+
+    ctx_path = _os.path.join(code_dir, f"{node_prefix}-{node_name}-ctx.md")
+    with open(ctx_path, "w", encoding="utf-8") as f:
+        f.write(f"# ctx: {node_name}\n\n{compacted}")
+    print(f"  [ask] ctx -> {_os.path.basename(ctx_path)} ({len(compacted)} chars)")
+    return compacted
 
 
 _TEST_SYSTEM = (
@@ -467,7 +595,9 @@ _SYNTAX_MAX_RETRIES = 2
 def _expand(chat, root_task: str, code_dir: str, max_depth: int,
             lang_cfg: dict, lang: str, workers: list, stats: dict,
             use_think: bool = False, use_test: bool = False,
-            use_syntax: bool = False, use_distinct: bool = False):
+            use_syntax: bool = False, use_distinct: bool = False,
+            use_ask: bool = False, web_n: int = 1, rag_project: str = None,
+            chat_ctx: str = ""):
     ext = lang_cfg["ext"]
     decompose_prompt = _load_lang_prompt(lang, "decompose")
     implement_prompt = _load_lang_prompt(lang, "implement")
@@ -499,6 +629,8 @@ def _expand(chat, root_task: str, code_dir: str, max_depth: int,
                     print(f"  [think] -> {_os.path.basename(root_md)} ({len(think_text)} chars)")
 
         user_prompt = _build_root_prompt(root_task)
+        if chat_ctx:
+            user_prompt += f"\n\n{chat_ctx}"
         if use_think and think_text:
             user_prompt += f"\n\nYour implementation plan:\n{think_text}"
 
@@ -578,6 +710,24 @@ def _expand(chat, root_task: str, code_dir: str, max_depth: int,
                             f.write(f"# {name}\n\n{think_text}")
                         print(f"    [think] -> {_os.path.basename(md_path)} ({len(think_text)} chars)")
 
+            # ── ask: pre-flight call extraction + enrichment ─────────
+            ctx_text = ""
+            if use_ask and is_leaf:
+                ask_prompt = _build_implement_prompt(name, sig_expr, desc,
+                                                     root_task, parent_code,
+                                                     use_ask=True)
+                if think_text:
+                    ask_prompt += f"\n\nYour implementation plan:\n{think_text}"
+                print(f"    [ask] extracting calls for {name}...")
+                ask_raw = _generate_local(chat, implement_prompt, ask_prompt) or ""
+                calls = _parse_calls(ask_raw)
+                if calls:
+                    print(f"    [ask] calls: {', '.join(calls)}")
+                    node_prefix = _node_id_to_prefix(nid)
+                    ctx_text = _enrich_ctx(calls, web_n, rag_project,
+                                           name, desc, code_dir,
+                                           node_prefix, chat)
+
             # ── code step ─────────────────────────────────────────────
             sys_prompt = implement_prompt if is_leaf else decompose_prompt
             if is_leaf:
@@ -586,8 +736,12 @@ def _expand(chat, root_task: str, code_dir: str, max_depth: int,
             else:
                 user_prompt = _build_decompose_prompt(name, sig_expr, desc,
                                                       root_task, parent_code)
+            if chat_ctx:
+                user_prompt += f"\n\n{chat_ctx}"
             if think_text:
                 user_prompt += f"\n\nYour implementation plan:\n{think_text}"
+            if ctx_text:
+                user_prompt += f"\n\nRelevant API examples:\n{ctx_text}"
 
             def _call_llm(s_prompt, u_prompt):
                 idx_ = [n[0] for n in level_nodes].index(nid)
@@ -1023,6 +1177,21 @@ def run(chat, args: str):
     use_distinct = "--distinct" in args
     args = args.replace("--distinct", "").strip()
 
+    use_ask = "--ask" in args
+    args = args.replace("--ask", "").strip()
+
+    web_n = 1
+    m = _re.search(r'--web\s+(\d+)', args)
+    if m:
+        web_n = int(m.group(1))
+        args = (args[:m.start()] + args[m.end():]).strip()
+
+    rag_project = None
+    m = _re.search(r'--rag\s+(\S+)', args)
+    if m:
+        rag_project = m.group(1)
+        args = (args[:m.start()] + args[m.end():]).strip()
+
     profile_name = None
     m = _re.search(r'--profile\s+(\S+)', args)
     if m:
@@ -1082,11 +1251,17 @@ def run(chat, args: str):
     print(f"[deepagent_code] task  : {root_task}")
     print(f"[deepagent_code] lang  : {lang}  depth: {max_depth}  dir: {_os.path.relpath(code_dir)}")
 
+    chat_ctx = _serialize_ctx(getattr(chat, "messages", []), ctx_n)
+    if chat_ctx:
+        print(f"[deepagent_code] chat ctx     : {ctx_n} msgs ({len(chat_ctx)} chars)")
+
     stats = {"files": 0, "tests": 0}
     try:
         tree = _expand(chat, root_task, code_dir, max_depth, lang_cfg, lang, workers, stats,
                         use_think=use_think, use_test=use_test,
-                        use_syntax=use_syntax, use_distinct=use_distinct)
+                        use_syntax=use_syntax, use_distinct=use_distinct,
+                        use_ask=use_ask, web_n=web_n, rag_project=rag_project,
+                        chat_ctx=chat_ctx)
     except _StopGeneration:
         tree = {}
         for fname in _os.listdir(code_dir):
