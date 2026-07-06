@@ -13,6 +13,7 @@ import sys
 import io
 import json
 import time
+import random
 import argparse
 import threading
 import subprocess
@@ -186,6 +187,127 @@ def _fts_rank(terms: list, file_contents: dict, top_k: int = 10) -> list:
     ).fetchall()
     db.close()
     return rows
+
+
+def _rs_select_messages(mid_candidates: list, limit_tokens: int) -> list:
+    """Pick whole messages within a token budget via uniform random sampling.
+
+    Note: true single-pass reservoir-sampling semantics aren't needed here since
+    mid_candidates is already fully memory-resident — this is budget-constrained
+    uniform sampling, functionally equivalent for the "cheap, honest" mid:rs mode.
+    """
+    order = list(range(len(mid_candidates)))
+    random.shuffle(order)
+    picked = []
+    used = 0
+    for idx in order:
+        toks = len(mid_candidates[idx].get("content") or "") // 4
+        if used + toks > limit_tokens and picked:
+            continue
+        picked.append(idx)
+        used += toks
+        if used >= limit_tokens:
+            break
+    picked.sort()
+    return [mid_candidates[i] for i in picked]
+
+
+def _bm25_select_messages(mid_candidates: list, query_terms: list, limit_tokens: int) -> list:
+    """Pick whole messages within a token budget via BM25 relevance to query_terms."""
+    if not mid_candidates or not query_terms:
+        return []
+    contents = {str(i): (m.get("content") or "") for i, m in enumerate(mid_candidates)}
+    ranked = _fts_rank(query_terms, contents, top_k=len(mid_candidates))
+    picked = []
+    used = 0
+    for key, _score in ranked:
+        idx = int(key)
+        toks = len(mid_candidates[idx].get("content") or "") // 4
+        if used + toks > limit_tokens and picked:
+            continue
+        picked.append(idx)
+        used += toks
+        if used >= limit_tokens:
+            break
+    picked.sort()
+    return [mid_candidates[i] for i in picked]
+
+
+def _dp_select_messages(mid_candidates: list, query_terms: list, limit_tokens: int) -> list:
+    """Pick whole messages via 0/1 knapsack: weight=tokens, value=BM25 relevance."""
+    if not mid_candidates or limit_tokens <= 0:
+        return []
+    weights = [max(1, len(m.get("content") or "") // 4) for m in mid_candidates]
+    values = [0.0] * len(mid_candidates)
+    if query_terms:
+        contents = {str(i): (m.get("content") or "") for i, m in enumerate(mid_candidates)}
+        ranked = _fts_rank(query_terms, contents, top_k=len(mid_candidates))
+        for key, score in ranked:
+            values[int(key)] = -float(score)
+    n = len(mid_candidates)
+    cap = int(limit_tokens)
+    dp = [[0.0] * (cap + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        w, v = weights[i - 1], values[i - 1]
+        for c in range(cap + 1):
+            dp[i][c] = dp[i - 1][c]
+            if w <= c and dp[i - 1][c - w] + v > dp[i][c]:
+                dp[i][c] = dp[i - 1][c - w] + v
+    picked = []
+    c = cap
+    for i in range(n, 0, -1):
+        if dp[i][c] != dp[i - 1][c]:
+            picked.append(i - 1)
+            c -= weights[i - 1]
+    picked.sort()
+    return [mid_candidates[i] for i in picked]
+
+
+def _tr_select_messages(mid_candidates: list, limit_tokens: int) -> list:
+    """Pick whole messages via TextRank/LexRank graph centrality (no query, no LLM)."""
+    n = len(mid_candidates)
+    if n == 0:
+        return []
+    if n == 1:
+        return list(mid_candidates)
+    word_sets = [set((m.get("content") or "").lower().split()) for m in mid_candidates]
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = word_sets[i], word_sets[j]
+            if not a or not b:
+                continue
+            inter = len(a & b)
+            if inter == 0:
+                continue
+            score = inter / len(a | b)
+            sim[i][j] = score
+            sim[j][i] = score
+    scores = [1.0 / n] * n
+    damping = 0.85
+    for _ in range(30):
+        new_scores = [(1 - damping) / n] * n
+        for i in range(n):
+            row_sum = sum(sim[i])
+            if row_sum == 0:
+                continue
+            for j in range(n):
+                if sim[i][j] > 0:
+                    new_scores[j] += damping * scores[i] * sim[i][j] / row_sum
+        scores = new_scores
+    order = sorted(range(n), key=lambda i: scores[i], reverse=True)
+    picked = []
+    used = 0
+    for idx in order:
+        toks = len(mid_candidates[idx].get("content") or "") // 4
+        if used + toks > limit_tokens and picked:
+            continue
+        picked.append(idx)
+        used += toks
+        if used >= limit_tokens:
+            break
+    picked.sort()
+    return [mid_candidates[i] for i in picked]
 
 
 class _Tee:
@@ -3258,6 +3380,7 @@ class CoderCLI:
         self._savepoint  = None    # index into self.messages set by /ctx savepoint
         self._ctx_autosave_path: str | None = None   # set by /ctx load|save; auto on first message
         self._ctx_autosave_enabled: bool = False
+        self._ctx_window: dict = {"enabled": False, "first": 0, "last": 0, "mid_algo": None, "mid_limit": 0}
         self._switch_saved: dict | None = None  # saved by /switch for /switch restore
         self._aliases    = self._load_aliases()  # global + local aliases.txt
         self._script_file = None
@@ -3890,7 +4013,7 @@ class CoderCLI:
                     print(f"  [{_tr_lang}→en] [translation failed — sending original]")
             self.messages.append({"role": "user", "content": msg_content})
             self._sep("AI")
-            reply = self._stream_chat(self.messages)
+            reply = self._stream_chat(self._ctx_window_projection(self.messages))
             if reply:
                 self.last_reply = reply
                 self._last_output = reply
@@ -4068,7 +4191,7 @@ advanced_tools =
         parts = user_input.split()
         if len(parts) < 2:
             est = sum(len(m["content"]) for m in self.messages) // 4
-            print(f"[ctx limit: {self.num_ctx}  current: ~{est:,}]  usage: /ctx <n> | clear [N] | cut | compact | save <f> | load <f> | savepoint [set|rollback|compact|show]")
+            print(f"[ctx limit: {self.num_ctx}  current: ~{est:,}]  usage: /ctx <n> | clear [N] | cut | compact | save <f> | load <f> | savepoint [set|rollback|compact|show] | window [off|first:M last:N mid:rs|bm25|dp|tr limit:K]")
             return
         if parts[1] == "cut":
             est = sum(len(m["content"]) for m in self.messages) // 4
@@ -4349,11 +4472,118 @@ advanced_tools =
                 path_note = self._ctx_autosave_path or "(none)"
                 print(f"[ctx autosave] {state}  file: {path_note}")
             return
+        if parts[1] == "window":
+            self._cmd_ctx_window(parts[2:])
+            return
         try:
             self.num_ctx = int(parts[1])
             print(f"[ctx set to {self.num_ctx} tokens]")
         except ValueError:
-            print("usage: /ctx <number> | cut | compact [N] | save <f> | load <f> | compose ...")
+            print("usage: /ctx <number> | cut | compact [N] | save <f> | load <f> | compose | window ...")
+
+    def _cmd_ctx_window(self, args: list) -> None:
+        """/ctx window [off | first:M last:N [mid:rs|bm25|dp|tr limit:K]]
+
+        Non-destructive sliding-window projection of self.messages, applied fresh
+        at each LLM call site (see _ctx_window_projection) instead of permanently
+        cutting history like /ctx cut does.
+        """
+        w = self._ctx_window
+        if not args:
+            if not w["enabled"]:
+                print("[ctx window] off")
+            else:
+                mid_note = f"  mid:{w['mid_algo']} limit:{w['mid_limit']}" if w["mid_algo"] else ""
+                print(f"[ctx window] on  first:{w['first']} last:{w['last']}{mid_note}")
+            return
+        if args[0] == "off":
+            w["enabled"] = False
+            _ok("[ctx window] disabled")
+            return
+        parsed: dict = {}
+        for tok in args:
+            if ":" not in tok:
+                print(f"usage: /ctx window off | first:M last:N [mid:rs|bm25|dp|tr limit:K]  (bad token: {tok})")
+                return
+            key, _, val = tok.partition(":")
+            parsed[key] = val
+        if "last" not in parsed:
+            print("usage: /ctx window off | first:M last:N [mid:rs|bm25|dp|tr limit:K]  (last:N is required)")
+            return
+        try:
+            first = int(parsed.get("first", 0))
+            last = int(parsed["last"])
+        except ValueError:
+            print("[ctx window] first/last must be integers (token counts)")
+            return
+        mid_algo = parsed.get("mid")
+        mid_limit = 0
+        if mid_algo is not None:
+            if mid_algo not in ("rs", "bm25", "dp", "tr"):
+                print("[ctx window] mid must be one of: rs, bm25, dp, tr")
+                return
+            if "limit" not in parsed:
+                print("[ctx window] limit:K is required when mid:<algo> is set")
+                return
+            try:
+                mid_limit = int(parsed["limit"])
+            except ValueError:
+                print("[ctx window] limit must be an integer (token count)")
+                return
+        w["enabled"] = True
+        w["first"] = first
+        w["last"] = last
+        w["mid_algo"] = mid_algo
+        w["mid_limit"] = mid_limit
+        projected = self._ctx_window_projection(self.messages)
+        est = sum(len(m.get("content") or "") for m in projected) // 4
+        mid_note = f"  mid:{mid_algo} limit:{mid_limit}" if mid_algo else ""
+        _ok(f"[ctx window] enabled  first:{first} last:{last}{mid_note}  → ~{est:,} tokens next call ({len(projected)}/{len(self.messages)} messages)")
+
+    def _ctx_window_projection(self, messages: list) -> list:
+        """Non-destructive windowed projection of messages for the current /ctx window
+        settings: fixed head (first) + sliding tail (last) + optional mid-selection.
+        Returns messages unchanged when window is off or too short to matter."""
+        w = self._ctx_window
+        if not w["enabled"] or len(messages) <= 1:
+            return messages
+        first_budget = w["first"]
+        last_budget = w["last"]
+        last_idx_start = len(messages) - 1
+        used = len(messages[-1].get("content") or "") // 4
+        for i in range(len(messages) - 2, -1, -1):
+            toks = len(messages[i].get("content") or "") // 4
+            if used + toks > last_budget:
+                break
+            used += toks
+            last_idx_start = i
+        first_idx_end = 0
+        if first_budget > 0:
+            used = 0
+            for i in range(len(messages)):
+                toks = len(messages[i].get("content") or "") // 4
+                if used + toks > first_budget:
+                    break
+                used += toks
+                first_idx_end = i + 1
+        if first_idx_end >= last_idx_start:
+            return messages
+        mid_candidates = messages[first_idx_end:last_idx_start]
+        mid_selected = []
+        if w["mid_algo"] and mid_candidates:
+            algo = w["mid_algo"]
+            limit_tokens = w["mid_limit"]
+            if algo == "rs":
+                mid_selected = _rs_select_messages(mid_candidates, limit_tokens)
+            else:
+                query_terms = (messages[-1].get("content") or "").lower().split()
+                if algo == "bm25":
+                    mid_selected = _bm25_select_messages(mid_candidates, query_terms, limit_tokens)
+                elif algo == "dp":
+                    mid_selected = _dp_select_messages(mid_candidates, query_terms, limit_tokens)
+                elif algo == "tr":
+                    mid_selected = _tr_select_messages(mid_candidates, limit_tokens)
+        return messages[:first_idx_end] + mid_selected + messages[last_idx_start:]
 
     def _resolve_ctx_path(self, fname: str) -> str:
         """Resolve ctx file path: full path → as-is; bare name → ctx/ then projects/<key>/;
@@ -5325,7 +5555,7 @@ advanced_tools =
             self.messages.append(msg)
             if has_prompt:
                 self._sep("AI")
-                reply = self._stream_chat(self.messages)
+                reply = self._stream_chat(self._ctx_window_projection(self.messages))
                 print()
                 if reply:
                     self.last_reply = reply
@@ -7664,7 +7894,7 @@ Config stored in ~/.1bcoder/translate.json
                 self._save_prompt(prompt_name, text)
         self.messages.append({"role": "user", "content": text})
         self._sep("AI")
-        reply = self._stream_chat(self.messages)
+        reply = self._stream_chat(self._ctx_window_projection(self.messages))
         if reply:
             self.last_reply = reply
             self._last_output = reply
