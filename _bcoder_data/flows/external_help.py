@@ -11,32 +11,32 @@ web browser usage. The cloud provider never sees your real business terms.
 
 ── Usage ──────────────────────────────────────────────────────────────────────
 
-  /flow external_help --glossary <name>
+  /flow external_help --dict <name>
       Obfuscate $ (last LLM output) and print step-by-step instructions.
 
-  /flow external_help --var <varname> --glossary <name>
+  /flow external_help --var <varname> --dict <name>
       Obfuscate a named session variable.
 
-  /flow external_help --glossary <name> --profile <name>
+  /flow external_help --dict <name> --profile <name>
       Use a specific local model profile for obfuscation.
       Recommended for best quality: qwen3:4b, nemotron-mini, phi4-mini.
 
-  /flow external_help --glossary <name> --cloud-profile <name>
+  /flow external_help --dict <name> --cloud-profile <name>
       Full automatic pipeline: obfuscate → send to cloud LLM → deobfuscate.
       Use when you have a cloud LLM configured as a 1bcoder profile.
 
-  /flow external_help --glossary <name> --force
+  /flow external_help --dict <name> --force
       Use direct string substitution for obfuscation instead of LLM.
       Guarantees every occurrence is replaced, including camelCase identifiers.
       Combine with --cloud-profile for fully automatic pipeline with force obfuscation.
 
-  /flow external_help --glossary <name> --decode --var cloud_answer
+  /flow external_help --dict <name> --decode --var cloud_answer
       Deobfuscate a cloud response (shortcut for /flow deobfuscate).
 
 ── Full example session (automatic — cloud profile configured) ────────────────
 
   > describe the linear optimisation problem -> task_text
-  > /flow external_help --var task_text --glossary tanker \
+  > /flow external_help --var task_text --dict tanker \
         --profile local_nemotron --cloud-profile claude_api
 
   [obfuscates locally → sends to cloud → deobfuscates locally]
@@ -45,7 +45,7 @@ web browser usage. The cloud provider never sees your real business terms.
 ── Full example session (manual — no cloud profile) ──────────────────────────
 
   > describe the linear optimisation problem -> task_text
-  > /flow external_help --var task_text --glossary tanker --profile local_nemotron
+  > /flow external_help --var task_text --dict tanker --profile local_nemotron
 
   ── OBFUSCATED ────────────────────────────────
   Optimize vessel routing for liquid cargo delivery to loading terminals...
@@ -58,18 +58,18 @@ web browser usage. The cloud provider never sees your real business terms.
   4. Come back here and paste the answer as a plain message:
        > <paste cloud response here> -> cloud_answer
   5. Then decode it:
-       > /flow deobfuscate --var cloud_answer --glossary tanker
+       > /flow deobfuscate --var cloud_answer --dict tanker
 
-── Glossary management ────────────────────────────────────────────────────────
+── Dictionary management ───────────────────────────────────────────────────────
 
-  Create a new glossary template:
-    /flow obfuscate --glossary-new <name>
+  Create a new dictionary template:
+    /flow obfuscate --dict-new <name>
 
-  Glossary location:
-    .1bcoder/glossaries/<name>.yaml     ← project-local
-    ~/.1bcoder/glossaries/<name>.yaml   ← global (shared across projects)
+  Dictionary location:
+    .1bcoder/dictionaries/<name>.yaml     ← project-local
+    ~/.1bcoder/dictionaries/<name>.yaml   ← global (shared across projects)
 
-  Glossary format:
+  Dictionary format:
     tanker:    vessel
     oil:       liquid cargo
     port:      loading terminal
@@ -85,7 +85,7 @@ web browser usage. The cloud provider never sees your real business terms.
 
 ── Notes ──────────────────────────────────────────────────────────────────────
 
-  - Small models (< 3B) may fail to follow glossary instructions correctly.
+  - Small models (< 3B) may fail to follow dictionary instructions correctly.
     Use --profile to specify a 4B+ model for better results.
   - Use /flow obfuscate and /flow deobfuscate for a more granular workflow
     where you control each step separately.
@@ -98,20 +98,20 @@ import os as _os
 
 # ── helpers (same as obfuscate/deobfuscate) ────────────────────────────────────
 
-def _find_glossary(name: str) -> str | None:
+def _find_dict(name: str) -> str | None:
     if _os.sep in name or "/" in name:
         return name if _os.path.exists(name) else None
     for p in [
-        _os.path.join(".1bcoder", "glossaries", f"{name}.yaml"),
-        _os.path.join(_os.path.expanduser("~"), ".1bcoder", "glossaries", f"{name}.yaml"),
+        _os.path.join(".1bcoder", "dictionaries", f"{name}.yaml"),
+        _os.path.join(_os.path.expanduser("~"), ".1bcoder", "dictionaries", f"{name}.yaml"),
     ]:
         if _os.path.exists(p):
             return p
     return None
 
 
-def _load_glossary(name: str) -> dict[str, str]:
-    path = _find_glossary(name)
+def _load_dict(name: str) -> dict[str, str]:
+    path = _find_dict(name)
     if not path:
         return {}
     try:
@@ -190,9 +190,9 @@ def _run_llm(chat, system_prompt: str, user_prompt: str,
 
 # ── entry point ────────────────────────────────────────────────────────────────
 
-def _force_replace(text: str, glossary: dict[str, str]) -> str:
+def _force_replace(text: str, term_map: dict[str, str]) -> str:
     """Case-preserving direct substitution — no LLM, no context awareness."""
-    for real, neutral in glossary.items():
+    for real, neutral in term_map.items():
         if not real or not neutral:
             continue
         def _make_rep(n: str):
@@ -207,29 +207,29 @@ def _force_replace(text: str, glossary: dict[str, str]) -> str:
 
 
 def run(chat, args: str):
-    var_m         = _re.search(r'--var\s+(\w+)', args)
-    glossary_m    = _re.search(r'--glossary\s+(\S+)', args)
-    profile_m     = _re.search(r'--profile\s+(\S+)', args)
-    cloud_m       = _re.search(r'--cloud-profile\s+(\S+)', args)
-    decode        = "--decode" in args
-    force         = "--force" in args
+    var_m     = _re.search(r'--var\s+(\w+)', args)
+    dict_m    = _re.search(r'--dict\s+(\S+)', args)
+    profile_m = _re.search(r'--profile\s+(\S+)', args)
+    cloud_m   = _re.search(r'--cloud-profile\s+(\S+)', args)
+    decode    = "--decode" in args
+    force     = "--force" in args
 
-    if not glossary_m:
+    if not dict_m:
         print(__doc__)
         return
 
-    gname         = glossary_m.group(1)
-    glossary      = _load_glossary(gname)
+    dname         = dict_m.group(1)
+    term_map      = _load_dict(dname)
     local_profile = profile_m.group(1) if profile_m else None
     cloud_profile = cloud_m.group(1) if cloud_m else None
 
-    if not glossary:
-        gpath = _find_glossary(gname)
-        if not gpath:
-            print(f"[external_help] glossary '{gname}' not found.")
-            print(f"  Create it: /flow obfuscate --glossary-new {gname}")
+    if not term_map:
+        dpath = _find_dict(dname)
+        if not dpath:
+            print(f"[external_help] dictionary '{dname}' not found.")
+            print(f"  Create it: /flow obfuscate --dict-new {dname}")
         else:
-            print(f"[external_help] glossary '{gname}' is empty: {gpath}")
+            print(f"[external_help] dictionary '{dname}' is empty: {dpath}")
         return
 
     # ── get text ──
@@ -248,18 +248,18 @@ def run(chat, args: str):
     # ── decode mode (shortcut for deobfuscate) ──
     profile = local_profile  # used in decode/obfuscate single-step calls
     if decode:
-        pairs = "\n".join(f"  {v} → {k}" for k, v in glossary.items())
+        pairs = "\n".join(f"  {v} → {k}" for k, v in term_map.items())
         prompt = (
             "Restore the following text by replacing neutral terms back to their "
-            "original business terminology according to the glossary. "
+            "original business terminology according to the dictionary. "
             "Handle plurals and grammar naturally. Output only the restored text.\n\n"
-            f"Glossary (obfuscated → original):\n{pairs}\n\nText:\n{text}"
+            f"Dictionary (obfuscated → original):\n{pairs}\n\nText:\n{text}"
         )
-        print(f"[external_help] decoding with glossary '{gname}' ({len(glossary)} terms)")
+        print(f"[external_help] decoding with dictionary '{dname}' ({len(term_map)} terms)")
         chat._sep("DECODED")
         reply = _run_llm(
             chat,
-            "You are a precise text rewriter. Follow glossary instructions exactly.",
+            "You are a precise text rewriter. Follow dictionary instructions exactly.",
             prompt, profile
         )
         if reply:
@@ -270,23 +270,23 @@ def run(chat, args: str):
 
     # ── step 1: obfuscate (force = direct replacement, otherwise local LLM) ──
     if force:
-        print(f"[external_help] step 1/3 — obfuscating ({len(glossary)} terms, FORCE/direct)")
+        print(f"[external_help] step 1/3 — obfuscating ({len(term_map)} terms, FORCE/direct)")
         chat._sep("OBFUSCATED")
-        obf_text = _force_replace(text, glossary)
+        obf_text = _force_replace(text, term_map)
         print(obf_text)
     else:
-        pairs = "\n".join(f"  {k} → {v}" for k, v in glossary.items())
+        pairs = "\n".join(f"  {k} → {v}" for k, v in term_map.items())
         obf_prompt = (
             "Rewrite the following text by replacing specific terms with neutral equivalents "
-            "according to the glossary. Keep all technical meaning intact. Handle plurals and "
+            "according to the dictionary. Keep all technical meaning intact. Handle plurals and "
             "grammar naturally. Do not add explanations. Output only the rewritten text.\n\n"
-            f"Glossary:\n{pairs}\n\nText:\n{text}"
+            f"Dictionary:\n{pairs}\n\nText:\n{text}"
         )
-        print(f"[external_help] step 1/3 — obfuscating ({len(glossary)} terms, local model)")
+        print(f"[external_help] step 1/3 — obfuscating ({len(term_map)} terms, local model)")
         chat._sep("OBFUSCATED")
         obf_text = _run_llm(
             chat,
-            "You are a precise text rewriter. Follow glossary instructions exactly.",
+            "You are a precise text rewriter. Follow dictionary instructions exactly.",
             obf_prompt, local_profile
         )
 
@@ -312,19 +312,19 @@ def run(chat, args: str):
                 return
 
             # ── step 3: deobfuscate (local) ──
-            rev_pairs = "\n".join(f"  {v} → {k}" for k, v in glossary.items())
+            rev_pairs = "\n".join(f"  {v} → {k}" for k, v in term_map.items())
             deobf_prompt = (
                 "Restore the following text by replacing neutral terms back to their "
-                "original business terminology according to the glossary. "
+                "original business terminology according to the dictionary. "
                 "Handle plurals and grammar naturally. Output only the restored text.\n\n"
-                f"Glossary (obfuscated → original):\n{rev_pairs}\n\nText:\n{cloud_reply}"
+                f"Dictionary (obfuscated → original):\n{rev_pairs}\n\nText:\n{cloud_reply}"
             )
 
             print(f"\n[external_help] step 3/3 — deobfuscating (local model)")
             chat._sep("DECODED")
             final = _run_llm(
                 chat,
-                "You are a precise text rewriter. Follow glossary instructions exactly.",
+                "You are a precise text rewriter. Follow dictionary instructions exactly.",
                 deobf_prompt, local_profile
             )
 
@@ -351,7 +351,7 @@ def run(chat, args: str):
     print("  4. Come back here — paste the answer as a plain message:")
     print("       > <paste cloud response here> -> cloud_answer")
     print("  5. Decode the response:")
-    print(f"       > /flow deobfuscate --var cloud_answer --glossary {gname}")
+    print(f"       > /flow deobfuscate --var cloud_answer --dict {dname}")
     print(sep)
     print(f"\n  Tip: if you have a cloud profile, use --cloud-profile <name> next time")
     print(f"       for a fully automatic pipeline without manual copy-paste")

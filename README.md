@@ -123,6 +123,7 @@ Tasks that require the model to decide *what to look at* — refactoring across 
 - Save AI replies to files with `/save` (code-fence stripping, multiple files, append modes)
 - **Session persistence** — `/ctx save` / `/ctx load` dump and restore full conversations; `/ctx list` browses the `.1bcoder/ctx/` project context library; `/ctx compact` summarizes and compresses the context via AI; `/ctx compact N` compacts last N messages in place; `/ctx savepoint` marks a position for rollback or selective compaction; `/ctx clear N` drops the last N messages
 - **Context composer** — `/ctx compose` builds a merged context from multiple saved ctx files with content-level dedup (identical message blocks appear once); workflow: `/proj find` → numbered results → `/ctx compose add N,M` → `/ctx compose run task.ctx` → `/ctx load task.ctx`
+- **Sliding context window** — `/ctx window` is a non-destructive projection (fixed head + sliding tail + optional summarized middle), **off by default** since the right size depends on the model in use; turn it on when responses slow down or timeouts hit a ceiling you've already raised — same feature exists in vyrii as "AutoCut Context"
 - **Scripts** — reusable sequences of commands stored as `.txt` files; `/script run <file> [key=value ...]` runs all steps automatically; `/script apply` runs step-by-step with Y/n confirmation
 - **Script from history** — `/script create ctx` captures this session's commands into a reusable script automatically
 - **Project map** — scan any codebase into a searchable index (`/map index`), query it (`/map find`), trace call chains (`/map trace`), and diff changes (`/map idiff`) — now includes `ORPHAN_DRIFT` alert (dead code delta) and `GHOST ALERT` (deleted file that other files depended on); `/map find` sets `{{map_files}}` after every hit; hidden directories excluded from indexing
@@ -1289,6 +1290,35 @@ If no output file given with `run`, merges directly into current context.
 
 ---
 
+### Sliding context window (`/ctx window`)
+
+**Off by default.** Unlike `/ctx cut` or `/ctx compact`, which permanently remove or rewrite messages, `/ctx window` is a **non-destructive projection**: your full conversation history stays intact in `self.messages`, but only a fixed head (`first`) + a sliding tail (`last`) + an optional summarized middle (`mid`) is actually sent to the model on each call. Turn it off and the full history is visible again immediately — nothing was lost.
+
+It is off by default because the right window size depends entirely on the model you're currently running, not on 1bcoder itself. A 1B model with a 4–8K native context needs a much tighter window than a 4B model with 32K — there is no single default that fits both, and setting one too aggressively would silently throw away context a bigger model could have handled fine.
+
+```
+/ctx window                              show current status
+/ctx window off                          disable (default)
+/ctx window last:2000                    sliding tail only, no fixed head
+/ctx window first:500 last:2000          fixed head (first 500 tokens) + sliding tail (last 2000)
+/ctx window first:500 last:2000 mid:bm25 limit:500   + up to 500 tokens summarized from the middle
+```
+
+`first` is the opening messages of the conversation — usually the original task/goal, which is the most valuable part of a long session and should never compete for space with the rest. `last` is the most recent messages — the part that reads like a normal, coherent conversation right before the next reply. Everything in between is dropped by default, or condensed by one of four `mid` algorithms when `mid:<algo> limit:K` is given:
+
+| `mid` | Algorithm | Query-aware? |
+|---|---|---|
+| `rs` | Reservoir sampling — cheap, uniform random slice of the middle | No |
+| `bm25` | BM25 retrieval against the current message — pulls back old facts relevant to what's being asked right now | Yes |
+| `dp` | 0/1 knapsack — optimal packing of the token budget by relevance score | Yes |
+| `tr` | TextRank/PageRank over message similarity — structurally central messages, not necessarily query-relevant | No |
+
+**When to turn it on:** watch for the model starting to respond noticeably slower as a session grows, or an outright request timeout. If you've already raised `/param timeout <seconds>` to a reasonable ceiling for your hardware and it's still timing out (or every reply now takes uncomfortably long), that's the signal — the context has grown past what this model can handle promptly, and it's time for `/ctx window` rather than a larger timeout. A bigger timeout just makes you wait longer for the same overloaded call; trimming the context fixes the actual cause.
+
+The same feature exists in **vyrii** (the web UI) as **"AutoCut Context"**, under Settings — same reasoning applies there: off by default, turn it on once you see response times creeping up or timeouts hitting the ceiling you've already configured. See vyrii's own README for the setting.
+
+---
+
 ### MCP (Model Context Protocol)
 
 Connect external tool servers to give the AI access to filesystems, databases, web pages, and more.
@@ -1621,6 +1651,9 @@ Full guide: `/doc flows`
 | `/ctx clear` | Clear all conversation messages (keeps `/param` and num_ctx) |
 | `/ctx clear <n>` | Remove last N messages from context |
 | `/ctx cut` | Remove oldest messages until context fits |
+| `/ctx window off` (default) | Disable sliding context window — see "Sliding context window" section below for when to turn it on |
+| `/ctx window first:M last:N [mid:algo limit:K]` | Enable sliding context window: fixed head + sliding tail (+ optional mid-selection) |
+| `/ctx window` | Show current window status |
 | `/ctx compact` | Ask AI to summarize the conversation, replace context with summary |
 | `/ctx compact <N>` | Summarize last N messages in place, replace with one compact block |
 | `/ctx save <file>` | Save full conversation to file (global ctx folder) |

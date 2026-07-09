@@ -1,4 +1,4 @@
-"""Restore obfuscated text back to original business terms using a glossary.
+"""Restore obfuscated text back to original business terms using a dictionary.
 
 Reverses what /flow obfuscate did — maps neutral terms back to real ones.
 Use this after getting a response from a cloud LLM to restore original terminology.
@@ -6,20 +6,20 @@ Safe for any text size: text is passed as a Python string, never expanded inline
 
 ── Usage ──────────────────────────────────────────────────────────────────────
 
-  /flow deobfuscate --glossary <name>
+  /flow deobfuscate --dict <name>
       Decode $ (last output — paste the cloud LLM response as a message first).
 
-  /flow deobfuscate --var <varname> --glossary <name>
+  /flow deobfuscate --var <varname> --dict <name>
       Decode a named session variable.
 
-  /flow deobfuscate --glossary <name> -> clear_solution
+  /flow deobfuscate --dict <name> -> clear_solution
       Capture decoded result into a variable.
 
-  /flow deobfuscate --glossary <name> --profile <name>
+  /flow deobfuscate --dict <name> --profile <name>
       Use a specific 1bcoder profile (model) for the LLM call.
       Same model as used for obfuscation gives best results.
 
-  /flow deobfuscate --glossary <name> --force
+  /flow deobfuscate --dict <name> --force
       Skip LLM — replace every occurrence by direct string substitution (reversed).
       Useful when the cloud LLM preserved terms exactly and no paraphrasing occurred.
 
@@ -27,26 +27,26 @@ Safe for any text size: text is passed as a Python string, never expanded inline
 
   Step 1 — obfuscate and send to cloud:
     > describe the task -> task_text
-    > /flow obfuscate --var task_text --glossary myproject
+    > /flow obfuscate --var task_text --dict myproject
     [copy obfuscated text → paste in ChatGPT / Claude / Gemini → get answer]
 
   Step 2 — paste response and decode:
     > <paste cloud LLM response here as a plain message> -> cloud_answer
-    > /flow deobfuscate --var cloud_answer --glossary myproject -> clear_solution
+    > /flow deobfuscate --var cloud_answer --dict myproject -> clear_solution
     > /var get clear_solution
 
   Shortcut (using $ = last output):
     > <paste cloud LLM response>
-    > /flow deobfuscate --glossary myproject
+    > /flow deobfuscate --dict myproject
 
 ── Notes ──────────────────────────────────────────────────────────────────────
 
   - Decoding runs in an isolated context — current conversation is not affected.
-  - The glossary is reversed automatically (obfuscated → real).
+  - The dictionary is reversed automatically (obfuscated → real).
   - If the cloud LLM slightly changed the obfuscated terms (e.g. "vessels" instead
     of "vessel"), the LLM decoder will still recover them correctly — unlike simple
     string replacement which would miss variations.
-  - Use /flow obfuscate --glossary-new <name> to create a new glossary template.
+  - Use /flow obfuscate --dict-new <name> to create a new dictionary template.
   - For the full guided workflow, use /flow external_help instead.
 """
 from __future__ import annotations
@@ -55,9 +55,9 @@ import os as _os
 
 # ── reuse helpers from obfuscate ──────────────────────────────────────────────
 
-def _force_replace(text: str, glossary: dict[str, str]) -> str:
+def _force_replace(text: str, term_map: dict[str, str]) -> str:
     """Case-preserving direct substitution — no LLM, no context awareness."""
-    for real, neutral in glossary.items():
+    for real, neutral in term_map.items():
         if not real or not neutral:
             continue
         def _make_rep(n: str):
@@ -70,12 +70,12 @@ def _force_replace(text: str, glossary: dict[str, str]) -> str:
         text = _re.sub(_re.escape(real), _make_rep(neutral), text, flags=_re.IGNORECASE)
     return text
 
-def _find_glossary(name: str) -> str | None:
+def _find_dict(name: str) -> str | None:
     if _os.sep in name or "/" in name:
         return name if _os.path.exists(name) else None
     candidates = [
-        _os.path.join(".1bcoder", "glossaries", f"{name}.yaml"),
-        _os.path.join(_os.path.expanduser("~"), ".1bcoder", "glossaries", f"{name}.yaml"),
+        _os.path.join(".1bcoder", "dictionaries", f"{name}.yaml"),
+        _os.path.join(_os.path.expanduser("~"), ".1bcoder", "dictionaries", f"{name}.yaml"),
     ]
     for p in candidates:
         if _os.path.exists(p):
@@ -83,8 +83,8 @@ def _find_glossary(name: str) -> str | None:
     return None
 
 
-def _load_glossary(name: str) -> dict[str, str]:
-    path = _find_glossary(name)
+def _load_dict(name: str) -> dict[str, str]:
+    path = _find_dict(name)
     if not path:
         return {}
     try:
@@ -132,15 +132,15 @@ def _load_profile_first(profile_name: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _deobfuscate_prompt(text: str, glossary: dict[str, str]) -> str:
+def _deobfuscate_prompt(text: str, term_map: dict[str, str]) -> str:
     # reverse: obfuscated → real
-    pairs = "\n".join(f"  {v} → {k}" for k, v in glossary.items())
+    pairs = "\n".join(f"  {v} → {k}" for k, v in term_map.items())
     return (
         "Your task is to restore the following text by replacing neutral/obfuscated terms "
-        "back to their original business terminology according to the glossary provided. "
+        "back to their original business terminology according to the dictionary provided. "
         "Keep all technical meaning intact. Handle plurals and grammatical forms naturally. "
         "Do not add explanations or commentary. Output only the restored text.\n\n"
-        f"Glossary (obfuscated → original):\n{pairs}\n\n"
+        f"Dictionary (obfuscated → original):\n{pairs}\n\n"
         f"Text to restore:\n{text}"
     )
 
@@ -148,25 +148,25 @@ def _deobfuscate_prompt(text: str, glossary: dict[str, str]) -> str:
 # ── entry point ────────────────────────────────────────────────────────────────
 
 def run(chat, args: str):
-    var_m      = _re.search(r'--var\s+(\w+)', args)
-    glossary_m = _re.search(r'--glossary\s+(\S+)', args)
-    profile_m  = _re.search(r'--profile\s+(\S+)', args)
-    force      = "--force" in args
+    var_m     = _re.search(r'--var\s+(\w+)', args)
+    dict_m    = _re.search(r'--dict\s+(\S+)', args)
+    profile_m = _re.search(r'--profile\s+(\S+)', args)
+    force     = "--force" in args
 
-    if not glossary_m:
+    if not dict_m:
         print(__doc__)
         return
 
-    gname    = glossary_m.group(1)
-    glossary = _load_glossary(gname)
+    dname    = dict_m.group(1)
+    term_map = _load_dict(dname)
 
-    if not glossary:
-        gpath = _find_glossary(gname)
-        if not gpath:
-            print(f"[deobfuscate] glossary '{gname}' not found.")
-            print(f"  Create it: /flow obfuscate --glossary-new {gname}")
+    if not term_map:
+        dpath = _find_dict(dname)
+        if not dpath:
+            print(f"[deobfuscate] dictionary '{dname}' not found.")
+            print(f"  Create it: /flow obfuscate --dict-new {dname}")
         else:
-            print(f"[deobfuscate] glossary '{gname}' is empty: {gpath}")
+            print(f"[deobfuscate] dictionary '{dname}' is empty: {dpath}")
         return
 
     # ── get text ──
@@ -176,22 +176,22 @@ def run(chat, args: str):
             print(f"[deobfuscate] variable '{var_m.group(1)}' is empty or not set")
             print( "  Paste the cloud LLM response as a message, capture it:")
             print( "  > <paste response> -> cloud_answer")
-            print(f"  > /flow deobfuscate --var cloud_answer --glossary {gname}")
+            print(f"  > /flow deobfuscate --var cloud_answer --dict {dname}")
             return
     else:
         text = chat._last_output
         if not text:
             print("[deobfuscate] nothing to decode — paste the cloud LLM response first:")
             print("  > <paste response here>")
-            print(f"  > /flow deobfuscate --glossary {gname}")
+            print(f"  > /flow deobfuscate --dict {dname}")
             return
 
-    # ── force mode: direct string substitution, reversed glossary ──
+    # ── force mode: direct string substitution, reversed dictionary ──
     if force:
-        rev_glossary = {v: k for k, v in glossary.items()}
-        print(f"[deobfuscate] FORCE mode — {len(rev_glossary)} terms, direct substitution, text: {len(text)} chars")
+        rev_map = {v: k for k, v in term_map.items()}
+        print(f"[deobfuscate] FORCE mode — {len(rev_map)} terms, direct substitution, text: {len(text)} chars")
         chat._sep("DECODED")
-        reply = _force_replace(text, rev_glossary)
+        reply = _force_replace(text, rev_map)
         print(reply)
         chat.last_reply   = reply
         chat._last_output = reply
@@ -214,13 +214,13 @@ def run(chat, args: str):
             print(f"[deobfuscate] profile '{profile_m.group(1)}' not found — using current model")
 
     # ── run LLM in isolated context ──
-    prompt    = _deobfuscate_prompt(text, glossary)
+    prompt    = _deobfuscate_prompt(text, term_map)
     temp_msgs = [
-        {"role": "system", "content": "You are a precise text rewriter. Follow glossary instructions exactly."},
+        {"role": "system", "content": "You are a precise text rewriter. Follow dictionary instructions exactly."},
         {"role": "user",   "content": prompt},
     ]
 
-    print(f"[deobfuscate] glossary: {gname} ({len(glossary)} terms, reversed)  text: {len(text)} chars")
+    print(f"[deobfuscate] dictionary: {dname} ({len(term_map)} terms, reversed)  text: {len(text)} chars")
     chat._sep("DECODED")
     reply = chat._stream_chat(temp_msgs)
 
