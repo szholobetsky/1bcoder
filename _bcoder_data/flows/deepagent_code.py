@@ -325,26 +325,27 @@ class _StopGeneration(Exception):
 
 
 def _on_interrupt(node_name: str) -> str:
-    """Called on Ctrl+C. Returns 'continue', 'hint:...', or 'quit'."""
+    """Called when an LLM call is interrupted (Ctrl+C) or fails (empty reply /
+    network error / timeout) -- chat._stream_chat collapses both to a falsy
+    result (None for Ctrl+C, "" for everything else), so both get the same
+    retry choice. Returns 'retry:<hint>' (hint may be empty), 'skip', or 'quit'."""
     try:
-        ans = input(
-            f'\n  [Enter] skip this node   '
-            f'h <hint> = retry with hint   '
-            f'q = stop and save: '
-        ).strip()
+        ans = input(f'\n  [{node_name}] interrupted/failed — retry? [Y/n/q]: ').strip().lower()
     except (EOFError, KeyboardInterrupt):
-        ans = 'q'
-
-    if ans.lower() == 'q':
         print('[deepagent_code] stopped — files saved')
         return 'quit'
-    if ans.lower().startswith('h '):
-        hint = ans[2:].strip()
-        if hint:
-            print(f'  [hint] retrying {node_name} with: {hint}')
-            return f'hint:{hint}'
-    print(f'  [skip] {node_name}')
-    return 'continue'
+    if ans.startswith('q'):
+        print('[deepagent_code] stopped — files saved')
+        return 'quit'
+    if ans.startswith('n'):
+        print(f'  [skip] {node_name}')
+        return 'skip'
+    try:
+        hint = input('  comment (optional, guides the retry): ').strip()
+    except (EOFError, KeyboardInterrupt):
+        hint = ''
+    print(f'  [retry] {node_name}' + (f' with: {hint}' if hint else '...'))
+    return f'retry:{hint}'
 
 
 # ── generation ───────────────────────────────────────────────────────────────
@@ -358,6 +359,24 @@ def _generate_local(chat, system_prompt: str, user_prompt: str) -> str:
     if result is None:
         return None
     return result or ""
+
+
+def _generate_with_retry(chat, system_prompt: str, user_prompt: str, label: str) -> str:
+    """Local generation with retry: chat._stream_chat collapses Ctrl+C to None
+    and any network error/timeout to "" -- both are offered the same Y/n/q
+    retry choice via _on_interrupt, looped until success, skip, or quit."""
+    prompt_now = user_prompt
+    while True:
+        result = _generate_local(chat, system_prompt, prompt_now)
+        if result:
+            return result
+        action = _on_interrupt(label)
+        if action == 'quit':
+            raise _StopGeneration()
+        if action == 'skip':
+            return ""
+        hint = action.split(':', 1)[1]
+        prompt_now = user_prompt + (f"\n\nAdditional instruction: {hint}" if hint else "")
 
 
 def _serialize_ctx(messages: list, n: int) -> str:
@@ -704,7 +723,8 @@ def _expand(chat, root_task: str, code_dir: str, max_depth: int,
                                                        think_prompt, chat.num_ctx,
                                                        chat.params)
                     else:
-                        think_text = _generate_local(chat, _THINK_SYSTEM, think_prompt)
+                        think_text = _generate_with_retry(chat, _THINK_SYSTEM, think_prompt,
+                                                          f"{name} [think]")
                     if think_text:
                         with open(md_path, "w", encoding="utf-8") as f:
                             f.write(f"# {name}\n\n{think_text}")
@@ -719,7 +739,7 @@ def _expand(chat, root_task: str, code_dir: str, max_depth: int,
                 if think_text:
                     ask_prompt += f"\n\nYour implementation plan:\n{think_text}"
                 print(f"    [ask] extracting calls for {name}...")
-                ask_raw = _generate_local(chat, implement_prompt, ask_prompt) or ""
+                ask_raw = _generate_with_retry(chat, implement_prompt, ask_prompt, f"{name} [ask]")
                 calls = _parse_calls(ask_raw)
                 if calls:
                     print(f"    [ask] calls: {', '.join(calls)}")
@@ -749,17 +769,7 @@ def _expand(chat, root_task: str, code_dir: str, max_depth: int,
                     h_, m_, _ = workers[idx_ % len(workers)]
                     return _generate_worker(h_, m_, s_prompt, u_prompt,
                                             chat.num_ctx, chat.params)
-                result = _generate_local(chat, s_prompt, u_prompt)
-                if result is None:
-                    action = _on_interrupt(name)
-                    if action == 'quit':
-                        raise _StopGeneration()
-                    if action.startswith('hint:'):
-                        hint = action[5:]
-                        u_with_hint = u_prompt + f"\n\nAdditional instruction: {hint}"
-                        return _generate_local(chat, s_prompt, u_with_hint) or ""
-                    return ""
-                return result
+                return _generate_with_retry(chat, s_prompt, u_prompt, name)
 
             raw = _call_llm(sys_prompt, user_prompt)
 

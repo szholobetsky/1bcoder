@@ -98,26 +98,67 @@ def _next_compact_path() -> str:
     return _os.path.join(out_dir, f"compact_{n}.md")
 
 
-# ── LLM helpers ───────────────────────────────────────────────────────────────
+# ── LLM helpers — retry on interrupt/failure (same Y/n/q convention as glossary.py) ──
 
-def _llm(chat, prompt: str) -> str:
+class _StopScan(Exception):
+    """Raised on user 'q' -- unwinds out of the chunk loop in _run_pass cleanly.
+    Whatever chunks were already summarized are still written out."""
+    pass
+
+
+def _on_ctrl_c(label: str) -> str:
+    """Called when a chunk's LLM call is interrupted (Ctrl+C) or fails (empty
+    reply / network error / timeout) -- chat._stream_chat collapses both to a
+    falsy result (None for Ctrl+C, "" for everything else), so both get the
+    same retry choice. Returns 'retry:<hint>' (hint may be empty), 'skip', or
+    'quit'."""
+    try:
+        ans = input(f"\n[scan] {label} interrupted/failed — retry? [Y/n/q]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "skip"
+    if ans.startswith("q"):
+        return "quit"
+    if ans.startswith("n"):
+        return "skip"
+    try:
+        hint = input("  comment (optional, guides the retry): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        hint = ""
+    return f"retry:{hint}"
+
+
+def _llm(chat, prompt: str, label: str = "chunk") -> str:
     msgs = [
         {"role": "system", "content": "You are a precise summarizer. Follow instructions exactly."},
         {"role": "user",   "content": prompt},
     ]
-    return (chat._stream_chat(msgs) or "").strip()
+    while True:
+        try:
+            raw = chat._stream_chat(msgs)
+        except KeyboardInterrupt:
+            raw = None
+        if raw:
+            return raw.strip()
+        action = _on_ctrl_c(label)
+        if action == "quit":
+            raise _StopScan()
+        if action == "skip":
+            return ""
+        hint = action.split(":", 1)[1]
+        if hint:
+            msgs[-1] = {"role": "user", "content": prompt + f"\n\nAdditional instruction: {hint}"}
 
 
-def _is_relevant(chat, chunk: str, query: str) -> bool:
+def _is_relevant(chat, chunk: str, query: str, label: str = "chunk") -> bool:
     prompt = (
         f'Does this text contain information relevant to: "{query}"?\n'
         f"Reply YES or NO only.\n\n{chunk}"
     )
-    answer = _llm(chat, prompt)
+    answer = _llm(chat, prompt, label)
     return answer.upper().startswith("YES")
 
 
-def _summarize(chat, chunk: str, summary_chars: int, query: str = "") -> str:
+def _summarize(chat, chunk: str, summary_chars: int, query: str = "", label: str = "chunk") -> str:
     if query:
         prompt = (
             f"Summarize the following text in {summary_chars} characters or less, "
@@ -130,7 +171,7 @@ def _summarize(chat, chunk: str, summary_chars: int, query: str = "") -> str:
             f"Preserve key facts, numbers, names, and technical details. "
             f"Output ONLY the summary.\n\n{chunk}"
         )
-    return _llm(chat, prompt)
+    return _llm(chat, prompt, label)
 
 
 # ── single compaction pass ────────────────────────────────────────────────────
@@ -138,7 +179,7 @@ def _summarize(chat, chunk: str, summary_chars: int, query: str = "") -> str:
 def _run_pass(chat, source_label: str, full_text: str,
               query: str, chunk_size: int, summary_chars: int,
               pass_n: int) -> tuple:
-    """Compact full_text → return (output_text, out_path)."""
+    """Compact full_text → return (output_text, out_path, stopped)."""
     chunks = [full_text[i:i + chunk_size]
               for i in range(0, len(full_text), chunk_size)]
     total = len(chunks)
@@ -148,20 +189,27 @@ def _run_pass(chat, source_label: str, full_text: str,
 
     summaries = []
     skipped = 0
+    stopped = False
     for idx, chunk in enumerate(chunks, 1):
         print(f"Scan: {idx}/{total}")
-        if query:
-            if not _is_relevant(chat, chunk, query):
-                print(f"  skip — not relevant")
-                skipped += 1
-                continue
-            text = _summarize(chat, chunk, summary_chars, query)
-        else:
-            text = _summarize(chat, chunk, summary_chars)
+        chunk_label = f"chunk {idx}/{total}"
+        try:
+            if query:
+                if not _is_relevant(chat, chunk, query, chunk_label):
+                    print(f"  skip — not relevant")
+                    skipped += 1
+                    continue
+                text = _summarize(chat, chunk, summary_chars, query, chunk_label)
+            else:
+                text = _summarize(chat, chunk, summary_chars, label=chunk_label)
+        except _StopScan:
+            print(f"\n[scan] stopped by user at {chunk_label} — partial output saved")
+            stopped = True
+            break
 
         if text:
-            label = text[:80].replace("\n", " ") + ("..." if len(text) > 80 else "")
-            print(f"  {len(text)} chars — {label}")
+            preview = text[:80].replace("\n", " ") + ("..." if len(text) > 80 else "")
+            print(f"  {len(text)} chars — {preview}")
             summaries.append(text)
 
     output_text = "\n\n".join(summaries)
@@ -181,7 +229,7 @@ def _run_pass(chat, source_label: str, full_text: str,
 
     print(f"[scan] pass {pass_n} done: {len(full_text)} → {len(output_text)} chars"
           f"  saved: {out_path}")
-    return output_text, out_path
+    return output_text, out_path, stopped
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -272,12 +320,15 @@ def run(chat, args: str):
     current_text = full_text
 
     for pass_n in range(1, max_rounds + 1):
-        current_text, out_path = _run_pass(
+        current_text, out_path, stopped = _run_pass(
             chat, source_label, current_text,
             query, chunk_size, summary_chars, pass_n,
         )
         final_path = out_path
         source_label = out_path
+
+        if stopped:
+            break
 
         if max_rounds > 1:
             if len(current_text) <= target_chars:

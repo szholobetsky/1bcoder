@@ -550,10 +550,15 @@ def _llm(chat, system: str, prompt: str) -> str:
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     while True:
         try:
-            result = (chat._stream_chat(msgs) or "").strip()
-            _check_cancel(chat)
-            return result
+            raw = chat._stream_chat(msgs)
         except KeyboardInterrupt:
+            raw = None
+        # chat.py's real _stream_chat already catches KeyboardInterrupt itself
+        # (prints "[interrupted]") and returns None as a sentinel rather than
+        # re-raising -- so None, not a caught KeyboardInterrupt, is the normal
+        # signal that Ctrl+C fired. Still catch KeyboardInterrupt above too, in
+        # case a _stream_chat implementation ever does propagate it directly.
+        if raw is None:
             action = _on_ctrl_c()
             if action == "quit":
                 raise _StopIndexing()
@@ -566,6 +571,10 @@ def _llm(chat, system: str, prompt: str) -> str:
                         {"role": "user", "content": prompt + f"\n\nAdditional instruction: {hint}"}]
             else:
                 print("  [glossary] retrying...")
+            continue
+        result = raw.strip()
+        _check_cancel(chat)
+        return result
 
 
 _TERMS_SYSTEM = (

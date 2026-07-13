@@ -166,22 +166,27 @@ Lenses:
 
 # ── interruption handler ──────────────────────────────────────────────────────
 
-def _on_interrupt(leaf: '_Node', nodes: list, new_nodes: int) -> tuple[bool, int]:
-    """Called when _stream_chat returns None (Ctrl+C). Returns (stop, new_nodes)."""
+def _on_interrupt(leaf: '_Node', nodes: list, new_nodes: int) -> tuple[str, int]:
+    """Called when a leaf's LLM call is interrupted (Ctrl+C) or fails (empty
+    reply / network error / timeout) -- chat._stream_chat collapses both to a
+    falsy result (None for Ctrl+C, "" for everything else), so both trigger
+    the same retry choice. Returns (action, new_nodes) where action is
+    'retry:<hint>', 'skip', or 'quit'."""
     try:
         ans = input(
-            f'\n  [Enter] continue   '
-            f's <note> = mark node done   '
-            f'q = quit and save: '
+            '\n  [deepagent] interrupted/failed — retry this node? [Y/n/q]  '
+            '(or "s <note>" to mark it done and skip): '
         ).strip()
     except (EOFError, KeyboardInterrupt):
-        ans = 'q'
-
-    if ans.lower() == 'q':
         print('[deepagent] stopped — tree saved')
-        return True, new_nodes
+        return 'quit', new_nodes
 
-    if ans.lower().startswith('s'):
+    low = ans.lower()
+    if low == 'q':
+        print('[deepagent] stopped — tree saved')
+        return 'quit', new_nodes
+
+    if low.startswith('s'):
         note = ans[1:].strip()
         suffix = f' [{note}]' if note else ' [done]'
         for n in nodes:
@@ -189,8 +194,17 @@ def _on_interrupt(leaf: '_Node', nodes: list, new_nodes: int) -> tuple[bool, int
                 n.text += suffix
                 break
         print(f'    {leaf.id}{suffix}')
+        return 'skip', new_nodes
 
-    return False, new_nodes
+    if low.startswith('n'):
+        return 'skip', new_nodes
+
+    # default (Enter, or anything starting with 'y') — retry, optional hint
+    try:
+        hint = input('  comment (optional, guides the retry): ').strip()
+    except (EOFError, KeyboardInterrupt):
+        hint = ''
+    return f'retry:{hint}', new_nodes
 
 
 # ── main flow ──────────────────────────────────────────────────────────────────
@@ -275,12 +289,26 @@ def run(chat, args: str):
                 + [{'role': 'user', 'content': prompt}]
             )
 
-            raw = chat._stream_chat(msgs)
-            if raw is None:                          # Ctrl+C sentinel
-                stop, new_nodes = _on_interrupt(leaf, nodes, new_nodes)
-                continue
-            if raw == "":                            # empty reply / network error
-                print(f'    [skip] empty reply')
+            while True:
+                raw = chat._stream_chat(msgs)
+                if raw:                              # got a real reply
+                    break
+                action, new_nodes = _on_interrupt(leaf, nodes, new_nodes)
+                if action == 'quit':
+                    stop = True
+                    break
+                if action == 'skip':
+                    raw = ""
+                    break
+                hint = action.split(':', 1)[1]
+                if hint:
+                    print(f'    [retry] {leaf.id} with: {hint}')
+                    msgs[-1] = {'role': 'user', 'content': prompt + f"\n\nAdditional instruction: {hint}"}
+                else:
+                    print(f'    [retry] {leaf.id}...')
+            if stop:
+                break
+            if raw == "":
                 continue
 
             items = _parse_items(raw, lenses)

@@ -35,10 +35,9 @@ def _load_deepagent_code():
 _dac = _load_deepagent_code()
 _extract_code = _dac._extract_code
 _syntax_check = _dac._syntax_check
-_generate_local = _dac._generate_local
+_generate_with_retry = _dac._generate_with_retry
 _generate_worker = _dac._generate_worker
 _load_profile = _dac._load_profile
-_on_interrupt = _dac._on_interrupt
 _StopGeneration = _dac._StopGeneration
 LANGS = _dac.LANGS
 _INTERNAL_PARAMS = _dac._INTERNAL_PARAMS
@@ -317,17 +316,7 @@ def _generate_tests(chat, joined_path: str, test_dir: str, lang_cfg: dict,
     for i, (func_name, func_code) in enumerate(functions, 1):
 
         def _call_llm(sys_prompt, user_prompt, _fn=func_name):
-            result = _generate_local(chat, sys_prompt, user_prompt)
-            if result is None:
-                action = _on_interrupt(_fn)
-                if action == 'quit':
-                    raise _StopGeneration()
-                if action.startswith('hint:'):
-                    hint = action[5:]
-                    return _generate_local(chat, sys_prompt,
-                                           user_prompt + f"\n\nAdditional instruction: {hint}") or ""
-                return ""
-            return result
+            return _generate_with_retry(chat, sys_prompt, user_prompt, _fn)
 
         r = _process_one_test(func_name, func_code, i, total,
                               test_dir, ext, lang_cfg, use_think, use_syntax,

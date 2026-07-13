@@ -3547,14 +3547,18 @@ class CoderCLI:
                 opts = {"num_ctx": self.num_ctx}
                 opts.update(self.params)
                 keep_alive = opts.pop("keep_alive", None)
+                think = opts.pop("think", None)
                 ollama_body = {"model": self.model, "messages": messages, "stream": True,
                                "options": opts}
                 if keep_alive is not None:
                     ollama_body["keep_alive"] = keep_alive
+                if think is not None:
+                    ollama_body["think"] = think
                 if self.log_requests:
                     print(f"  [log] POST {self.base_url}/api/chat")
                     print(f"  [log] model={self.model} messages={len(messages)} options={opts}"
-                          + (f" keep_alive={keep_alive}" if keep_alive is not None else ""))
+                          + (f" keep_alive={keep_alive}" if keep_alive is not None else "")
+                          + (f" think={think}" if think is not None else ""))
                 with requests.post(
                     f"{self.base_url}/api/chat",
                     json=ollama_body,

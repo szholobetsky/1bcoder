@@ -43,6 +43,20 @@ Structure flags:
   plan: l1,l2,l3        per-depth focus labels (default: overview,analysis,implementation)
   list: a1,a2           aspect list injected into every generation prompt
 
+  NOTE (found empirically, AnimalAlert case study — see DEEPAGENT_SPEC.md §2.3/§2.5):
+  the <task> string dominates over a plan: label at the same depth, not the other
+  way round. Both go into the prompt, but <task> is the FIRST sentence ("Write a
+  detailed markdown analysis of: <task>...") and a plan: label is a secondary
+  "Focus perspective:" line after it. Asking for architecture (plan: inter-module
+  boundaries, ...) over a <task> phrased as "how to implement such system" works,
+  because both point the same direction. Asking for epics/stories over that same
+  implementation-flavored <task> does NOT reliably work — the epics still come out
+  mechanism-shaped ("Alert Trigger Mechanism", "Scoring Workflow") no matter what
+  plan: says, because <task> already committed to "how to implement." To actually
+  get epic/story output, rephrase <task> itself toward user-facing capability
+  framing (a product-manager/App-Store-listing framing worked — see example below),
+  not just the plan: labels.
+
 Worker flags (parallel BFS):
   --ctx-worker N        context for parallel workers (default: same as --ctx)
 
@@ -54,6 +68,20 @@ Generate examples:
   /flow deepagent_md "hotel room features" --rag hotel --maxdepth 1
   /flow deepagent_md "hotel room features" --rag hotel --rag-store C:\\MyProject --maxdepth 1
   /flow deepagent_md "topic" --profile phones --ctx-worker 4 --maxdepth 3
+
+  Architecture decomposition (C4-flavored: Container/Component/Code) — mechanism-first
+  <task> phrasing, matching plan: labels; depth never stops on its own, cap it deliberately
+  (~3-5x nodes per extra level, verified empirically — see DEEPAGENT_SPEC.md §2.3):
+  /flow deepagent_md "how to implement such system" --ctx 2 --maxdepth 4 \\
+    plan: inter-module boundaries (frontend/backend/database), intra-module layers (e.g. MVC), concrete objects (class/method/route/table)
+
+  Epic -> user story -> e2e-function decomposition — <task> itself reframed as a
+  product-manager/App-Store-listing description (not "how to implement"), each plan:
+  label a full instruction rather than a bare word (validated against AnimalAlert,
+  see DEEPAGENT_SPEC.md §2.5 — this is the run that actually produced non-overlapping,
+  vertically-sliced epics and consistently-applied "As a user..." stories):
+  /flow deepagent_md "the feature list for this app's store page, written the way a user reads it before downloading — never mentioning backend, database, or implementation details" --ctx 2 --maxdepth 3 \\
+    plan: a single non-overlapping user-facing capability — named the way a product manager would name a feature on a roadmap — never a technical mechanism or system layer or a non-functional/performance concern (those are not epics), one single user story within that capability — written strictly as "As a [app user] I want [one specific action] so that [one specific benefit]" — describe exactly one thing the user does in one sitting — never combine multiple actions or backend responsibilities into one story, the complete closed end-to-end technical flow that fully implements that one story — name the actual screen or UI element — the actual API endpoint and method — the actual database fields written or read — and the exact response the user sees
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  COMPOSE  — assemble generated tree into a single document
@@ -81,6 +109,24 @@ Compose examples:
   /flow deepagent_md compose plan1 --ref all                   .md with inline references
   /flow deepagent_md compose plan1 --ref distinct              .md with bibliography at end
   /flow deepagent_md compose plan1 out.md                      flat to custom filename
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ CONTINUE  — expand one more labeled level onto an existing tree's leaves
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Usage:
+  /flow deepagent_md continue <plan_dir> plan: <new level label>[, ...] [list: a1,a2]
+
+Every fresh run persists its task/plan_labels/aspects/cfg to
+<plan_dir>/_deepagent_meta.yaml. `continue` reads that file (no need to
+retype the original task), finds the tree's *current* leaves (nodes with
+no children yet), and expands each one exactly one more level using the
+new plan: label(s) — instead of committing to a large --maxdepth upfront
+and paying for a full extra level everywhere, even branches that didn't
+need it. Sequential only — no --profile support yet.
+
+Continue examples:
+  /flow deepagent_md continue plan3 plan: classes and methods
+  /flow deepagent_md continue plan3 plan: classes and methods list: name concrete Java types
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  OUTPUT STRUCTURE
@@ -126,12 +172,37 @@ No preamble or meta-commentary.
 # ── section parser ────────────────────────────────────────────────────────────
 
 def _parse_sections(content: str) -> list:
-    """Extract section titles from ## N. Title or # N. Title headers."""
+    """Extract section titles from ## N. Title (or # N. Title) headers.
+
+    The model frequently writes its FIRST real section without the leading
+    number (e.g. "## Overview" instead of "## 1. Overview"), even though the
+    prompt explicitly asks for "## 1. Title" — without a fallback, that
+    section silently disappears from the tree: it never becomes a child
+    node, its content stays orphaned inside the parent with no home of its
+    own. Confirmed against real generated trees (AnimalAlert plan5): the
+    single most foundational item at a level ("Core Alert Notification
+    Capability" as an epic, "User Alert Initiation" as a story) was lost
+    this way, every time, silently.
+
+    Fix: treat the first ##-or-deeper heading as implicit section 1 if it
+    has no number. A bare single-# heading is never treated as a section —
+    that's the node's own file title line (present when re-reading an
+    already-generated file on resume: `# {title}\n\n...`), not
+    LLM-authored content, and must not be picked up as a phantom section.
+    """
     titles = []
+    first_seen = False
     for line in content.splitlines():
         m = _re.match(r'^#{1,4}\s+\d+[.)]\s+(.+)', line)
         if m:
             titles.append(m.group(1).strip())
+            first_seen = True
+            continue
+        if not first_seen:
+            m2 = _re.match(r'^#{2,4}\s+(.+)', line)
+            if m2:
+                titles.append(m2.group(1).strip())
+                first_seen = True
     return titles
 
 
@@ -149,6 +220,49 @@ def _make_plan_dir(base: str) -> str:
 
 def _item_path(plan_dir: str, node_id: str) -> str:
     return _os.path.join(plan_dir, f"item_{node_id}.md")
+
+
+# ── run metadata (for `continue`) ───────────────────────────────────────────
+
+_META_FILENAME = "_deepagent_meta.yaml"
+
+
+def _save_meta(plan_dir: str, task: str, plan_labels: list, aspects: list,
+               maxdepth: int, use_web: bool, cfg: dict) -> None:
+    import yaml as _yaml
+    meta = {
+        "task": task, "plan_labels": plan_labels, "aspects": aspects,
+        "maxdepth": maxdepth, "use_web": use_web, "cfg": cfg or {},
+    }
+    try:
+        with open(_os.path.join(plan_dir, _META_FILENAME), "w", encoding="utf-8") as f:
+            _yaml.safe_dump(meta, f, allow_unicode=True, sort_keys=False)
+    except OSError:
+        pass
+
+
+def _load_meta(plan_dir: str):
+    import yaml as _yaml
+    path = _os.path.join(plan_dir, _META_FILENAME)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return _yaml.safe_load(f)
+    except (OSError, _yaml.YAMLError):
+        return None
+
+
+def _labels_with_new_at(base_labels: list, start_idx: int, new_labels: list) -> list:
+    """Return a copy of base_labels with new_labels placed starting at
+    start_idx (padding with "" as needed) — used to slot a `continue`'s new
+    plan: label(s) exactly at the depth they'll apply to, regardless of how
+    many labels the original run had."""
+    labels = list(base_labels)
+    for i, lbl in enumerate(new_labels):
+        idx = start_idx + i
+        while len(labels) <= idx:
+            labels.append("")
+        labels[idx] = lbl
+    return labels
 
 
 # ── browser-like page fetch ───────────────────────────────────────────────────
@@ -500,15 +614,54 @@ def _extract_parent_section(plan_dir: str, node_id: str, max_chars: int) -> str:
     return section.strip()
 
 
+class _StopGeneration(Exception):
+    pass
+
+
+def _on_interrupt(label: str) -> str:
+    """Called when an LLM call is interrupted (Ctrl+C) or fails (empty reply /
+    network error / timeout) -- chat._stream_chat collapses both to a falsy
+    result (None for Ctrl+C, "" for everything else), so both get the same
+    retry choice. Returns 'retry:<hint>' (hint may be empty), 'skip', or 'quit'."""
+    try:
+        ans = input(f'\n  [{label}] interrupted/failed — retry? [Y/n/q]: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print('[deepagent_md] stopped')
+        return 'quit'
+    if ans.startswith('q'):
+        print('[deepagent_md] stopped')
+        return 'quit'
+    if ans.startswith('n'):
+        print(f'  [skip] {label}')
+        return 'skip'
+    try:
+        hint = input('  comment (optional, guides the retry): ').strip()
+    except (EOFError, KeyboardInterrupt):
+        hint = ''
+    print(f'  [retry] {label}' + (f' with: {hint}' if hint else '...'))
+    return f'retry:{hint}'
+
+
 def _generate(chat, title: str, root_task: str, web_ctx: str = "",
               focus: str = "", aspects: list = None, parent_ctx: str = "",
-              chat_ctx: str = "") -> str:
+              chat_ctx: str = "", label: str = "") -> str:
     prompt = _build_prompt(title, root_task, web_ctx, focus, aspects or [], parent_ctx, chat_ctx)
     msgs = [
         {"role": "system", "content": "You are a research writer. Follow output format strictly."},
         {"role": "user", "content": prompt},
     ]
-    return chat._stream_chat(msgs) or ""
+    while True:
+        result = chat._stream_chat(msgs) or ""
+        if result:
+            return result
+        action = _on_interrupt(label or title)
+        if action == 'quit':
+            raise _StopGeneration()
+        if action == 'skip':
+            return ""
+        hint = action.split(':', 1)[1]
+        if hint:
+            msgs[-1] = {"role": "user", "content": prompt + f"\n\nAdditional instruction: {hint}"}
 
 
 # ── recursive expand ──────────────────────────────────────────────────────────
@@ -554,7 +707,8 @@ def _expand(chat, node_id: str, title: str, root_task: str,
         parent_ctx = _extract_parent_section(plan_dir, node_id, max_parent_ctx)
         if parent_ctx:
             print(f"{indent}  [parent ctx] {len(parent_ctx)} chars")
-        content = _generate(chat, title, root_task, web_ctx, focus, aspects, parent_ctx, chat_ctx)
+        content = _generate(chat, title, root_task, web_ctx, focus, aspects, parent_ctx, chat_ctx,
+                            label=node_id)
         if not content:
             print(f"{indent}  [skip] empty reply")
             return
@@ -589,8 +743,20 @@ def _shift_headings(text: str, shift: int) -> str:
 
 
 def _split_sections(text: str) -> tuple:
-    """Split file body into (preamble, [(sec_num, heading_line, body_text), ...])."""
-    sec_re = _re.compile(r'^#{1,4}\s+(\d+)[.)]\s+', _re.MULTILINE)
+    """Split file body into (preamble, [(sec_num, heading_line, body_text), ...]).
+
+    Mirrors the fix in _parse_sections: the model's first real section often
+    has no leading number ("## Overview" instead of "## 1. Overview") even
+    though the prompt asks for "## 1. Title" — without a fallback that
+    section's body silently folds into the discarded preamble instead of
+    becoming sections[0]. Confirmed against real generated trees (AnimalAlert
+    plan5). Callers pass `text` with the node's own "# {title}" line already
+    stripped (see _compose_node), so — unlike _parse_sections — there's no
+    risk of that title line being mistaken for an unnumbered first section
+    here; no single-# guard is needed.
+    """
+    sec_re   = _re.compile(r'^#{1,4}\s+(\d+)[.)]\s+', _re.MULTILINE)
+    unnum_re = _re.compile(r'^#{1,4}\s+\S')
     lines  = text.splitlines(keepends=True)
     preamble_lines = []
     sections = []
@@ -603,12 +769,17 @@ def _split_sections(text: str) -> tuple:
         if m:
             if current_num is not None:
                 sections.append((current_num, current_head, "".join(current_body)))
-            elif not sections:
-                pass   # still in preamble, close it
             current_num  = int(m.group(1))
             current_head = line
             current_body = []
-        elif current_num is None:
+            continue
+        if current_num is None and not sections and unnum_re.match(line):
+            # first heading found has no number — treat as implicit section 1
+            current_num  = 1
+            current_head = line
+            current_body = []
+            continue
+        if current_num is None:
             preamble_lines.append(line)
         else:
             current_body.append(line)
@@ -625,11 +796,15 @@ _INTERNAL_PARAMS = {"timeout", "num_ctx", "think_exclude", "ask_limit",
                     "ask_show", "run_timeout", "log", "keep_alive"}
 
 def _generate_worker(host: str, model: str, prompt: str,
-                     num_ctx: int, params: dict) -> str:
-    """Direct HTTP POST to a specific Ollama worker (stream=False, thread-safe)."""
+                     num_ctx: int, params: dict, system: str = None) -> str:
+    """Direct HTTP POST to a specific Ollama worker (stream=False, thread-safe).
+    `system` lets other flows (e.g. deepagent_spec) reuse this same HTTP-call
+    function with their own system prompt instead of forking a duplicate;
+    defaults to deepagent_md's own research-writer prompt, unchanged for
+    existing callers."""
     import requests as _r
     msgs = [
-        {"role": "system", "content": "You are a research writer. Follow output format strictly."},
+        {"role": "system", "content": system or "You are a research writer. Follow output format strictly."},
         {"role": "user",   "content": prompt},
     ]
     opts = {"num_ctx": num_ctx}
@@ -730,7 +905,8 @@ def _expand_bfs(chat, root_sections: list, root_task: str, plan_dir: str,
                 display_worker = f"{host}/{model}"
                 content = _generate_worker(host, model, prompt, chat.num_ctx, chat.params)
             else:
-                content = _generate(chat, title, root_task, web_ctx, focus, aspects, parent_ctx, chat_ctx)
+                content = _generate(chat, title, root_task, web_ctx, focus, aspects, parent_ctx, chat_ctx,
+                                    label=node_id)
                 display_worker = "local"
 
             return node_id, title, d, content, False
@@ -1150,6 +1326,92 @@ def run(chat, args: str):
             _compose(plan_dir, out, ref_mode=ref_mode)
         return
 
+    if args.startswith("continue"):
+        rest = args[8:].strip()
+        cm = _re.search(r'--ctx\s+(\d+)', rest)
+        ctx_n_continue = int(cm.group(1)) if cm else 6
+        if cm:
+            rest = (rest[:cm.start()] + rest[cm.end():]).strip()
+        plan_m = _re.search(r'\bplan:\s*(.+?)(?:\s+(?:list:|$))', rest + " ")
+        list_m = _re.search(r'\blist:\s*(.+?)(?:\s*$)', rest)
+        anchor = len(rest)
+        if plan_m: anchor = min(anchor, plan_m.start())
+        if list_m: anchor = min(anchor, list_m.start())
+        new_labels  = [l.strip() for l in plan_m.group(1).split(',') if l.strip()] if plan_m else []
+        new_aspects = [l.strip() for l in list_m.group(1).split(',') if l.strip()] if list_m else []
+        plan_name = rest[:anchor].strip()
+        if not plan_name or not new_labels:
+            print("usage: /flow deepagent_md continue <plan_dir> plan: <new level label>[, ...] [list: a1,a2]")
+            return
+
+        base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
+        plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
+        if not _os.path.isdir(plan_dir):
+            print(f"[deepagent_md] not found: {plan_dir}")
+            return
+
+        meta = _load_meta(plan_dir)
+        if meta is None:
+            print(f"[deepagent_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
+                  f"`continue` support (or the file was moved/deleted). Cannot continue "
+                  f"without the original task/plan_labels.")
+            return
+
+        task        = meta.get("task", "")
+        plan_labels = list(meta.get("plan_labels", []))
+        aspects     = list(meta.get("aspects", [])) + new_aspects
+        cfg         = meta.get("cfg", {}) or {}
+        use_web     = meta.get("use_web", False)
+        if not task:
+            print(f"[deepagent_md] {_META_FILENAME} has no task recorded — cannot continue")
+            return
+
+        all_ids = _collect_node_ids(plan_dir)
+        if not all_ids:
+            print(f"[deepagent_md] no nodes found in {plan_dir}")
+            return
+        leaves = sorted(
+            [nid for nid in all_ids if not _child_ids(nid, all_ids)],
+            key=lambda x: tuple(int(p) for p in x.split("."))
+        )
+        if not leaves:
+            print(f"[deepagent_md] every node in {plan_dir} already has children — nothing to continue")
+            return
+
+        chat_ctx = _serialize_ctx(getattr(chat, "messages", []), ctx_n_continue)
+        saved = dict(chat.params)
+        if "temperature" not in chat.params:
+            chat.params["temperature"] = 0.8
+        stats = {"files": 0}
+        max_parent_ctx = 500
+        new_maxdepth = meta.get("maxdepth", 0)
+
+        print(f"[deepagent_md] continue : {plan_dir}")
+        print(f"[deepagent_md] leaves   : {len(leaves)}")
+        print(f"[deepagent_md] new level: {', '.join(new_labels)}")
+
+        labels_out = plan_labels
+        try:
+            for leaf_id in leaves:
+                leaf_depth = leaf_id.count(".") + 1
+                title = _read_file_title(plan_dir, leaf_id)
+                labels_for_leaf = _labels_with_new_at(plan_labels, leaf_depth, new_labels)
+                labels_out = labels_for_leaf
+                target_depth = leaf_depth + len(new_labels)
+                new_maxdepth = max(new_maxdepth, target_depth)
+                _expand(chat, leaf_id, title, task, plan_dir,
+                        depth=leaf_depth, max_depth=target_depth, use_web=use_web,
+                        plan_labels=labels_for_leaf, aspects=aspects, stats=stats,
+                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+        except _StopGeneration:
+            print("\n[deepagent_md] stopped by user — partial output saved")
+
+        chat.params = saved
+        _save_meta(plan_dir, task, labels_out, aspects, new_maxdepth, use_web, cfg)
+        print(f"\n[deepagent_md] continue done: {stats['files']} files generated in {plan_dir}")
+        print(f"[deepagent_md] to join: /flow deepagent_md compose {_os.path.basename(plan_dir)}")
+        return
+
     # ── preset (sets defaults, explicit flags override) ───────────────────────
     preset_web_n  = 3
     preset_fix    = None
@@ -1337,6 +1599,7 @@ def run(chat, args: str):
         "rag_path":    rag_path,
         "rw_ratio":    rw_ratio,
     }
+    _save_meta(plan_dir, task, plan_labels, aspects, maxdepth, use_web, cfg)
 
     saved = dict(chat.params)
     if "temperature" not in chat.params:
@@ -1345,61 +1608,67 @@ def run(chat, args: str):
     stats = {"files": 0}
 
     # generate index
-    index_path = _os.path.join(plan_dir, "index.md")
-    if _os.path.isfile(index_path):
-        print("[deepagent_md] resuming from existing index.md")
-        index_content = open(index_path, encoding="utf-8").read()
-    else:
-        print(f"\n[gen] index: {task}")
-        web_ctx = ""
-        if use_web or cfg.get("rag_project"):
-            print("  [web] searching root topic...")
-            web_ctx = _web_research(
-                chat, task, task,
-                web_n=cfg["web_n"],
-                fix_spec=cfg["fix_spec"],
-                scan_to=cfg["scan_to"],
-                prescan=cfg["prescan"],
-                plan_dir=plan_dir if cfg["use_ref"] else "",
-                node_id="index" if cfg["use_ref"] else "",
-                use_ref=cfg["use_ref"],
-                rag_project=cfg.get("rag_project"),
-                rag_path=cfg.get("rag_path"),
-            )
-        index_content = _generate(chat, task, task, web_ctx,
-                                  focus=plan_labels[0] if plan_labels else "",
-                                  aspects=aspects, chat_ctx=chat_ctx)
-        if not index_content:
-            print("[deepagent_md] failed to generate index — stopping")
+    stopped_early = False
+    try:
+        index_path = _os.path.join(plan_dir, "index.md")
+        if _os.path.isfile(index_path):
+            print("[deepagent_md] resuming from existing index.md")
+            index_content = open(index_path, encoding="utf-8").read()
+        else:
+            print(f"\n[gen] index: {task}")
+            web_ctx = ""
+            if use_web or cfg.get("rag_project"):
+                print("  [web] searching root topic...")
+                web_ctx = _web_research(
+                    chat, task, task,
+                    web_n=cfg["web_n"],
+                    fix_spec=cfg["fix_spec"],
+                    scan_to=cfg["scan_to"],
+                    prescan=cfg["prescan"],
+                    plan_dir=plan_dir if cfg["use_ref"] else "",
+                    node_id="index" if cfg["use_ref"] else "",
+                    use_ref=cfg["use_ref"],
+                    rag_project=cfg.get("rag_project"),
+                    rag_path=cfg.get("rag_path"),
+                )
+            index_content = _generate(chat, task, task, web_ctx,
+                                      focus=plan_labels[0] if plan_labels else "",
+                                      aspects=aspects, chat_ctx=chat_ctx, label="index")
+            if not index_content:
+                print("[deepagent_md] failed to generate index — stopping")
+                chat.params = saved
+                return
+            with open(index_path, "w", encoding="utf-8") as f:
+                f.write(f"# {task}\n\n{index_content}")
+            stats["files"] += 1
+            print(f"  -> index.md ({len(index_content)} chars)")
+
+        top = _parse_sections(index_content)
+        if not top:
+            print("[deepagent_md] no ## N. sections in index.md — check LLM output format")
             chat.params = saved
             return
-        with open(index_path, "w", encoding="utf-8") as f:
-            f.write(f"# {task}\n\n{index_content}")
-        stats["files"] += 1
-        print(f"  -> index.md ({len(index_content)} chars)")
 
-    top = _parse_sections(index_content)
-    if not top:
-        print("[deepagent_md] no ## N. sections in index.md — check LLM output format")
-        chat.params = saved
-        return
+        print(f"\n[deepagent_md] {len(top)} top-level sections, expanding to depth {maxdepth}...")
 
-    print(f"\n[deepagent_md] {len(top)} top-level sections, expanding to depth {maxdepth}...")
-
-    if workers:
-        _expand_bfs(chat, top, task, plan_dir,
-                    max_depth=maxdepth, use_web=use_web,
-                    plan_labels=plan_labels, aspects=aspects,
-                    max_parent_ctx=max_parent_ctx, workers=workers,
-                    stats=stats, chat_ctx=chat_ctx_worker, cfg=cfg)
-    else:
-        for i, title in enumerate(top, 1):
-            _expand(chat, str(i), title, task, plan_dir,
-                    depth=1, max_depth=maxdepth, use_web=use_web,
-                    plan_labels=plan_labels, aspects=aspects, stats=stats,
-                    max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+        if workers:
+            _expand_bfs(chat, top, task, plan_dir,
+                        max_depth=maxdepth, use_web=use_web,
+                        plan_labels=plan_labels, aspects=aspects,
+                        max_parent_ctx=max_parent_ctx, workers=workers,
+                        stats=stats, chat_ctx=chat_ctx_worker, cfg=cfg)
+        else:
+            for i, title in enumerate(top, 1):
+                _expand(chat, str(i), title, task, plan_dir,
+                        depth=1, max_depth=maxdepth, use_web=use_web,
+                        plan_labels=plan_labels, aspects=aspects, stats=stats,
+                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+    except _StopGeneration:
+        print("\n[deepagent_md] stopped by user — partial output saved")
+        stopped_early = True
 
     chat.params = saved
     total = stats["files"]
-    print(f"\n[deepagent_md] done: {total} files generated in {plan_dir}")
+    print(f"\n[deepagent_md] done: {total} files generated in {plan_dir}"
+          + ("  (stopped early)" if stopped_early else ""))
     print(f"[deepagent_md] to join: /flow deepagent_md compose {_os.path.basename(plan_dir)}")
