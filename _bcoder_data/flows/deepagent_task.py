@@ -18,6 +18,15 @@ LEAF node expands one level deeper using its own spec_<leaf_id>.<i>.md
 files (if deepagent_spec has been run on it yet — if not, the leaf is just
 a childless row, same as any other, not an error).
 
+planMD is NOT mandatory: if .1bcoder/planMD/<plan_name> doesn't exist
+(deleted, or a plan that only ever had deepagent_spec run on it), the node
+tree is instead derived from the spec directory's own filenames —
+spec_<leaf_id>.<i>.md already encodes each leaf's full dotted id, so every
+ancestor container id can be reconstructed from it. Container rows just
+fall back to showing the bare id as their title (no item_<id>.md to read
+one from). Only genuinely errors out if NEITHER planMD nor spec has
+anything for this plan name.
+
 Row format (one line per task, 2-space indent per depth level), tag-based
 and order-independent — NOT positional fields (rejected that design: the
 first version used "; lane; status; assignee; date", replaced after
@@ -195,11 +204,37 @@ def _leaf_spec_children(spec_dir: str, leaf_id: str) -> list:
     return hits
 
 
+_SPEC_LEAF_RE = _re.compile(r'^spec_([\d.]+)\.(\d+)\.md$')
+
+
+def _collect_ids_from_spec(spec_dir: str) -> set:
+    """Fallback for when planMD/<plan> doesn't exist: derive the full node-id
+    set — every spec leaf plus every ancestor its dot-notation implies —
+    purely from spec_<leaf_id>.<sec_index>.md filenames. Container ids
+    picked up this way have no item_<id>.md; _read_file_title already
+    tolerates that (falls back to the bare id) so no other change needed."""
+    ids = set()
+    if not _os.path.isdir(spec_dir):
+        return ids
+    for fname in _os.listdir(spec_dir):
+        m = _SPEC_LEAF_RE.match(fname)
+        if not m:
+            continue
+        parts = m.group(1).split(".")
+        for i in range(1, len(parts) + 1):
+            ids.add(".".join(parts[:i]))
+    return ids
+
+
 def _build_rows(plan_dir: str, spec_dir: str) -> list:
     """[(id, title, depth), ...] — container nodes from item_<id>.md titles;
     each leaf additionally expands one level deeper using its own spec
-    units, if any exist yet."""
-    all_ids = _dmd._collect_node_ids(plan_dir)
+    units, if any exist yet. Falls back to _collect_ids_from_spec when
+    plan_dir (planMD) doesn't exist on disk."""
+    if _os.path.isdir(plan_dir):
+        all_ids = _dmd._collect_node_ids(plan_dir)
+    else:
+        all_ids = _collect_ids_from_spec(spec_dir)
     rows = []
     for item_id in sorted(all_ids, key=lambda x: tuple(int(p) for p in x.split("."))):
         depth = item_id.count(".") + 1
@@ -220,18 +255,20 @@ def run(chat, args: str):
 
     base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
     plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
-    if not _os.path.isdir(plan_dir):
-        print(f"[deepagent_task] not found: {plan_dir}")
+    spec_dir = _dspec._default_spec_dir(plan_dir)
+    has_planmd = _os.path.isdir(plan_dir)
+
+    if not has_planmd and not _os.path.isdir(spec_dir):
+        print(f"[deepagent_task] not found: neither {plan_dir} nor {spec_dir} exist")
         return
 
-    spec_dir = _dspec._default_spec_dir(plan_dir)
     tasks_path = _tasks_path(plan_dir)
     colors_path = _ensure_colors_file(plan_dir)
     existing = _parse_existing_tasks(tasks_path)
     rows = _build_rows(plan_dir, spec_dir)
 
     if not rows:
-        print(f"[deepagent_task] no nodes found in {plan_dir}")
+        print(f"[deepagent_task] no nodes found in {plan_dir} or {spec_dir}")
         return
 
     lines = []
@@ -250,7 +287,7 @@ def run(chat, args: str):
     with open(tasks_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    print(f"[deepagent_task] plan   : {plan_dir}")
+    print(f"[deepagent_task] plan   : {plan_dir}{' (not found - using spec dir only)' if not has_planmd else ''}")
     print(f"[deepagent_task] specs  : {spec_dir}")
     print(f"[deepagent_task] colors : {colors_path}")
     print(f"[deepagent_task] wrote {len(rows)} row(s) ({new_count} new) to {tasks_path}")
