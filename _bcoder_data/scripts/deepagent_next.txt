@@ -1,0 +1,16 @@
+# Runs deepagent_architect --next for an EXISTING plan -- claims and
+# processes exactly ONE not-yet-taken ticket from tasks.md (the first open
+# row in numeric order), then stops. Safe to run repeatedly (or
+# concurrently from another process/machine) to work through the backlog
+# one ticket at a time -- each run picks whatever the others haven't
+# claimed yet. See deepagent_loop.txt for the same thing but looping
+# through the whole backlog automatically instead of stopping after one.
+#
+# Required params:
+#   plan = the existing plan name (e.g. plan1)
+#
+# Usage:
+#   1bcoder --host openai://localhost:1234 --model qwen3-4b-instruct-2507 ^
+#       --scriptapply deepagent_next.txt --param plan=plan1
+/param timeout 300
+/flow deepagent_architect {{plan}} --next --lang py

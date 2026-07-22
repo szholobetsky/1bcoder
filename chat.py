@@ -6522,7 +6522,7 @@ advanced_tools =
                 _save_script([l[4:] if l.startswith("[v] ") else l for l in _raw], self._script_file)
             lines = _load_script(self._script_file)
             pending = [(i, l.rstrip("\n")) for i, l in enumerate(lines)
-                       if not l.startswith("[v]") and not l.strip().startswith("#")]
+                       if not l.startswith("[v]") and l.strip() and not l.strip().startswith("#")]
             if not pending:
                 print("nothing to apply")
                 return
@@ -7348,6 +7348,12 @@ advanced_tools =
             url = raw.strip()
             if not url:
                 print("usage: /web fetch <url> [-n 4000]"); return
+            marker = f"[WEB CONTENT from {url}]"
+            if any(isinstance(m.get("content"), str) and m["content"].startswith(marker)
+                   for m in ctx):
+                print(f"[web] {url} already fetched this turn -- skipping duplicate "
+                      f"fetch (see earlier context)")
+                return
             print(f"[web] fetching {url} ...")
             try:
                 import requests as _r
@@ -9708,7 +9714,14 @@ Config stored in ~/.1bcoder/translate.json
             depth = int(toks[1]) if len(toks) > 1 and toks[1].isdigit() else 2
             self._map_index(root, depth)
         elif sub == "find":
-            query = parts[2].strip() if len(parts) > 2 else ""
+            # Strip stray quote chars -- neither find's nor trace's query
+            # language uses them for anything, but agents/models routinely
+            # wrap the term in quotes (mimicking /web search or
+            # /flow deepagent_code "text" conventions) and that would
+            # otherwise become part of the literal search term, silently
+            # matching nothing. Confirmed on a real CBC run's research agent
+            # writing ACTION: /map find "validate_task" -d 1.
+            query = parts[2].strip().replace('"', '').replace("'", '') if len(parts) > 2 else ""
             if not os.path.exists(os.path.join(BCODER_DIR, "map.txt")):
                 _warn("[map] map.txt not found. /map index can take a long time on large projects.")
                 if not self._confirm("[map] run /map index now? [Y/n]:"):
@@ -9716,7 +9729,7 @@ Config stored in ~/.1bcoder/translate.json
                 self._map_index(os.path.abspath("."), 2)
             self._map_find(query)
         elif sub == "trace":
-            query = parts[2].strip() if len(parts) > 2 else ""
+            query = parts[2].strip().replace('"', '').replace("'", '') if len(parts) > 2 else ""
             if not os.path.exists(os.path.join(BCODER_DIR, "map.txt")):
                 _warn("[map] map.txt not found. /map index can take a long time on large projects.")
                 if not self._confirm("[map] run /map index now? [Y/n]:"):
@@ -11261,8 +11274,11 @@ Config stored in ~/.1bcoder/translate.json
                 print()
             tw = 10
             print(f"  {'max_turns':<{tw}}: {cfg['max_turns']}    auto_exec: {cfg['auto_exec']}    auto_apply: {cfg['auto_apply']}")
-            if cfg["tools"] is not None:
-                tool_str = ", ".join(cfg["tools"])
+            if cfg["tools"] is None:
+                print(f"  {'tools':<{tw}}: (default)")
+            elif not cfg["tools"]:
+                print(f"  {'tools':<{tw}}: (none - no tools)")
+            else:
                 # wrap at 70 chars
                 line, out = "", []
                 for t in cfg["tools"]:
@@ -11275,8 +11291,6 @@ Config stored in ~/.1bcoder/translate.json
                 print(f"  {'tools':<{tw}}: {out[0]}")
                 for l in out[1:]:
                     print(f"  {'':<{tw}}  {l}")
-            else:
-                print(f"  {'tools':<{tw}}: (default)")
             for section, label in [("gates", "gates"), ("before", "before"), ("procs", "procs"), ("hooks", "hooks")]:
                 items = cfg[section]
                 if items:

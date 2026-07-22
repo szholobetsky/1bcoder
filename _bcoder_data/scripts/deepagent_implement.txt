@@ -1,0 +1,18 @@
+# Runs deepagent_architect for ONE backlog task_id, delegating leaf methods
+# to deepagent_code. Run this once per task_id you want to actually build --
+# check .1bcoder/tasks/<plan>/tasks.md (written by deepagent_plan.txt) for
+# the list of ids first. Re-run this script again with a different task_id
+# for each further backlog item -- deepagent_plan.txt (deepagent_md/spec/
+# task) does NOT need to run again, only this step is per-task.
+#
+# Required params:
+#   plan    = the plan name (e.g. plan2)
+#   task_id = which row from tasks.md to build (e.g. 1, or 2.1)
+#
+# Usage:
+#   1bcoder --host openai://localhost:1234 --model qwen3-4b-instruct-2507 ^
+#       --scriptapply deepagent_implement.txt --param plan=plan2 --param task_id=1
+# NOTE: no blank line here -- a blank line counts as a step and gets routed
+# as an empty chat message (triggers a real, unwanted LLM call).
+/param timeout 300
+/flow deepagent_architect {{plan}} {{task_id}} --lang py

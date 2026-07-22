@@ -164,14 +164,20 @@ def _read_term_file(project: str, term: str) -> dict:
     chunk that produced one — never overwritten on an existing term (same
     append-only philosophy as FACTS:), unless --redefine explicitly wipes it.
     Tolerates the older single-paragraph format (pre-dates this change): a
-    DEFINITION: block with no bullet lines is treated as one candidate."""
+    DEFINITION: block with no bullet lines is treated as one candidate.
+
+    HISTORY: is a separate append-only section from a different producer
+    (the /flow history flow, not /flow glossary) — facts are static
+    properties of the term, history is temporal task-driven change records.
+    /flow glossary itself never writes HISTORY:, but must preserve it
+    unchanged whenever it rewrites a term file it doesn't otherwise touch."""
     kterm = _kebab(term)
     path = _term_path(project, kterm)
     if not _os.path.isfile(path):
-        return {"term": kterm, "definitions": [], "facts": [], "links": []}
+        return {"term": kterm, "definitions": [], "facts": [], "links": [], "history": []}
     text = open(path, encoding="utf-8").read()
-    definitions, facts, links = [], [], []
-    m = _re.search(r'DEFINITION:\s*\n(.*?)(?=\nFACTS:|\nLINK:|\Z)', text, _re.DOTALL)
+    definitions, facts, links, history = [], [], [], []
+    m = _re.search(r'DEFINITION:\n(.*?)(?=\nFACTS:|\nLINK:|\nHISTORY:|\Z)', text, _re.DOTALL)
     if m:
         block = m.group(1).strip()
         if block:
@@ -181,10 +187,10 @@ def _read_term_file(project: str, term: str) -> dict:
                 definitions = [l.lstrip("-*").strip() for l in bullet_lines]
             else:
                 definitions = [block]  # legacy plain-paragraph format
-    m = _re.search(r'FACTS:\s*\n(.*?)(?=\nLINK:|\Z)', text, _re.DOTALL)
+    m = _re.search(r'FACTS:\n(.*?)(?=\nLINK:|\nHISTORY:|\Z)', text, _re.DOTALL)
     if m:
         facts = [l.lstrip("-*").strip() for l in m.group(1).splitlines() if l.strip()]
-    m = _re.search(r'LINK:\s*\n(.*)\Z', text, _re.DOTALL)
+    m = _re.search(r'LINK:\n(.*?)(?=\nHISTORY:|\Z)', text, _re.DOTALL)
     if m:
         raw_links = [l.lstrip("-*").strip() for l in m.group(1).splitlines() if l.strip()]
         links = []
@@ -194,7 +200,11 @@ def _read_term_file(project: str, term: str) -> dict:
             # or ones never touched by --crosslink/relink)
             lm = _re.match(r'\[([^\]]+)\]\([^)]+\)', l)
             links.append(lm.group(1) if lm else l)
-    return {"term": kterm, "definitions": definitions, "facts": facts, "links": links}
+    m = _re.search(r'HISTORY:\n(.*)\Z', text, _re.DOTALL)
+    if m:
+        history = [l.lstrip("-*").strip() for l in m.group(1).splitlines() if l.strip()]
+    return {"term": kterm, "definitions": definitions, "facts": facts, "links": links,
+            "history": history}
 
 
 def _write_term_file(project: str, term: str, data: dict) -> None:
@@ -213,6 +223,10 @@ def _write_term_file(project: str, term: str, data: dict) -> None:
         # part of any markdown spec) — renders clickable in VS Code/GitHub
         # previews while still regex-parseable by _read_term_file above.
         lines.append(f"- [{link}]({link}.md)")
+    lines.append("")
+    lines.append("HISTORY:")
+    for entry in data.get("history", []):
+        lines.append(f"- {entry}")
     with open(_term_path(project, kterm), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -222,6 +236,31 @@ def _write_think(project: str, source_label: str, chunk_idx: int, text: str) -> 
     path = _os.path.join(_think_dir(project), f"{safe}_chunk{chunk_idx}.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# think: {source_label} chunk {chunk_idx}\n\n{text}")
+
+
+# ── source provenance tag ────────────────────────────────────────────────────
+# Every DEFINITION:/FACTS: candidate is tagged with where it came from, e.g.
+# "amortisation is rounded to 2 decimals [file: src/finance.py:142]" — 142 is
+# the 1-based line where the chunk that produced this candidate starts (falls
+# back to the chunk index if a line number isn't available, e.g. --tabular).
+# This is what lets a later cross-reference pass walk term -> source file/line
+# instead of only term -> term (which is all LINK: gives today).
+
+_SOURCE_TAG_RE = _re.compile(r'\s*\[file:\s*[^\]]*\]\s*$')
+
+
+def _source_tag(source_path: str, index) -> str:
+    path = source_path.replace(_os.sep, '/')
+    if index is None:
+        return f" [file: {path}]"
+    return f" [file: {path}:{index}]"
+
+
+def _strip_source_tag(text: str) -> str:
+    """Drop a trailing [file: ...] tag before similarity comparison, so two
+    facts with identical content but different source tags (e.g. the same
+    fact re-derived from an overlapping chunk) still dedup correctly."""
+    return _SOURCE_TAG_RE.sub('', text)
 
 
 # ── subword fuzzy match — ported from chat.py _split_identifier (2324-2355) ──
@@ -347,7 +386,7 @@ def _query_filter(project: str, tokens: list) -> list:
     for term in _load_terms(project):
         data = _read_term_file(project, term)
         fname = term.lower()
-        child_lines = list(data["facts"])
+        child_lines = list(data["facts"]) + list(data["history"])
 
         if pos_file and not all(tok in fname for tok in pos_file):
             continue
@@ -440,13 +479,17 @@ def _collect(path: str, use_tabular: bool) -> list:
 # ── chunking ─────────────────────────────────────────────────────────────────
 
 def _char_chunks(text: str, chunk_chars: int, overlap_chars: int) -> list:
+    """Return [(chunk_text, start_line), ...] — start_line is the 1-based line
+    number where the chunk begins in `text`, used to tag FACTS:/DEFINITION:
+    entries with their source (see _source_tag)."""
     if chunk_chars <= 0 or len(text) <= chunk_chars:
-        return [text]
+        return [(text, 1)]
     step = max(chunk_chars - overlap_chars, 1)
     chunks, start, n = [], 0, len(text)
     while start < n:
         end = min(start + chunk_chars, n)
-        chunks.append(text[start:end])
+        start_line = text.count('\n', 0, start) + 1
+        chunks.append((text[start:end], start_line))
         if end >= n:
             break
         start += step
@@ -457,7 +500,9 @@ def _code_chunks(text: str, ext: str, chunk_chars: int, overlap_chars: int) -> l
     """Split on function/class boundaries instead of raw char slicing, so a
     chunk is never a syntactically meaningless fragment of a function. Falls
     back to _char_chunks for languages without a boundary regex, or when a
-    single function/class exceeds the chunk budget."""
+    single function/class exceeds the chunk budget.
+
+    Return [(chunk_text, start_line), ...] — same contract as _char_chunks."""
     func_re = _CODE_BOUNDARY_RE.get(ext)
     if not func_re:
         return _char_chunks(text, chunk_chars, overlap_chars)
@@ -473,29 +518,33 @@ def _code_chunks(text: str, ext: str, chunk_chars: int, overlap_chars: int) -> l
     boundary_lines.append(len(lines))
     boundary_lines = sorted(set(boundary_lines))
 
-    segments = []
+    segments = []  # (text, start_line) — start_line is 1-based
     for i in range(len(boundary_lines) - 1):
-        seg = "".join(lines[boundary_lines[i]:boundary_lines[i + 1]])
+        seg_start = boundary_lines[i]
+        seg = "".join(lines[seg_start:boundary_lines[i + 1]])
         if seg.strip():
-            segments.append(seg)
+            segments.append((seg, seg_start + 1))
     if not segments:
         return _char_chunks(text, chunk_chars, overlap_chars)
 
-    chunks, buf = [], ""
-    for seg in segments:
+    chunks, buf, buf_start = [], "", None
+    for seg, seg_start in segments:
         if len(seg) > chunk_chars:
             if buf:
-                chunks.append(buf)
-                buf = ""
-            chunks.extend(_char_chunks(seg, chunk_chars, overlap_chars))
+                chunks.append((buf, buf_start))
+                buf, buf_start = "", None
+            for sub_text, sub_line in _char_chunks(seg, chunk_chars, overlap_chars):
+                chunks.append((sub_text, seg_start + sub_line - 1))
             continue
         if buf and len(buf) + len(seg) > chunk_chars:
-            chunks.append(buf)
-            buf = seg
+            chunks.append((buf, buf_start))
+            buf, buf_start = seg, seg_start
         else:
+            if not buf:
+                buf_start = seg_start
             buf += seg
     if buf:
-        chunks.append(buf)
+        chunks.append((buf, buf_start))
     return chunks
 
 
@@ -700,9 +749,11 @@ def _filter_code_terms(terms: list) -> list:
 def _dedup_facts(existing_facts: list, new_facts: list, label: str = "fact") -> list:
     to_append = []
     for nf in new_facts:
+        nf_content = _strip_source_tag(nf)
         dup_of = None
         for ef in existing_facts:
-            ratio = _difflib.SequenceMatcher(None, nf.lower(), ef.lower()).ratio()
+            ratio = _difflib.SequenceMatcher(
+                None, nf_content.lower(), _strip_source_tag(ef).lower()).ratio()
             if ratio >= _UNIQUE_THRESHOLD:
                 dup_of = ef
                 break
@@ -731,7 +782,10 @@ def _think_code(chat, code_chunk: str) -> str:
 def _process_chunk(chat, project: str, chunk_text: str, bucket: str,
                    source_label: str, chunk_idx: int, total_chunks: int,
                    file_idx: int, total_files: int,
-                   redefine: bool, refact: bool, unique: bool) -> list:
+                   redefine: bool, refact: bool, unique: bool,
+                   source_path: str = None, start_line: int = None) -> list:
+    tag = _source_tag(source_path if source_path is not None else source_label,
+                       start_line if start_line is not None else chunk_idx)
     think_text = ""
     if bucket == "code":
         think_text = _think_code(chat, chunk_text)
@@ -758,7 +812,7 @@ def _process_chunk(chat, project: str, chunk_text: str, bucket: str,
         print(f"    term: {term_idx}/{total_terms}  {cand}  "
               f"chunk: {chunk_idx}/{total_chunks}  file: {file_idx}/{total_files}")
         is_new = kterm not in known
-        data = ({"term": kterm, "definitions": [], "facts": [], "links": []}
+        data = ({"term": kterm, "definitions": [], "facts": [], "links": [], "history": []}
                 if is_new else _read_term_file(project, kterm))
 
         # DEFINITION: never overwritten on an existing term (same append-only
@@ -768,6 +822,8 @@ def _process_chunk(chat, project: str, chunk_text: str, bucket: str,
         # a new candidate against existing ones instead of blindly appending.
         def_prompt = f"Term: {cand}\n\nText:\n{llm_input}"
         new_def = _extract_definition_marker(_llm(chat, _DEFINITION_SYSTEM, def_prompt))
+        if new_def:
+            new_def = new_def + tag
         if is_new or redefine:
             data["definitions"] = [new_def] if new_def else []
         elif new_def:
@@ -780,6 +836,7 @@ def _process_chunk(chat, project: str, chunk_text: str, bucket: str,
         facts_prompt = (f"Term: {cand}\nDefinition: {'; '.join(data['definitions'])}"
                         f"\n\nText:\n{llm_input}")
         new_facts = _extract_facts_marker(_llm(chat, _FACTS_SYSTEM, facts_prompt))
+        new_facts = [f + tag for f in new_facts]
 
         if is_new or refact:
             data["facts"] = new_facts
@@ -805,6 +862,8 @@ def _process_tabular(chat, project: str, fp: str, text: str, sample_rows: int = 
     facts = [l.lstrip("-*").strip() for l in raw.splitlines() if l.strip().startswith(("-", "*"))]
     if not facts:
         return
+    tag = _source_tag(fp, None)  # whole-file schema, not chunked — no line number
+    facts = [f + tag for f in facts]
     term = _os.path.splitext(_os.path.basename(fp))[0]
     kterm = _add_term(project, term)
     data = _read_term_file(project, kterm)
@@ -885,18 +944,19 @@ def _cmd_index(chat, rest: str) -> None:
 
             chunks = (_code_chunks(text, ext, chunk_chars, overlap_chars) if bucket == "code"
                       else _char_chunks(text, chunk_chars, overlap_chars))
-            chunks = [c for c in chunks if c.strip()]
+            chunks = [c for c in chunks if c[0].strip()]
             if not chunks:
                 continue
 
             total_chunks = len(chunks)
             print(f"\n[glossary] file: {file_idx}/{total_files}  {fp} — {bucket}, {total_chunks} chunk(s)")
-            for i, chunk in enumerate(chunks, 1):
+            for i, (chunk, start_line) in enumerate(chunks, 1):
                 print(f"  chunk: {i}/{total_chunks}  file: {file_idx}/{total_files}")
                 touched = _process_chunk(chat, project, chunk, bucket,
                                          _os.path.basename(fp), i, total_chunks,
                                          file_idx, total_files,
-                                         redefine, refact, unique)
+                                         redefine, refact, unique,
+                                         source_path=fp, start_line=start_line)
                 if touched:
                     print(f"    terms: {', '.join(touched)}")
                 total_touched.update(touched)
@@ -962,7 +1022,7 @@ def _cmd_find(chat, rest: str) -> None:
     results = []
     for term in _load_terms(project):
         data = _read_term_file(project, term)
-        body = "\n".join(data["definitions"] + data["facts"]).lower()
+        body = "\n".join(data["definitions"] + data["facts"] + data["history"]).lower()
         if any(w in body for w in words):
             snippet = (data["definitions"][0][:150] if data["definitions"]
                       else (data["facts"][0][:150] if data["facts"] else ""))

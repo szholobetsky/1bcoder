@@ -111,6 +111,27 @@ Compose examples:
   /flow deepagent_md compose plan1 out.md                      flat to custom filename
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ RESUME  — finish an interrupted run at its ORIGINAL maxdepth
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Usage:
+  /flow deepagent_md resume <plan_dir>
+
+The plain command (no subcommand) always creates a brand new planN via
+_make_plan_dir -- re-issuing the exact same command after a kill/crash does
+NOT continue the interrupted plan, it starts planN+1 from scratch. `resume`
+is the fix: reloads task/plan_labels/aspects/maxdepth from
+<plan_dir>/_deepagent_meta.yaml (saved on every run, before any generation
+happens) and re-enters the same index+expand logic. Every node already on
+disk is left untouched (same per-node skip-if-exists check the plain
+command already relies on internally) -- only what's missing gets
+generated. Unlike `continue`, does NOT require or accept a new plan: label
+and does NOT add depth -- it fills in the SAME maxdepth the interrupted run
+was already targeting.
+
+Resume example:
+  /flow deepagent_md resume plan3
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  CONTINUE  — expand one more labeled level onto an existing tree's leaves
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage:
@@ -156,7 +177,13 @@ Structure your response with 2-5 sections using this exact header format:
 ## 1. Section Title
 ## 2. Section Title
 
-Be specific and concrete. No preamble, no meta-commentary, no repetition of the title."""
+Be specific and concrete. No preamble, no meta-commentary, no repetition of the title.
+
+Every distinct concept (a data model, an entity, a component, a workflow state)
+must be fully defined in exactly ONE place across the whole document. If this
+section needs a concept that belongs to a different part of the document (e.g.
+an entity's fields, defined in a data-model section), reference it by name only
+-- do not restate, redefine, or re-list its fields, structure, or behavior here."""
 
 _PROMPT_WEB = """\
 Write a detailed markdown analysis of: "{title}"
@@ -165,6 +192,12 @@ This is part of a larger study on: "{root_task}"
 Use the web research below as your primary source. Reference specific facts.
 Structure with 2-5 sections using: ## 1. Section Title format.
 No preamble or meta-commentary.
+
+Every distinct concept (a data model, an entity, a component, a workflow state)
+must be fully defined in exactly ONE place across the whole document. If this
+section needs a concept that belongs to a different part of the document (e.g.
+an entity's fields, defined in a data-model section), reference it by name only
+-- do not restate, redefine, or re-list its fields, structure, or behavior here.
 
 {web_context}"""
 
@@ -622,7 +655,16 @@ def _on_interrupt(label: str) -> str:
     """Called when an LLM call is interrupted (Ctrl+C) or fails (empty reply /
     network error / timeout) -- chat._stream_chat collapses both to a falsy
     result (None for Ctrl+C, "" for everything else), so both get the same
-    retry choice. Returns 'retry:<hint>' (hint may be empty), 'skip', or 'quit'."""
+    retry choice. Returns 'retry:<hint>' (hint may be empty), 'skip', or 'quit'.
+
+    No interactive terminal (headless/scripted run, e.g. -p or a flow driven
+    programmatically with auto=True) -- stdin may be open but never written
+    to, which blocks on input() rather than raising EOFError. Check isatty()
+    up front and skip the node instead of prompting or hanging."""
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        print(f'\n  [{label}] interrupted/failed -- no interactive terminal, skipping')
+        return 'skip'
     try:
         ans = input(f'\n  [{label}] interrupted/failed — retry? [Y/n/q]: ').strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -1326,6 +1368,96 @@ def run(chat, args: str):
             _compose(plan_dir, out, ref_mode=ref_mode)
         return
 
+    if args.startswith("resume"):
+        # /flow deepagent_md resume <plan_dir>
+        #
+        # The plain (no-subcommand) path always calls _make_plan_dir(base),
+        # which creates the first NON-existing planN directory -- meaning a
+        # killed/interrupted run can never be resumed by just re-issuing the
+        # same command, it always starts a brand new planN+1 from scratch.
+        # `continue` doesn't cover this either -- it requires at least one
+        # NEW plan: label and always targets a depth beyond the current
+        # leaves, it can't just "finish this same maxdepth". `resume` is the
+        # missing piece: reload the original task/labels/aspects/maxdepth
+        # from _deepagent_meta.yaml (already saved on every run, even one
+        # that gets killed seconds later -- see _save_meta call below) and
+        # re-enter the exact same index-generate + expand loop the first run
+        # used. _expand()'s own "if file already exists: skip" check (used
+        # at every depth, not just top-level) does the rest: whatever was
+        # already written stays untouched, only what's missing gets filled
+        # in -- same principle deepagent_architect's --next/--loop resume
+        # and deepagent_spec's own per-file skip already rely on.
+        plan_name = rest = args[6:].strip()
+        if not plan_name:
+            print("usage: /flow deepagent_md resume <plan_dir>")
+            return
+        base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
+        plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
+        if not _os.path.isdir(plan_dir):
+            print(f"[deepagent_md] not found: {plan_dir}")
+            return
+
+        meta = _load_meta(plan_dir)
+        if meta is None:
+            print(f"[deepagent_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
+                  f"`resume` support (or the file was moved/deleted). Cannot resume "
+                  f"without the original task/plan_labels/maxdepth.")
+            return
+        task        = meta.get("task", "")
+        plan_labels = list(meta.get("plan_labels", []))
+        aspects     = list(meta.get("aspects", []))
+        cfg         = meta.get("cfg", {}) or {}
+        use_web     = meta.get("use_web", False)
+        maxdepth    = meta.get("maxdepth", _DEFAULT_MAXDEPTH)
+        if not task:
+            print(f"[deepagent_md] {_META_FILENAME} has no task recorded — cannot resume")
+            return
+
+        chat_ctx = _serialize_ctx(getattr(chat, "messages", []), 6)
+        max_parent_ctx = 500
+        stats = {"files": 0}
+        stopped_early = False
+
+        print(f"[deepagent_md] resume  : {plan_dir}")
+        print(f"[deepagent_md] maxdepth: {maxdepth}")
+
+        try:
+            index_path = _os.path.join(plan_dir, "index.md")
+            if _os.path.isfile(index_path):
+                print("[deepagent_md] index.md already exists — skipping")
+                index_content = open(index_path, encoding="utf-8").read()
+            else:
+                print(f"\n[gen] index: {task}")
+                index_content = _generate(chat, task, task, "", focus=plan_labels[0] if plan_labels else "",
+                                          aspects=aspects, chat_ctx=chat_ctx, label="index")
+                if not index_content:
+                    print("[deepagent_md] failed to generate index — stopping")
+                    return
+                with open(index_path, "w", encoding="utf-8") as f:
+                    f.write(f"# {task}\n\n{index_content}")
+                stats["files"] += 1
+                print(f"  -> index.md ({len(index_content)} chars)")
+
+            top = _parse_sections(index_content)
+            if not top:
+                print("[deepagent_md] no ## N. sections in index.md — check LLM output format")
+                return
+
+            print(f"\n[deepagent_md] {len(top)} top-level sections, resuming to depth {maxdepth}...")
+            for i, title in enumerate(top, 1):
+                _expand(chat, str(i), title, task, plan_dir,
+                        depth=1, max_depth=maxdepth, use_web=use_web,
+                        plan_labels=plan_labels, aspects=aspects, stats=stats,
+                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+        except _StopGeneration:
+            print("\n[deepagent_md] stopped by user — partial output saved")
+            stopped_early = True
+
+        print(f"\n[deepagent_md] resume done: {stats['files']} new file(s) generated in {plan_dir}"
+              + ("  (stopped early)" if stopped_early else ""))
+        print(f"[deepagent_md] to join: /flow deepagent_md compose {_os.path.basename(plan_dir)}")
+        return
+
     if args.startswith("continue"):
         rest = args[8:].strip()
         cm = _re.search(r'--ctx\s+(\d+)', rest)
@@ -1512,6 +1644,12 @@ def run(chat, args: str):
         max_parent_ctx = int(m.group(1))
         args = (args[:m.start()] + args[m.end():]).strip()
 
+    task_file = None
+    m = _re.search(r'--file\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))', args)
+    if m:
+        task_file = (m.group(1) or m.group(2) or m.group(3))
+        args = (args[:m.start()] + args[m.end():]).strip()
+
     profile_name = None
     m = _re.search(r'--profile\s+(\S+)', args)
     if m:
@@ -1556,10 +1694,22 @@ def run(chat, args: str):
                   else ['overview', 'analysis', 'implementation']
     aspects     = [l.strip() for l in list_m.group(1).split(',') if l.strip()] if list_m else []
     task = args[:anchor].strip().strip("\"'")
+
+    if task_file:
+        if not _os.path.isabs(task_file):
+            task_file = _os.path.join(_os.getcwd(), task_file)
+        if _os.path.isfile(task_file):
+            file_content = open(task_file, encoding="utf-8").read().strip()
+            task = (task + "\n\n" + file_content).strip() if task else file_content
+        else:
+            print(f"[deepagent_md] --file not found: {task_file}")
+            return
+
     if not task:
-        print("usage: /flow deepagent_md <task> [--web] [--maxdepth N]")
+        print("usage: /flow deepagent_md <task> [--web] [--maxdepth N] [--file task.txt]")
         print("       /flow deepagent_md compose <plan_dir> [output.md]")
         print('  e.g. /flow deepagent_md "heat equation as Cauchy problem in Java" --web --maxdepth 3')
+        print('  e.g. /flow deepagent_md --file task.txt --maxdepth 2')
         return
 
     base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")

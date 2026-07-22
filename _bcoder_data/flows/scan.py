@@ -42,6 +42,7 @@ Examples:
 """
 import os as _os
 import re as _re
+import sys as _sys
 
 _DEFAULT_EXTENSIONS = "txt,md,py,rst,js,ts,java,cpp,c,h,log,csv,json,yaml,yml,html,css"
 _DEFAULT_CHUNK   = 4000
@@ -111,7 +112,14 @@ def _on_ctrl_c(label: str) -> str:
     reply / network error / timeout) -- chat._stream_chat collapses both to a
     falsy result (None for Ctrl+C, "" for everything else), so both get the
     same retry choice. Returns 'retry:<hint>' (hint may be empty), 'skip', or
-    'quit'."""
+    'quit'.
+
+    No interactive terminal (headless/scripted run) -- stdin may be open but
+    never written to, which blocks on input() rather than raising EOFError.
+    Check isatty() up front and skip the chunk instead of prompting or hanging."""
+    if not _sys.stdin.isatty():
+        print(f"\n[scan] {label} interrupted/failed -- no interactive terminal, skipping")
+        return "skip"
     try:
         ans = input(f"\n[scan] {label} interrupted/failed — retry? [Y/n/q]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):

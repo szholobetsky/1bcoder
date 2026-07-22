@@ -1,0 +1,17 @@
+# Runs deepagent_architect --loop for an EXISTING plan -- processes the
+# ENTIRE open backlog from tasks.md automatically, one ticket at a time,
+# claiming each via .1bcoder/arch/<plan>/<id>/.claim so multiple concurrent
+# --loop processes (different machines/models) can safely divide the work
+# without duplicating it. Delegates leaf methods to deepagent_code as it
+# goes. Resumable: if killed mid-run, just run this again -- already-done
+# tickets are skipped (.done marker), already-decided levels within a
+# still-open ticket are skipped too (item_<id>.md already on disk).
+#
+# Required params:
+#   plan = the existing plan name (e.g. plan1)
+#
+# Usage:
+#   1bcoder --host openai://localhost:1234 --model qwen3-4b-instruct-2507 ^
+#       --scriptapply deepagent_loop.txt --param plan=plan1
+/param timeout 300
+/flow deepagent_architect {{plan}} --loop --lang py

@@ -5,6 +5,7 @@ Usage: /deepagent <task> plan: l1, l2, l3 [list: lens1, lens2] [file: output.md]
 """
 import os as _os
 import re as _re
+import sys as _sys
 
 
 # ── tree node ──────────────────────────────────────────────────────────────────
@@ -171,7 +172,14 @@ def _on_interrupt(leaf: '_Node', nodes: list, new_nodes: int) -> tuple[str, int]
     reply / network error / timeout) -- chat._stream_chat collapses both to a
     falsy result (None for Ctrl+C, "" for everything else), so both trigger
     the same retry choice. Returns (action, new_nodes) where action is
-    'retry:<hint>', 'skip', or 'quit'."""
+    'retry:<hint>', 'skip', or 'quit'.
+
+    No interactive terminal (headless/scripted run) -- stdin may be open but
+    never written to, which blocks on input() rather than raising EOFError.
+    Check isatty() up front and skip the node instead of prompting or hanging."""
+    if not _sys.stdin.isatty():
+        print(f'\n  [deepagent] {leaf.id} interrupted/failed -- no interactive terminal, skipping')
+        return 'skip', new_nodes
     try:
         ans = input(
             '\n  [deepagent] interrupted/failed — retry this node? [Y/n/q]  '

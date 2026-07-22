@@ -1,0 +1,20 @@
+# Runs deepagent_md -> deepagent_spec -> deepagent_task ONCE for one task
+# description, producing tasks.md with (usually many) backlog rows. Run this
+# once per plan. To turn a specific backlog row into actual code, use
+# deepagent_implement.txt afterward -- once per task_id you want to build.
+#
+# Required params:
+#   task = path to a .txt file with the task description (e.g. task.txt)
+#   plan = the plan name this deepagent_md run will produce (e.g. plan2 --
+#          check .1bcoder/planMD/ yourself first, deepagent_md auto-numbers
+#          and there's no way to know the next free number from in here)
+#
+# Usage:
+#   1bcoder --host openai://localhost:1234 --model qwen3-4b-instruct-2507 ^
+#       --scriptapply deepagent_plan.txt --param task=task.txt --param plan=plan2
+# NOTE: no blank line here -- a blank line counts as a step and gets routed
+# as an empty chat message (triggers a real, unwanted LLM call).
+/param timeout 300
+/flow deepagent_md --file {{task}} --maxdepth 2
+/flow deepagent_spec {{plan}}
+/flow deepagent_task {{plan}}
