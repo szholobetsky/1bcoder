@@ -861,6 +861,10 @@ Output capture operators (work with any command — LLM reply, tool, proc):
 /role <persona>             Set a system role prepended to every chat request (survives /ctx clear).
 /role show                  Show the current role.
 /role clear                 Remove the role.
+/role save <name>           Save the current role to .1bcoder/role/ (project-local, if
+                              .1bcoder/ already exists here) or ~/.1bcoder/role/ (global fallback).
+/role list                  Numbered list of saved roles — project-local first, then global.
+/role load <N|name>         Load a saved role by its /role list number or by name.
     Default role: "You are a software developer assistant."
     Note: words like "senior", "expert", "professor" push the model to rely on its own knowledge
     and skip cautious steps (read-before-edit, describe-before-change). Use them intentionally.
@@ -2475,6 +2479,10 @@ _CMD_SPEC = {
     "/switch":    dict(file_idx=None, kw_idx=1, keywords=["restore", "profile"]),
     "/rag":       dict(file_idx=None, kw_idx=1, keywords=["index", "search", "list", "add", "remove", "init", "ingest", "status"]),
     "/stats":     dict(file_idx=None, kw_idx=1, keywords=["reset", "save"]),
+    # /role also accepts freeform persona text as its argument (like /ask), not
+    # just these five subcommands — cutoff=0.6 in _fuzzy_fix keeps this from
+    # misfiring on ordinary persona openers ("You are…", "Act as…").
+    "/role":      dict(file_idx=None, kw_idx=1, keywords=["show", "clear", "save", "list", "load"]),
 }
 
 
@@ -3387,6 +3395,7 @@ class CoderCLI:
         self._proc_active: list[str] = []  # persistent procs (run after every reply)
         self._vars: dict = {}              # /var store — {{name}} placeholders
         self._role: str = "You are a software developer assistant."  # /role — system persona prepended to every chat request
+        self._role_list_cache: list = []   # [(name, (scope, path))] from last /role list, for /role load N
         self._last_proc_stdout: str = ""   # saved last proc output for /var set
         self._last_output: str = ""        # universal last output (LLM, tool, proc) — $ and -> capture
         self._last_tps: float | None = None     # TG speed from last _stream_chat call
@@ -7916,12 +7925,42 @@ Config stored in ~/.1bcoder/translate.json
 
     # ── /var ────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _role_kebab(name: str) -> str:
+        s = name.strip().lower()
+        s = re.sub(r'[^a-z0-9]+', '-', s)
+        return re.sub(r'-+', '-', s).strip('-')
+
+    @staticmethod
+    def _role_save_dir() -> str:
+        """Project-local `.1bcoder/role/` if this project is already 1bcoder-
+        initialized (never create `.1bcoder/` itself just to save a role),
+        else the global `~/.1bcoder/role/` fallback."""
+        proj_root = os.path.join(os.getcwd(), ".1bcoder")
+        if os.path.isdir(proj_root):
+            d = os.path.join(proj_root, "role")
+        else:
+            d = os.path.join(os.path.expanduser("~"), ".1bcoder", "role")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _role_search_dirs() -> list:
+        """[(scope, dir), ...] — project-local first (only if the project is
+        1bcoder-initialized), then global; /role list dedupes by this order."""
+        dirs = []
+        if os.path.isdir(os.path.join(os.getcwd(), ".1bcoder")):
+            dirs.append(("project", os.path.join(os.getcwd(), ".1bcoder", "role")))
+        dirs.append(("global", os.path.join(os.path.expanduser("~"), ".1bcoder", "role")))
+        return dirs
+
     def _cmd_role(self, user_input: str):
         parts = user_input.split(None, 1)
         sub   = parts[1].strip() if len(parts) > 1 else ""
 
         if not sub:
-            print("usage: /role <persona> | /role show | /role clear")
+            print("usage: /role <persona> | /role show | /role clear | "
+                  "/role save <name> | /role list | /role load <N|name>")
             return
 
         if sub == "show":
@@ -7934,6 +7973,68 @@ Config stored in ~/.1bcoder/translate.json
         if sub == "clear":
             self._role = ""
             _ok("[role] cleared")
+            return
+
+        verb, _, rest = sub.partition(" ")
+        rest = rest.strip()
+
+        if verb == "save" and rest:
+            if not self._role:
+                print("[role] nothing to save — set a role first: /role <persona>")
+                return
+            d = self._role_save_dir()
+            path = os.path.join(d, self._role_kebab(rest) + ".md")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self._role)
+            except OSError as e:
+                print(f"[role] cannot write: {e}")
+                return
+            _ok(f"[role] saved '{rest}' -> {path}")
+            return
+
+        if sub == "list":
+            seen: dict = {}
+            for scope, d in self._role_search_dirs():
+                if not os.path.isdir(d):
+                    continue
+                for fn in sorted(os.listdir(d)):
+                    if not fn.endswith(".md"):
+                        continue
+                    name = fn[:-3]
+                    if name not in seen:   # first hit wins — project-local before global
+                        seen[name] = (scope, os.path.join(d, fn))
+            self._role_list_cache = list(seen.items())
+            if not self._role_list_cache:
+                print("[role] no saved roles  (use /role save <name> first)")
+                return
+            for i, (name, (scope, _path)) in enumerate(self._role_list_cache, 1):
+                print(f"  {i}. {name}  [{scope}]")
+            return
+
+        if verb == "load" and rest:
+            target_path = None
+            if rest.isdigit() and getattr(self, "_role_list_cache", None):
+                idx = int(rest) - 1
+                if 0 <= idx < len(self._role_list_cache):
+                    _name, (_scope, target_path) = self._role_list_cache[idx]
+            if target_path is None:
+                kebab = self._role_kebab(rest)
+                for _scope, d in self._role_search_dirs():
+                    cand = os.path.join(d, kebab + ".md")
+                    if os.path.isfile(cand):
+                        target_path = cand
+                        break
+            if target_path is None:
+                print(f"[role] not found: {rest}  (try /role list)")
+                return
+            try:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    self._role = f.read()
+            except OSError as e:
+                print(f"[role] cannot read: {e}")
+                return
+            _ok(f"[role] loaded '{rest}'")
             return
 
         self._role = sub
