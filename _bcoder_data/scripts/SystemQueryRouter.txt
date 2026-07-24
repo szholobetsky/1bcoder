@@ -1,0 +1,17 @@
+# Route a request: skip it early if off-topic, retry the rephrase until it
+# yields more than one keyword. Demonstrates both GATE patterns together:
+#   GATE ... > :EXIT   a label BELOW the GATE line — plain skip/branch
+#   GATE ... > :LOOP   a label ABOVE the GATE line — loop while it keeps failing
+# Usage: /script run SystemQueryRouter.txt query="how do I reset the admin password?"
+#
+# Both gates use pattern-gate (regex against the reply via stdin), not expr_gate
+# (Python eval): splicing freeform LLM text into an eval'd expression breaks on
+# the first stray quote/colon/space. expr_gate is for clean numeric/token values
+# ({{count}}, {{i}}), not prose — pattern-gate has no such risk.
+check if this request relates to the system's operation and if so restate it formally naming the correct module names, otherwise reply with exactly one word WRONG: {{query}} -> query
+GATE: pattern-gate('^WRONG$', 'query is off-topic') > :EXIT
+:LOOP
+rephrase {{query}} in English as a comma-separated list of keywords, nothing else -> keywords
+GATE: pattern-gate('^\S+$', 'need more than one keyword') > :LOOP
+answer {{query}} using these keywords: {{keywords}}
+:EXIT

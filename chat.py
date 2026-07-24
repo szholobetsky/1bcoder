@@ -334,6 +334,25 @@ class _Tee:
         sys.stdout = self._orig
 
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _strip_ui_separators(text: str) -> str:
+    """Drop 1bcoder's own decorative `_sep()` lines (e.g. `─── AI ──────────`)
+    from text captured via `-> var`/_Tee — those are terminal chrome printed
+    around a reply, not part of the reply/output itself. `_sep()` lines are
+    always heavy in the `─` box-drawing char (~20-40 of them per line), which
+    real command/LLM output essentially never produces, so a simple threshold
+    is robust across all of `_sep()`'s call sites without needing to touch each one."""
+    kept = []
+    for line in text.split("\n"):
+        plain = _ANSI_RE.sub("", line)
+        if plain.count("─") >= 15:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _cdiff(line: str) -> str:
     """Colorize a single unified-diff or map-diff line for terminal display."""
     if line.startswith(("--- ", "+++ ")):
@@ -664,8 +683,22 @@ Commands
 
 /script list              List all scripts (* = current). Shows global scripts (g:) and project scripts.
 /script open              Select and load a script (type number). Includes global and project scripts.
-    Script format: one command per line. Lines starting with [v] are done (skipped).
-                 Lines starting with # are comments (skipped).
+    Script format: one command per line. Lines starting with # are comments (skipped).
+    :LABEL                          A label — a bare line, referenced by GATE: as a jump target.
+                                    Can be defined above or below the GATE: line that jumps to it.
+    GATE: <proc>('arg', ...) > :LABEL
+                                    Conditional jump-if-false: runs <proc> (from _bcoder_data/proc/
+                                    or ~/.1bcoder/proc/), same PASS/FAIL: convention as /proc gate.
+                                    PASS (proc prints nothing) → continue to the next line.
+                                    FAIL (a "FAIL: ..." line) → jump to :LABEL.
+                                    A :LABEL above the GATE: line makes it a loop; below, a plain
+                                    skip/branch. A missing proc, timeout, or crash stops the script
+                                    with an error — it is never silently treated as PASS.
+    #POS:N                          Resume pointer, auto-managed as the first line of the file —
+                                    not meant to be hand-edited. Lets an interrupted (q) apply pick
+                                    up from the same line later, even after restarting 1bcoder.
+                                    Cleared automatically once a run reaches the end of the script.
+                                    /script run always starts fresh regardless of a saved #POS.
 /script create [path]          Create a new empty script.
 /script create ctx [path]      Create script from this session's command history.
     Records all /read /edit /fix /patch /run /save /bkup /map /model /host commands typed so far.
@@ -674,21 +707,31 @@ Commands
           /script create fix-bug.txt
           /script create ctx
           /script create ctx my-workflow.txt
-/script show [N]          Display steps of the current script. If N given, open script N from list first.
-/script add <command>     Append a step to the current script.
+/script show [N]          Display lines of the current script, ">" marks the current #POS. If N
+                           given, open script N from list first.
+/script add <command>     Append a line to the current script.
     e.g.  /script add /fix main.py 2-2 fix indentation
 /script clear             Wipe current script completely.
-/script reset             Unmark all done steps.
-/script reapply [key=value ...]   Reset all done steps then apply the plan automatically.
+/script reset             Clear the saved #POS (start over from the top next run).
+/script reapply [key=value ...]   Clear #POS then apply the script automatically.
 /script refresh           Reload script from disk and show contents.
-/script run <file> [key=value ...]        Run all steps automatically (shorthand for apply -y).
-/script apply [file] [key=value ...]     Run steps one by one (Y/n/q per step).
-/script apply -y [file] [key=value ...]  Run all pending steps automatically.
-    Parameters substitute {{key}} placeholders in script steps.
-    Missing parameters are prompted interactively.
+/script run <file> [key=value ...]        Run all lines automatically (shorthand for apply -y,
+                                          ignores any saved #POS — always starts fresh).
+/script apply [file] [key=value ...]     Run lines one by one (Y/n/q per step, GATE: lines run
+                                         unconditionally — resumes from #POS if present).
+/script apply -y [file] [key=value ...]  Run all lines automatically (resumes from #POS if present).
+    Parameters substitute {{key}} placeholders in script lines, including inside GATE:(...) args.
+    Missing parameters are prompted interactively. A runaway GATE: loop stops after 1000 steps.
     e.g.  /script run simargl-find.txt query="add author field" mode=file
           /script apply -y collect.txt
           /script apply fix-fn.txt file=calc.py range=1-4
+          GATE: expr_gate('int({{i}}) <= 0') > :LOOP
+          GATE: pattern-gate('select \*', 'use explicit columns') > :FIX_QUERY
+    Note: expr_gate is for clean numbers/tokens only — {{var}} substitutes as raw text with no
+    quoting, so splicing freeform LLM text into an eval'd expression breaks on the reply's own
+    spaces/quotes/colons and always FAILs regardless of content. For any check on freeform text,
+    use pattern-gate (matches a regex against the reply via stdin, not eval — no such risk).
+    See _bcoder_data/scripts/SystemQueryRouter.txt for a full example using both GATE shapes.
 
 /prompt save <name>   Save the last user message as a reusable prompt template.
                       Name becomes the filename (no spaces, .txt added automatically).
@@ -1983,6 +2026,86 @@ def _save_script(lines, path):
         return
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+
+
+# ── /script control flow: labels, GATE:, #POS resume pointer ──────────────────
+# Replaces the old per-line [v] "done forever" markers, which are incompatible
+# with loops (a loop body must be allowed to re-execute). #POS is a single
+# resume-pointer line instead — same "interrupt, /model swap, resume" workflow,
+# but loop-safe since it just means "next line to run", not "never run again".
+
+_LABEL_RE = re.compile(r'^:(\w+)$')
+_GATE_RE  = re.compile(r'^GATE:\s*([\w-]+)\((.*)\)\s*>\s*:(\w+)\s*$')
+_POS_RE   = re.compile(r'^#POS:(\d+)\s*$')
+
+
+def _content_lines(lines: list) -> list:
+    """Strip a leading #POS:N header line, if present. pc always indexes into
+    this content-only list, independent of whether #POS is present, so line
+    numbers don't shift depending on run history."""
+    if lines and _POS_RE.match(lines[0].rstrip("\n")):
+        return lines[1:]
+    return lines
+
+
+def _load_pos(lines: list) -> int:
+    """Read the resume pointer from a script's raw lines; 0 if absent."""
+    if lines:
+        m = _POS_RE.match(lines[0].rstrip("\n"))
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def _save_pos(content_lines: list, pc: int, path: str) -> None:
+    """Persist content_lines back to path with a fresh #POS:{pc} header."""
+    _save_script([f"#POS:{pc}\n"] + content_lines, path)
+
+
+def _clear_pos(lines: list, path: str) -> None:
+    """Strip any #POS header — script finished a full pass, ready to reuse
+    (same intent as the old auto-reset-after-completion behavior)."""
+    _save_script(_content_lines(lines), path)
+
+
+def _build_label_map(content_lines: list) -> dict:
+    """One pass over a script's content lines -> {label_name: line_index}.
+    Labels may be referenced both forward and backward in the same script."""
+    label_map = {}
+    for i, raw in enumerate(content_lines):
+        m = _LABEL_RE.match(raw.rstrip("\n").strip())
+        if m:
+            label_map[m.group(1)] = i
+    return label_map
+
+
+def _split_gate_args(raw: str) -> list:
+    """Quote-aware comma-split for a GATE(...) argument list — a comma inside
+    a quoted argument does not split it, e.g. "'{{a}} in [1,2,3]'" stays one
+    argument, not three. Each argument's outer matching quotes are stripped."""
+    args, buf, quote = [], "", None
+    for ch in raw:
+        if quote:
+            buf += ch
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            buf += ch
+        elif ch == ",":
+            args.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        args.append(buf.strip())
+    cleaned = []
+    for a in args:
+        if len(a) >= 2 and a[0] == a[-1] and a[0] in ("'", '"'):
+            cleaned.append(a[1:-1])
+        else:
+            cleaned.append(a)
+    return cleaned
 
 
 def _apply_params(cmd_str: str, params: dict) -> str:
@@ -3847,7 +3970,7 @@ class CoderCLI:
         if capture_var:
             with _Tee() as tee:
                 self._route(user_input, auto=auto)
-            captured = tee.getvalue().strip()
+            captured = _strip_ui_separators(tee.getvalue()).strip()
             self._last_output = captured
             self._vars[capture_var] = captured
             _ok(f"[var] {capture_var} captured ({len(captured)} chars)")
@@ -6423,17 +6546,22 @@ advanced_tools =
                     return
             if not _need_script():
                 return
-            lines = _load_script(self._script_file)
-            if not lines:
+            raw_lines = _load_script(self._script_file)
+            if not raw_lines:
                 print("[script is empty]")
                 return
-            for i, line in enumerate(lines, 1):
+            pos = _load_pos(raw_lines)
+            content = _content_lines(raw_lines)
+            if not content:
+                print("[script is empty]")
+                return
+            for i, line in enumerate(content):
                 line = line.rstrip("\n")
                 if line.strip().startswith("#"):
                     print(f"       {_DIM}{line}{_R}")
                 else:
-                    tick = "v " if line.startswith("[v]") else ". "
-                    print(f"  {i:2}. {tick}{line.replace('[v] ', '', 1)}")
+                    marker = "> " if i == pos else ". "
+                    print(f"  {i + 1:2}. {marker}{line}")
 
         elif sub == "add":
             if not _need_script():
@@ -6455,38 +6583,38 @@ advanced_tools =
             if not _need_script():
                 return
             lines = _load_script(self._script_file)
-            new_lines = [l[4:] if l.startswith("[v] ") else l for l in lines]
-            _save_script(new_lines, self._script_file)
-            n_steps = sum(1 for l in new_lines if not l.strip().startswith("#"))
-            print(f"script reset — {n_steps} step(s) unmarked")
+            _clear_pos(lines, self._script_file)
+            n_steps = sum(1 for l in _content_lines(lines) if not l.strip().startswith("#"))
+            print(f"script reset — {n_steps} line(s), #POS cleared")
 
         elif sub == "reapply":
             if not _need_script():
                 return
             lines = _load_script(self._script_file)
-            new_lines = [l[4:] if l.startswith("[v] ") else l for l in lines]
-            _save_script(new_lines, self._script_file)
-            n_steps = sum(1 for l in new_lines if not l.strip().startswith("#"))
-            print(f"script reset — {n_steps} step(s) unmarked, applying...")
+            _clear_pos(lines, self._script_file)
+            n_steps = sum(1 for l in _content_lines(lines) if not l.strip().startswith("#"))
+            print(f"script reset — {n_steps} line(s), #POS cleared, applying...")
             self._cmd_script(f"/script apply -y {rest}")
 
         elif sub == "refresh":
             if not _need_script():
                 return
-            lines = _load_script(self._script_file)
-            n_steps = sum(1 for l in lines if not l.strip().startswith("#"))
-            print(f"script: {n_steps} step(s)")
-            for i, line in enumerate(lines, 1):
+            raw_lines = _load_script(self._script_file)
+            pos = _load_pos(raw_lines)
+            content = _content_lines(raw_lines)
+            n_steps = sum(1 for l in content if not l.strip().startswith("#"))
+            print(f"script: {n_steps} line(s)")
+            for i, line in enumerate(content):
                 line = line.rstrip("\n")
                 if line.strip().startswith("#"):
                     print(f"       {_DIM}{line}{_R}")
                 else:
-                    tick = "v " if line.startswith("[v]") else ". "
-                    print(f"  {i:2}. {tick}{line.replace('[v] ', '', 1)}")
+                    marker = "> " if i == pos else ". "
+                    print(f"  {i + 1:2}. {marker}{line}")
 
         elif sub == "run":
-            # /script run <file|N> [key=value ...] — shorthand for /script apply -y
-            # N can be a list index matching /script list / /script open / /script show
+            # /script run <file|N> [key=value ...] — shorthand for /script apply -y,
+            # always starts at pc=0 regardless of any saved #POS (fresh run each time)
             auto_yes, filename, params = _parse_script_apply_args("-y " + rest if rest else "-y")
             if not filename:
                 print("usage: /script run <file> [key=value ...]")
@@ -6526,33 +6654,89 @@ advanced_tools =
                 self._script_file = path
             elif not _need_script():
                 return
-            if locals().get("_script_run_reset"):
-                _raw = _load_script(self._script_file)
-                _save_script([l[4:] if l.startswith("[v] ") else l for l in _raw], self._script_file)
-            lines = _load_script(self._script_file)
-            pending = [(i, l.rstrip("\n")) for i, l in enumerate(lines)
-                       if not l.startswith("[v]") and l.strip() and not l.strip().startswith("#")]
-            if not pending:
+
+            raw_lines = _load_script(self._script_file)
+            content   = _content_lines(raw_lines)
+            if not content:
                 print("nothing to apply")
                 return
-            # merge session vars as defaults; explicit params take priority
-            params = {**self._vars, **params}
-            for key in _find_template_keys(pending):
-                if not params.get(key):   # missing or NaN sentinel (empty string)
+            label_map = _build_label_map(content)
+
+            pc = 0 if locals().get("_script_run_reset") else _load_pos(raw_lines)
+            if pc >= len(content):
+                pc = 0   # stale/completed position — start over
+
+            # key=value args seed self._vars ONCE, here — not re-merged on top
+            # of it on every step. A script step's own -> var capture or /var
+            # set must be able to permanently overwrite a key that was also
+            # passed as an explicit arg (e.g. a script invoked with query=...
+            # that later does "..." -> query to hold a reformulated value);
+            # re-merging explicit params on every step would silently and
+            # permanently shadow that capture for the rest of the run.
+            self._vars.update(params)
+
+            # prompt for any missing {{key}} up front, scanning the whole script
+            # (not just a "pending" subset — [v]-filtering no longer exists).
+            steps_for_keys = [(i, l.rstrip("\n")) for i, l in enumerate(content)
+                               if l.strip() and not l.strip().startswith("#")]
+            for key in _find_template_keys(steps_for_keys):
+                if not self._vars.get(key):   # missing or NaN sentinel
                     value = self._prompt_input(f"  {key} = ? ")
                     if value:
-                        params[key] = value
                         self._vars[key] = value   # persist into session vars
+
             suffix = "— auto-applying all" if auto_yes else "— Y/n/q per step"
-            print(f"script: {len(pending)} step(s) {suffix}")
+            print(f"script: {len(content)} line(s) {suffix}")
             original_confirm = self._confirm
             if auto_yes:
                 self._confirm = lambda prompt, **kw: True
                 self._auto_apply = True
+
+            MAX_STEPS = 1000   # loop-safety cap — a runaway GATE loop stops here
+            executed  = 0
             try:
-                for step_num, (idx, cmd_str) in enumerate(pending, 1):
-                    cmd_str = _apply_params(cmd_str, params)
-                    self._sep(f"Step {step_num}/{len(pending)}")
+                while pc < len(content):
+                    raw      = content[pc].rstrip("\n")
+                    stripped = raw.strip()
+
+                    if not stripped or stripped.startswith("#"):
+                        pc += 1
+                        continue
+
+                    if _LABEL_RE.match(stripped):
+                        pc += 1
+                        continue
+
+                    executed += 1
+                    if executed > MAX_STEPS:
+                        _warn(f"[script] exceeded {MAX_STEPS} steps — possible infinite loop, stopped")
+                        return
+
+                    gate_m = _GATE_RE.match(_apply_params(stripped, self._vars))
+                    if gate_m:
+                        gate_name, raw_args, target = gate_m.groups()
+                        if target not in label_map:
+                            _err(f"[script] GATE target label not found: :{target}")
+                            return
+                        args = _split_gate_args(raw_args)
+                        invocation = gate_name + " " + " ".join(shlex.quote(a) for a in args)
+                        self._sep(f"GATE [{executed}] line {pc + 1}: {gate_name}")
+                        result = self._run_gate_strict(invocation)
+                        if result is None:
+                            _err(f"[script] gate infra error — stopped at line {pc + 1}")
+                            return
+                        if "FAIL:" in result:
+                            for fline in result.splitlines():
+                                if fline.startswith("FAIL:"):
+                                    print(f"  {_YELL}{fline}{_R}")
+                            pc = label_map[target]
+                        else:
+                            pc += 1
+                        _save_pos(content, pc, self._script_file)
+                        continue
+
+                    cmd_str = _apply_params(raw, self._vars)
+                    self._sep(f"Step [{executed}] line {pc + 1}")
                     print(cmd_str)
                     if not auto_yes:
                         ans = self._prompt_input("  run? [Y/n/q]:")
@@ -6561,20 +6745,17 @@ advanced_tools =
                             return
                         if ans.lower() not in ("", "y", "yes"):
                             print("[skipped]")
+                            pc += 1
+                            _save_pos(content, pc, self._script_file)
                             continue
-                    # mark done
-                    plan_lines = _load_script(self._script_file)
-                    plan_lines[idx] = f"[v] {plan_lines[idx]}"
-                    _save_script(plan_lines, self._script_file)
                     self._route(cmd_str, auto=True)
+                    pc += 1
+                    _save_pos(content, pc, self._script_file)
             finally:
                 self._confirm = original_confirm
                 self._auto_apply = False
             print("script complete")
-            # auto-reset: remove [v] markers so script is ready to reuse
-            _done = _load_script(self._script_file)
-            _reset = [l[4:] if l.startswith("[v] ") else l for l in _done]
-            _save_script(_reset, self._script_file)
+            _clear_pos(_load_script(self._script_file), self._script_file)
 
         else:
             print("usage: /script list | open [N] | create | show [N] | run <file> | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
@@ -6880,6 +7061,68 @@ advanced_tools =
                 print("[proc] injected")
 
         return stdout
+
+    def _run_gate_strict(self, name_and_args: str) -> str | None:
+        """Like _run_proc, but for /script GATE: lines — distinguishes a real
+        PASS (silent output) from an infra failure (proc not found / timeout /
+        crashed / non-zero exit). _run_proc's plain "" return conflates these
+        two cases (chat.py's own agent-loop gates already have this same latent
+        ambiguity); GATE: cannot afford to silently treat an infra failure as
+        a passing condition, so this never runs through the interactive
+        /proc run path (which also blocks on a real terminal prompt) and never
+        returns "" to mean anything other than "ran fine, printed nothing".
+
+        Returns None on infra failure (caller must stop the script — never
+        treat this as PASS); otherwise the captured stdout text (may be empty
+        on a genuine pass, or contain FAIL: lines on a genuine gate failure).
+        """
+        try:
+            parts = shlex.split(name_and_args)
+        except ValueError:
+            parts = name_and_args.split()
+        if not parts:
+            return None
+        name_only  = parts[0]
+        extra_args = parts[1:]
+        fname = name_only if name_only.endswith(".py") else name_only + ".py"
+        path = None
+        for d in (LOCAL_PROC_DIR, PROC_DIR):
+            p = os.path.join(d, fname)
+            if os.path.isfile(p):
+                path = p
+                break
+        if not path:
+            print(f"{_RED}[gate] proc not found: {fname}{_R}")
+            return None
+
+        proc_env = dict(os.environ)
+        proc_env["BCODER_WORKDIR"] = WORKDIR
+        try:
+            result = subprocess.run(
+                [sys.executable, path] + extra_args,
+                input=self.last_reply or "",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                env=proc_env,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"{_RED}[gate] timeout: {name_and_args}{_R}")
+            return None
+        except Exception as e:
+            print(f"{_RED}[gate] error running {name_and_args}: {e}{_R}")
+            return None
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            print(f"{_RED}[gate] {name_and_args} exited {result.returncode}{_R}")
+            if stderr:
+                print(f"  {_DIM}{stderr}{_R}")
+            return None
+
+        return (result.stdout or "").strip()
 
     # ── /translate ──────────────────────────────────────────────────────────
 
@@ -11617,11 +11860,10 @@ def main():
             if key:
                 params[key.strip()] = value.strip()
         cli = CoderCLI(base_url, model, models, provider)
-        # reset script — remove [v] markers so every headless run starts fresh
+        # reset script — clear any #POS so every headless run starts fresh
         lines = _load_script(script)
-        reset = [re.sub(r'^\[v\]\s*', '', l) for l in lines]
-        if reset != lines:
-            _save_script(reset, script)
+        if lines and _POS_RE.match(lines[0].rstrip("\n")):
+            _clear_pos(lines, script)
         param_tokens = " ".join(f"{k}={v}" for k, v in params.items())
         script_fwd = script.replace("\\", "/")   # shlex.split strips backslashes on Windows
         cli._cmd_script(f"/script apply -y {script_fwd} {param_tokens}".strip())

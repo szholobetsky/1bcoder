@@ -1,0 +1,9 @@
+# Ask the model for a SELECT query; if the reply still contains SELECT *,
+# retry the SAME instruction until it names explicit columns. The label sits
+# directly above the step it guards, so one line serves both the first
+# attempt and every retry — no separate "ask" vs "fix" step needed.
+# Usage: /script run SqlSelectGate.txt table=users need="id and name of active users"
+:FIX_QUERY
+write a SQL SELECT query for the {{table}} table returning {{need}}. Always name explicit columns, never use SELECT *. Output only the SQL, no explanation.
+GATE: pattern-gate('select \*', 'use explicit columns') > :FIX_QUERY
+query is ready to run

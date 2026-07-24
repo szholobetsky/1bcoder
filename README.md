@@ -959,7 +959,8 @@ Aliases are loaded at startup from the global `aliases.txt` then the project-loc
 ### Scripts
 
 Scripts are `.txt` files containing one command per line, stored in `.1bcoder/scripts/`.
-Lines starting with `[v]` are already done and skipped. Lines starting with `#` are comments and skipped.
+Lines starting with `#` are comments and skipped. Scripts can branch and loop using labels
+and `GATE:` — see [Labels, branching, and loops](#labels-branching-and-loops-label-gate) below.
 
 | Command | Description |
 |---|---|
@@ -968,15 +969,15 @@ Lines starting with `[v]` are already done and skipped. Lines starting with `#` 
 | `/script open <N>` | Load script by number directly — shows the list but skips the prompt |
 | `/script create [path]` | Create a new empty script |
 | `/script create ctx [path]` | **Create script from this session's command history** |
-| `/script show` | Display steps of the current script |
-| `/script add <command>` | Append a step to the current script |
+| `/script show` | Display lines of the current script; `>` marks the current resume position |
+| `/script add <command>` | Append a line to the current script |
 | `/script clear` | Wipe current script completely |
-| `/script reset` | Unmark all done steps (also happens automatically when a script runs to completion) |
-| `/script reapply [key=value ...]` | Reset all done steps then apply automatically; prompts for any NaN `{{variables}}` before running |
+| `/script reset` | Clear the saved resume position (start over from the top next run) |
+| `/script reapply [key=value ...]` | Clear the resume position then apply automatically; prompts for any NaN `{{variables}}` before running |
 | `/script refresh` | Reload script from disk and show contents |
-| `/script run <file> [key=value ...]` | **Run all steps automatically** — shorthand for `apply -y` |
-| `/script apply [file] [key=value ...]` | Run steps one by one (Y/n/q per step) |
-| `/script apply -y [file] [key=value ...]` | Run all pending steps automatically |
+| `/script run <file> [key=value ...]` | **Run all lines automatically** — shorthand for `apply -y`; always starts fresh, ignoring any saved resume position |
+| `/script apply [file] [key=value ...]` | Run lines one by one (Y/n/q per step); resumes from the last position if the script was interrupted |
+| `/script apply -y [file] [key=value ...]` | Run all lines automatically; resumes from the last position if present |
 
 **`/script create ctx`** captures all work commands typed this session (`/read`, `/edit`, `/fim`, `/fix`, `/patch`, `/run`, `/save`, `/bkup`, `/map`, `/model`, `/host`) into a ready-to-run plan:
 
@@ -1009,6 +1010,61 @@ Run a script non-interactively from the command line:
 ```bash
 1bcoder --model llama3.2:1b --scriptapply my-fixes.txt --param file=calc.py
 ```
+
+#### Labels, branching, and loops (`:LABEL`, `GATE:`)
+
+A script isn't limited to a straight top-to-bottom list — a label plus one conditional-jump
+instruction gives it branching and loops, no Python required for the common case:
+
+- **`:LABEL`** — a bare line marking a jump target. Can be defined above or below the `GATE:`
+  line that jumps to it.
+- **`GATE: <proc>('arg', ...) > :LABEL`** — runs `<proc>` (any file in `_bcoder_data/proc/` or
+  `~/.1bcoder/proc/`), reusing the same `FAIL: reason` / silent-pass convention as `/proc gate on`.
+  Proc **passes** (prints nothing) → continue to the next line. Proc **fails** (prints a `FAIL:`
+  line) → jump to `:LABEL`. A label placed **above** the `GATE:` line turns it into a loop (keeps
+  jumping back while the condition keeps failing); a label placed **below** makes it a plain
+  skip/branch. A proc that can't be found, times out, or crashes stops the script with a clear
+  error — it is never silently treated as a pass. A runaway loop stops automatically after 1000 steps.
+
+`{{key}}` placeholders are substituted before `GATE:` is evaluated, including inside the
+parentheses, so a gate can check the live value of any session variable or `-> var` capture.
+
+**`expr_gate` is for clean numeric/token values, not prose.** It's a built-in gate that evaluates
+a Python boolean expression against `{{vars}}` — `int`, `float`, `len`, `set`, `sorted`, and a few
+other safe builtins are available; no imports or file access. `{{var}}` substitution is a plain
+text splice with no quoting, so `expr_gate('int({{i}}) <= 0')` is safe (a number is valid Python
+wherever it lands), but splicing a freeform LLM reply into an eval'd expression — e.g.
+`expr_gate('{{reply}} != "WRONG"')` — breaks on the reply's own spaces/colons/quotes and always
+evaluates as an expression error (`FAIL`), regardless of what the reply actually said. For any
+check on freeform text, use `pattern-gate` instead — it matches a regex against the reply via
+stdin, not `eval()`, so arbitrary text is safe:
+
+```
+GATE: pattern-gate('select \*', 'use explicit columns') > :FIX_QUERY
+```
+
+A loop needs something that changes each pass — since scripts don't have arithmetic assignment,
+counting/state lives in a small proc instead (reading and writing its own counter file, or
+inspecting `{{var}}`/the last reply). For example, a proc that decrements a counter and prints
+`FAIL:` until it reaches zero:
+
+```
+:LOOP
+GATE: countdown_gate() > :LOOP
+final step after the loop exits
+```
+
+`_bcoder_data/scripts/SystemQueryRouter.txt` is a complete, runnable example combining both
+`GATE:` shapes — a plain skip (`> :EXIT`, label below) that routes off-topic requests around the
+rest of the script, and a loop (`> :LOOP`, label above) that keeps rephrasing until it gets more
+than one keyword — using `pattern-gate` throughout for exactly the reason above.
+
+**Resuming an interrupted script**: the current line is tracked with a `#POS:N` header line,
+written automatically to the top of the script file after every step (not meant to be
+hand-edited). Interrupt an `/script apply` with `q`, do something else (switch `/model`, check
+`/var get`), then run `/script apply` on the same file again — it picks up from the same line,
+even after restarting 1bcoder. `/script run` always ignores any saved `#POS` and starts fresh.
+`#POS` is cleared automatically once a run reaches the end of the script.
 
 ---
 
