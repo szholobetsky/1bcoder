@@ -1,1 +1,1 @@
-[v] /read example/calc.py 2-2
+/read example/calc.py 2-2

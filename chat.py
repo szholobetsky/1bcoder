@@ -1318,7 +1318,7 @@ Note: /switch always keeps the conversation context (-sc).
     file: path to a .md/.txt file — steps extracted from numbered/bulleted list or === sections.
           For .md: numbered/bulleted items → steps; === separator → one step per section.
                    ### Example/Summary → injected as context before step 1.
-          For .txt: each non-comment, non-[v] line → one step.
+          For .txt: each non-comment, non-label, non-gate line → one step.
           If a turn returns empty or no ACTION, the agent continues to the next step.
           Gate FAIL on a plan step retries that step (re-injects hint, removes old one).
     e.g.  /agent find and fix the divide by zero bug in calc.py
@@ -2172,7 +2172,9 @@ def _load_agent_script_file(path: str):
     """Parse .md or .txt file into (steps, context_text) for /agent plan <file>.
 
     === markers (alone on a line): text between consecutive === → one step each.
-    .txt: each non-empty, non-comment, non-[v] line → one step; no context.
+    .txt: each non-empty, non-comment, non-label, non-gate line → one step; no context.
+          A leading #POS header and any :LABEL / GATE: lines are stripped first —
+          agent plans don't support script branching, so those lines carry no step.
     .md:  numbered/bulleted list items → steps;
           ### Example / ### Summary sections (and other non-list ## headings) → context_text.
 
@@ -2197,9 +2199,10 @@ def _load_agent_script_file(path: str):
 
     if ext == ".txt":
         steps = []
-        for line in raw.splitlines():
+        for line in _content_lines(raw.splitlines()):
             line = line.rstrip()
-            if not line or line.strip().startswith("#") or line.startswith("[v]"):
+            stripped = line.strip()
+            if not line or stripped.startswith("#") or _LABEL_RE.match(stripped) or _GATE_RE.match(stripped):
                 continue
             steps.append(line)
         return steps, ""
@@ -6119,13 +6122,16 @@ advanced_tools =
             return True
 
         # ── .txt script: original behaviour ───────────────────────────────────
+        # Hooks don't support branching — any #POS header is stripped and any
+        # :LABEL / GATE: line is skipped rather than routed as a literal command.
         saved_vars = dict(self._vars)
         self._vars.update({k: v for k, v in args.items() if v})
         try:
-            lines = _load_script(script_path)
+            lines = _content_lines(_load_script(script_path))
             for line in lines:
                 line = line.rstrip("\n")
-                if not line or line.strip().startswith("#") or line.startswith("[v]"):
+                stripped = line.strip()
+                if not line or stripped.startswith("#") or _LABEL_RE.match(stripped) or _GATE_RE.match(stripped):
                     continue
                 self._route(_apply_params(line, self._vars), auto=True)
         finally:
