@@ -76,6 +76,21 @@ comma-separated list of level names to force out regardless of research
 evidence (only "abstract" is meaningful to skip in practice -- interface/
 approach/class are not optional in v1).
 
+--noposition: disable the "Ticket <key> pipeline: interface->abstract->
+approach->class. So far: interface="X", ... You are now at: <level> (step N
+of M)" breadcrumb normally added to every research question and design
+decision. Without it, each level only ever sees the previous level's raw
+decision text as an isolated "Task/need" -- no explicit sense of how many
+design stages exist, which already ran, or whether this is the last one (the
+same missing-positional-awareness gap deepagent_md/deepagent_tree had; see
+DEEPAGENT_SPEC.md). On by default.
+
+--finalize ["<text>"]: opt-in. At the LAST active level in the pipeline
+(normally "class", or whichever level --skip leaves as the final one),
+append a universal "this is the last design step before deepagent_code"
+instruction, plus <text> as well if given (never replaces the universal
+one). Off by default.
+
 --next / --loop: pick the next open (not "[x]") row from tasks.md instead of
 a caller-supplied task_id. Before starting work on a ticket, it is claimed
 by atomically creating .1bcoder/arch/<plan>/<id>/.claim (os.O_EXCL -- fails
@@ -117,6 +132,7 @@ def _load(name: str, filename: str):
 _dspec = _load("_dspec", "deepagent_spec.py")
 _dcode = _load("_dcode", "deepagent_code.py")
 _dtask = _load("_dtask", "deepagent_task.py")
+_dmd   = _load("_dmd", "deepagent_md.py")
 
 _CLAIM_STALE_SECONDS = 60 * 60  # 1 hour -- abandoned claim, safe to re-take
 
@@ -250,6 +266,47 @@ _DECIDE_SYSTEM = {
     ),
 }
 
+_DEFAULT_FINALIZE_TEXT = (
+    "This is the last design step in this ticket's pipeline, before delegating "
+    "to deepagent_code for actual method implementation -- the class shape you "
+    "decide here must be complete and concrete enough to implement directly, "
+    "with no ambiguity left for a level that doesn't exist after this one."
+)
+
+
+def _build_position_line(task_key: str, level: str, pipeline: list, active_levels: list) -> str:
+    """Breadcrumb across this ticket's fixed interface->abstract->approach->class
+    pipeline, e.g.:
+    'Ticket "task_key" pipeline: interface->abstract->approach->class. So far:
+    interface="UserRepository", abstract=SKIPPED, approach="JPA-based lookup".
+    You are now at: class (step 4 of 4).'
+
+    Without this, the model sees each level's decision only as an isolated
+    "Task/need" handed to it fresh -- it has no explicit sense of how many
+    stages exist, which have already run, or whether it's the last one.
+    Plausibly the same underlying gap DEEPAGENT_SPEC.md's own finding
+    describes for deepagent_md's tree (the model never stops subdividing on
+    its own, because it's never told where it stands) -- here it manifests
+    as not knowing whether more design levels are still coming after this
+    one. `active_levels` (already tracked by _run_one for interface_name/
+    abstract_name inheritance) supplies each prior level's own gist for
+    free -- no extra parsing pass needed."""
+    done_bits = []
+    for lvl, _nid, dec in active_levels:
+        if lvl == "abstract" and dec.strip().upper().startswith("SKIP"):
+            done_bits.append(f"{lvl}=SKIPPED")
+            continue
+        if _is_reuse(dec):
+            done_bits.append(f"{lvl}=REUSE")
+            continue
+        gist = _parse_field(dec, "CHOSEN") if lvl == "approach" else _parse_field(dec, "NAME")
+        done_bits.append(f'{lvl}="{gist or "?"}"')
+    step_idx = pipeline.index(level) + 1 if level in pipeline else "?"
+    so_far = ("So far: " + ", ".join(done_bits) + ". ") if done_bits else ""
+    return (f'Ticket "{task_key}" pipeline: {"->".join(pipeline)}. {so_far}'
+            f'You are now at: {level} (step {step_idx} of {len(pipeline)}).')
+
+
 _METHOD_LINE_RE = _re.compile(
     r'^([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\)\s*(?:->\s*(\S+))?\s*(?:#\s*(.*))?$'
 )
@@ -282,7 +339,19 @@ def _run_research_agent(chat, question: str) -> str:
     start fresh, not accumulate across nodes or carry the user's unrelated
     conversation). Gated by tool-allowlist-gate so the read-only guarantee is
     enforced, not just documented in tools=. Returns the agent's last
-    assistant message (its findings report)."""
+    assistant message (its findings report).
+
+    The old monkeypatch answered EVERY _input() call with "n", not just the
+    natural-completion one -- including _run_agent_loop's own Ctrl+C
+    "Response interrupted. Retry current turn? [Y/n/q]:" prompt, which meant
+    an interrupted research turn was silently auto-skipped and the loop just
+    kept going, "q" could never actually be chosen, and the user never saw
+    the prompt at all. _headless_input below only intercepts the
+    add-to-context prompt; everything else -- in particular the interrupt
+    retry/comment prompts -- reaches the real terminal, and a real "q" there
+    raises _StopGeneration (same convention as deepagent_code/deepagent_md)
+    so the whole /flow deepagent_architect run stops instead of silently
+    moving on to the next level."""
     path = chat._find_agent_def("research")
     if not path:
         return ("[deepagent_architect] 'research' agent not found -- "
@@ -306,7 +375,17 @@ def _run_research_agent(chat, question: str) -> str:
     chat._aliases.update(cfg["aliases"])
 
     orig_input = mod._input
-    mod._input = lambda prompt="": "n"
+    quit_requested = []
+
+    def _headless_input(prompt: str = "") -> str:
+        if prompt.strip().startswith("Add to main context?"):
+            return "n"
+        ans = orig_input(prompt)
+        if prompt.strip().startswith("Response interrupted") and ans.strip().lower().startswith("q"):
+            quit_requested.append(True)
+        return ans
+
+    mod._input = _headless_input
     try:
         chat._run_agent_loop("research", agent_msgs, cfg["max_turns"],
                              auto_exec=True, auto_apply=True, use_procs=True)
@@ -315,6 +394,9 @@ def _run_research_agent(chat, question: str) -> str:
         (chat._proc_active, chat._proc_before,
          chat._proc_gates, chat._proc_gates_post, chat._aliases) = saved
 
+    if quit_requested:
+        raise _dcode._StopGeneration()
+
     for m in reversed(agent_msgs):
         if m["role"] == "assistant":
             return m["content"]
@@ -322,19 +404,38 @@ def _run_research_agent(chat, question: str) -> str:
 
 
 def _decide(chat, level: str, task_text: str, research_findings: str,
-           lang: str = "py") -> str:
-    """Second call: propose the actual design, given research findings."""
+           lang: str = "py", label: str = "", extra_ctx: str = "") -> str:
+    """Second call: propose the actual design, given research findings.
+
+    Same interrupted/failed-call handling as every other deepagent_* LLM
+    call (deepagent_code._on_interrupt / _StopGeneration): a Ctrl+C or an
+    empty/network-error reply gets the normal retry-with-comment/skip/quit
+    choice instead of silently falling through with an empty decision
+    string -- which used to corrupt every level after it (parent_task_text
+    becomes "", NAME:/METHODS: fields all parse empty, etc., see _run_one)."""
     system = _DECIDE_SYSTEM[level]
     if level in ("interface", "abstract", "class"):
-        hint = _LANG_TYPE_HINTS.get(lang, _LANG_TYPE_HINTS["py"])
-        system += f"\nWrite every method's args and return type using {hint}.\n"
+        type_hint = _LANG_TYPE_HINTS.get(lang, _LANG_TYPE_HINTS["py"])
+        system += f"\nWrite every method's args and return type using {type_hint}.\n"
     user = (
         f"Task/need:\n{task_text}\n\n"
         f"Research findings:\n{research_findings}\n\n"
-        f"Now produce your {level} design in exactly the form described above."
+        + (f"{extra_ctx}\n\n" if extra_ctx else "")
+        + f"Now produce your {level} design in exactly the form described above."
     )
-    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    return (chat._stream_chat(msgs) or "").strip()
+    while True:
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        result = (chat._stream_chat(msgs) or "").strip()
+        if result:
+            return result
+        action = _dcode._on_interrupt(label or f"{level} decide")
+        if action == 'quit':
+            raise _dcode._StopGeneration()
+        if action == 'skip':
+            return ""
+        note = action.split(':', 1)[1]
+        if note:
+            user += f"\n\nAdditional instruction: {note}"
 
 
 # ── parsing helpers ───────────────────────────────────────────────────────────
@@ -763,12 +864,45 @@ def _leaf_done_path(arch_dir: str, leaf_id: str) -> str:
     return _os.path.join(arch_dir, f"leaf_{leaf_id}.done")
 
 
+def _row_title(plan_name: str, task_id: str) -> str:
+    """Look up a tasks.md row's own title text for task_id (the part after
+    'plan-<id>. ' and before any '+tag' markers), reusing deepagent_task's
+    row regex. Last-resort fallback source in _resolve_root_task, below
+    even the planMD item -- a title alone still beats the bare digits."""
+    tasks_path = _dtask._tasks_path(_plan_dir(plan_name))
+    if not _os.path.isfile(tasks_path):
+        return ""
+    with open(tasks_path, encoding="utf-8") as f:
+        for line in f:
+            m = _dtask._ROW_RE.match(line.strip())
+            if m and m.group(2) == task_id:
+                return m.group(3).strip()
+    return ""
+
+
 def _resolve_root_task(plan_name: str, task_arg: str) -> str:
-    """If task_arg is a bare dotted id (e.g. "3.2"), read spec_<id>.<n>.md
-    files for that leaf as the root task description; otherwise task_arg
-    itself is the literal task text."""
-    if _re.match(r'^[0-9]+(\.[0-9]+)*$', task_arg.strip()):
-        plan_dir = _os.path.join(_os.getcwd(), ".1bcoder", "planMD", plan_name)
+    """If task_arg is a bare dotted id (e.g. "3.2"), resolve it to real task
+    text instead of ever using the bare digits verbatim. Resolution order:
+      1. spec_<id>.<n>.md (deepagent_spec output) -- richest, but only
+         exists for LEAF ids (deepagent_spec never writes specs for
+         epic/section nodes that have children).
+      2. planMD's own item_<id>.md (deepagent_md's node content) -- exists
+         for every node, leaf or not, so this is what backs a non-leaf id.
+      3. the tasks.md row's own title text.
+
+    Falling through all three used to silently return task_arg itself --
+    hit in production: --loop claimed epic id "1" (tasks.md's ids include
+    every row, not just leaves, and "1" sorts before "1.1"/"1.1.1"/...) and
+    handed the research agent literally the text "1" as its task, which it
+    then couldn't ground in anything and wandered off into an unrelated
+    file in the repo. _open_task_ids now filters --next/--loop to leaves
+    only, but this fallback chain also protects a manually-typed non-leaf
+    id (e.g. `/flow deepagent_architect plan1 1`) from the same failure --
+    only the true last resort (nothing found anywhere) still returns the
+    bare id, now with a loud warning instead of silent corruption."""
+    task_arg = task_arg.strip()
+    if _re.match(r'^[0-9]+(\.[0-9]+)*$', task_arg):
+        plan_dir = _plan_dir(plan_name)
         spec_dir = _dspec._default_spec_dir(plan_dir)
         if _os.path.isdir(spec_dir):
             parts = []
@@ -782,6 +916,18 @@ def _resolve_root_task(plan_name: str, task_arg: str) -> str:
                 i += 1
             if parts:
                 return "\n\n".join(parts)
+        item_path = _dmd._item_path(plan_dir, task_arg)
+        if _os.path.isfile(item_path):
+            with open(item_path, encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                return content
+        title = _row_title(plan_name, task_arg)
+        if title:
+            return title
+        print(f"[deepagent_architect] WARNING: no spec, planMD item, or tasks.md "
+              f"title found for id '{task_arg}' -- falling back to the bare id "
+              f"as task text, which is almost certainly wrong")
     return task_arg
 
 
@@ -792,24 +938,38 @@ def _plan_dir(plan_name: str) -> str:
 
 
 def _open_task_ids(plan_name: str) -> list:
-    """Ordered (numeric-tuple sort) list of tasks.md row ids not marked
-    done ('[x]'). Reuses deepagent_task's own row regex directly instead of
-    re-deriving it, so both stay in sync if the tasks.md format ever
-    changes."""
+    """Ordered (numeric-tuple sort) list of LEAF tasks.md row ids not marked
+    done ('[x]') -- 'leaf' meaning no other row's id starts with '<id>.',
+    the same definition deepagent_spec uses for its own leaf selection.
+    Reuses deepagent_task's own row regex directly instead of re-deriving
+    it, so both stay in sync if the tasks.md format ever changes.
+
+    Non-leaf (epic/section) ids are deliberately excluded here: they have
+    no spec_<id>.<n>.md (deepagent_spec only writes specs for leaves), so
+    handing one to _run_one used to fall through _resolve_root_task all the
+    way to the bare id string. Real production hit: --loop claimed epic id
+    "1" first -- ids sort "1" < "1.1" < "1.1.1" < ... so the coarsest,
+    least-atomic row always wins the numeric sort -- and the research agent
+    got literally the text "1" as its task."""
     tasks_path = _dtask._tasks_path(_plan_dir(plan_name))
     if not _os.path.isfile(tasks_path):
         return []
-    ids = []
+    all_ids = []
+    open_ids = []
     with open(tasks_path, encoding="utf-8") as f:
         for line in f:
             m = _dtask._ROW_RE.match(line.strip())
             if not m:
                 continue
             mark, tid = m.group(1), m.group(2)
+            all_ids.append(tid)
             if mark != "x":
-                ids.append(tid)
-    ids.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
-    return ids
+                open_ids.append(tid)
+    all_ids_set = set(all_ids)
+    leaf_ids = [tid for tid in open_ids
+                if not any(other.startswith(tid + ".") for other in all_ids_set)]
+    leaf_ids.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
+    return leaf_ids
 
 
 def _claim_path(arch_dir: str) -> str:
@@ -869,7 +1029,8 @@ def _release_claim(arch_dir: str):
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def _run_one(chat, plan_name: str, task_arg: str, lang: str, skip_levels: set,
-            arch_dir: str = None) -> bool:
+            arch_dir: str = None, noposition: bool = False,
+            finalize_text: str = None) -> bool:
     """Run the full interface->abstract->approach->class->leaf chain for ONE
     ticket. Returns True on success (a class + at least one method were
     produced), False otherwise -- callers (--next/--loop) use this to decide
@@ -888,6 +1049,8 @@ def _run_one(chat, plan_name: str, task_arg: str, lang: str, skip_levels: set,
     if skip_levels:
         print(f"[deepagent_architect] skip : {', '.join(sorted(skip_levels))}")
 
+    pipeline = [lvl for lvl in LEVELS if lvl not in skip_levels]
+
     node_id = "1"
     first_level = True
     parent_task_text = root_task
@@ -905,15 +1068,25 @@ def _run_one(chat, plan_name: str, task_arg: str, lang: str, skip_levels: set,
 
         print(f"\n[deepagent_architect] === {level} ({node_id}) ===")
 
+        extra_parts = []
+        if not noposition:
+            extra_parts.append(_build_position_line(task_key, level, pipeline, active_levels))
+        if finalize_text and level == pipeline[-1]:
+            extra_parts.append(finalize_text)
+        extra_ctx = "\n\n".join(extra_parts)
+
         if _os.path.isfile(_item_path(arch_dir, node_id)):
             print(f"[deepagent_architect] [resume] {node_id} already exists -- skipping")
             decision = _read_node_decision(arch_dir, node_id)
         else:
             question = _RESEARCH_QUESTIONS[level].format(task=parent_task_text)
+            if extra_ctx:
+                question += f"\n\n{extra_ctx}"
             print("[deepagent_architect] researching...")
             research = _run_research_agent(chat, question)
 
-            decision = _decide(chat, level, parent_task_text, research, lang=lang)
+            decision = _decide(chat, level, parent_task_text, research, lang=lang,
+                              label=f"{level} decide ({node_id})", extra_ctx=extra_ctx)
             _write_node(arch_dir, node_id, level, research, decision)
             print(f"[deepagent_architect] wrote item_{node_id}.md")
 
@@ -979,7 +1152,14 @@ def _run_one(chat, plan_name: str, task_arg: str, lang: str, skip_levels: set,
                 "actual concrete class now; do not output REUSE again for "
                 "that same file."
             )
-            class_decision = _decide(chat, "class", parent_task_text, class_research, lang=lang)
+            retry_extra_parts = []
+            if not noposition:
+                retry_extra_parts.append(_build_position_line(task_key, "class", pipeline, active_levels))
+            if finalize_text:
+                retry_extra_parts.append(finalize_text)
+            class_decision = _decide(chat, "class", parent_task_text, class_research, lang=lang,
+                                     label=f"class decide ({class_id}) retry",
+                                     extra_ctx="\n\n".join(retry_extra_parts))
             _write_node(arch_dir, class_id, "class", class_research, class_decision)
             print(f"[deepagent_architect] rewrote item_{class_id}.md")
             if _is_reuse(class_decision) and not _reuse_target_is_stub(class_decision):
@@ -1037,12 +1217,19 @@ def _run_one(chat, plan_name: str, task_arg: str, lang: str, skip_levels: set,
     return True
 
 
-def _run_next(chat, plan_name: str, lang: str, skip_levels: set) -> bool:
+def _run_next(chat, plan_name: str, lang: str, skip_levels: set,
+              noposition: bool = False, finalize_text: str = None) -> bool:
     """Claim and process exactly one not-yet-taken ticket from tasks.md.
     Returns True if a ticket was processed (successfully or not -- see
     _run_one's own success printout), False if none were available (empty
     backlog, or every remaining ticket is already claimed by another live
-    process)."""
+    process).
+
+    A user-chosen "quit" at any interrupt prompt inside _run_one raises
+    _dcode._StopGeneration -- caught here just long enough to release the
+    ticket's claim (so it can be resumed/retaken later) and print a status
+    line, then re-raised so --loop's caller stops instead of moving on to
+    claim the next ticket."""
     ids = _open_task_ids(plan_name)
     if not ids:
         print(f"[deepagent_architect] no open tickets in {plan_name}'s tasks.md")
@@ -1052,32 +1239,43 @@ def _run_next(chat, plan_name: str, lang: str, skip_levels: set) -> bool:
         if not _try_claim(arch_dir):
             continue
         print(f"[deepagent_architect] claimed ticket {tid}  (pid {_os.getpid()})")
-        ok = False
         try:
-            ok = _run_one(chat, plan_name, tid, lang, skip_levels, arch_dir=arch_dir)
-        finally:
-            if ok:
-                _mark_done(arch_dir)
-                print(f"[deepagent_architect] ticket {tid} done")
-            else:
-                _release_claim(arch_dir)
-                print(f"[deepagent_architect] ticket {tid} did not complete "
-                      f"-- claim released for retry")
+            ok = _run_one(chat, plan_name, tid, lang, skip_levels, arch_dir=arch_dir,
+                          noposition=noposition, finalize_text=finalize_text)
+        except _dcode._StopGeneration:
+            _release_claim(arch_dir)
+            print(f"[deepagent_architect] stopped by user -- ticket {tid} claim "
+                  f"released, partial progress saved (resume with the same command)")
+            raise
+        if ok:
+            _mark_done(arch_dir)
+            print(f"[deepagent_architect] ticket {tid} done")
+        else:
+            _release_claim(arch_dir)
+            print(f"[deepagent_architect] ticket {tid} did not complete "
+                  f"-- claim released for retry")
         return True
     print(f"[deepagent_architect] all {len(ids)} open ticket(s) already "
           f"claimed by another process")
     return False
 
 
-def _run_loop(chat, plan_name: str, lang: str, skip_levels: set, max_tickets: int = 0):
+def _run_loop(chat, plan_name: str, lang: str, skip_levels: set, max_tickets: int = 0,
+             noposition: bool = False, finalize_text: str = None):
     count = 0
-    while True:
-        if max_tickets and count >= max_tickets:
-            print(f"[deepagent_architect] --loop stopping: reached --max {max_tickets}")
-            break
-        if not _run_next(chat, plan_name, lang, skip_levels):
-            break
-        count += 1
+    try:
+        while True:
+            if max_tickets and count >= max_tickets:
+                print(f"[deepagent_architect] --loop stopping: reached --max {max_tickets}")
+                break
+            if not _run_next(chat, plan_name, lang, skip_levels,
+                             noposition=noposition, finalize_text=finalize_text):
+                break
+            count += 1
+    except _dcode._StopGeneration:
+        print(f"[deepagent_architect] --loop stopped by user after {count} "
+              f"ticket(s) processed (pid {_os.getpid()})")
+        return
     print(f"[deepagent_architect] --loop finished: {count} ticket(s) "
           f"processed by this process (pid {_os.getpid()})")
 
@@ -1085,7 +1283,7 @@ def _run_loop(chat, plan_name: str, lang: str, skip_levels: set, max_tickets: in
 def run(chat, args: str):
     args = args.strip()
     _usage = ('usage: /flow deepagent_architect <plan_name> <task_id_or_text> '
-              '[--lang py] [--skip level1,level2]\n'
+              '[--lang py] [--skip level1,level2] [--noposition] [--finalize ["<text>"]]\n'
               '       /flow deepagent_architect <plan_name> --next [--lang py]\n'
               '       /flow deepagent_architect <plan_name> --loop [--lang py] [--max N]')
     if not args:
@@ -1103,6 +1301,20 @@ def run(chat, args: str):
     if m:
         skip_levels = {s.strip().lower() for s in m.group(1).split(",") if s.strip()}
         args = (args[:m.start()] + args[m.end():]).strip()
+
+    # ── position breadcrumb, final-level instruction ────────────────────────
+    # noposition is opt-OUT (breadcrumb included by default); finalize is
+    # opt-IN (off unless explicitly requested) -- see module docstring.
+    noposition = bool(_re.search(r'--noposition\b', args))
+    if noposition:
+        args = _re.sub(r'--noposition\b', '', args).strip()
+
+    finalize_text = None
+    fzm = _re.search(r'--finalize(?:\s+"([^"]*)")?', args)
+    if fzm:
+        custom = fzm.group(1) or ""
+        finalize_text = _DEFAULT_FINALIZE_TEXT + (f"\n\n{custom}" if custom else "")
+        args = (args[:fzm.start()] + args[fzm.end():]).strip()
 
     loop_mode = bool(_re.search(r'--loop\b', args))
     if loop_mode:
@@ -1128,10 +1340,19 @@ def run(chat, args: str):
               + (f"  (max {max_tickets})" if loop_mode and max_tickets else ""))
         if skip_levels:
             print(f"[deepagent_architect] skip : {', '.join(sorted(skip_levels))}")
+        if noposition:
+            print("[deepagent_architect] noposition: position breadcrumb disabled")
+        if finalize_text:
+            print(f"[deepagent_architect] finalize  : on ({len(finalize_text)} chars)")
         if loop_mode:
-            _run_loop(chat, plan_name, lang, skip_levels, max_tickets)
+            _run_loop(chat, plan_name, lang, skip_levels, max_tickets,
+                      noposition=noposition, finalize_text=finalize_text)
         else:
-            _run_next(chat, plan_name, lang, skip_levels)
+            try:
+                _run_next(chat, plan_name, lang, skip_levels,
+                         noposition=noposition, finalize_text=finalize_text)
+            except _dcode._StopGeneration:
+                pass  # _run_next already printed the stopped-by-user status line
         return
 
     if args.startswith('"'):
@@ -1154,4 +1375,14 @@ def run(chat, args: str):
         print(_usage)
         return
 
-    _run_one(chat, plan_name, task_arg, lang, skip_levels)
+    if noposition:
+        print("[deepagent_architect] noposition: position breadcrumb disabled")
+    if finalize_text:
+        print(f"[deepagent_architect] finalize  : on ({len(finalize_text)} chars)")
+
+    try:
+        _run_one(chat, plan_name, task_arg, lang, skip_levels,
+                noposition=noposition, finalize_text=finalize_text)
+    except _dcode._StopGeneration:
+        print("\n[deepagent_architect] stopped by user -- partial progress saved "
+              "(resume with the same command)")

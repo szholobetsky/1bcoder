@@ -1,15 +1,50 @@
-"""deepagent_md — recursive markdown document tree generator.
+"""deepagent_tree_md — deepagent_tree's strict hierarchical decomposition,
+PLUS an explicit "write a full article per sub-part" requirement. Same
+recursive/BFS/resume/compose/web-research/--profile machinery as
+deepagent_md, unchanged; only the generation prompt differs.
+
+Sibling variant of `deepagent_tree` (same directory) -- both enforce the
+same structural rules (part-of not about, homogeneity, ceiling/floor, no
+smearing), see _DECOMPOSITION_RULES below. The difference is rule 6, FULL
+ARTICLE: `deepagent_tree`'s own prompt turned out to produce short,
+outline-like sub-part descriptions (a title plus one gloss sentence) in
+practice, because "decompose into sub-parts" reads as a listing task, not a
+writing task, unlike deepagent_md's "write a detailed markdown analysis"
+framing -- and the FLOOR rule (don't reach into a sub-part's own internal
+breakdown) was apparently read by the model as license to stay terse in
+general, not just about descendants. `deepagent_tree_md` adds rule 6 to
+separate those two axes explicitly: depth of EXPLANATION at a sub-part's own
+level is wanted, depth of DECOMPOSITION into what's inside it is not.
+
+Not yet known which framing works better in practice (terse outline vs. full
+article, both still structurally disciplined) -- keeping both as separate
+flows to compare real output side by side rather than committing to one.
+
+deepagent_md's prompt asks for "a detailed markdown analysis" -- fine for
+prose (an essay on Shakespearean drama has no obligation to keep every
+depth at the same grain, and legitimately revisits a theme from a new
+angle at any level). That freedom is exactly wrong for a technical
+decomposition (a backlog, a module breakdown, an architecture tree): a
+parent must be the literal union of its children, siblings must be the
+same size/kind of thing, and nothing may be restated or preempted across
+levels. deepagent_tree_md enforces that as a hard structural rule instead of
+leaving it to how the task text happens to be phrased -- see _PROMPT below
+for the exact contract (part-of not about, homogeneity, ceiling/floor,
+no smearing, full article). Use deepagent_md for documents/essays,
+deepagent_tree/deepagent_tree_md for anything meant to become a genuine
+work-breakdown tree (e.g. a backlog consumed downstream by
+deepagent_spec -> deepagent_task -> deepagent_architect).
 
 Builds a folder of .md files by expanding a topic tree depth-first.
-Each node calls the LLM once; deeper levels focus on subsections of
-their parent. Optional --web or --rag injects source material before
-each generation call.
+Each node calls the LLM once; deeper levels decompose their parent into
+homogeneous, mutually exclusive sub-parts. Optional --web or --rag injects
+source material before each generation call.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  GENERATE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage:
-  /flow deepagent_md <task> [flags] [plan: l1,l2,l3] [list: a1,a2]
+  /flow deepagent_tree_md <task> [flags] [plan: l1,l2,l3] [list: a1,a2]
 
 Core flags:
   --maxdepth N          tree depth (default 3; 1 = index only)
@@ -39,15 +74,12 @@ Presets (set web defaults; explicit flags override):
   --preset balanced     --web 5 --scan 200
   --preset deep         --web 10 --scan 200 --prescan --ref
 
-Positional-awareness flags:
+Positional-awareness flags (no --noblock here -- rule 6 FULL ARTICLE already
+requires a full paragraph per sub-part, a superset of "at least one sentence",
+so the mechanical bare-heading retry `deepagent_tree` needs isn't necessary):
   --noposition          disable the "Position in this tree: ... -- depth N of M"
                         breadcrumb (ancestor titles only, never their body text)
-                        normally added to every generation prompt. Without it the
-                        model has no way to judge whether it's already deep enough
-                        to stop decomposing -- plausibly the real mechanism behind
-                        this document's own finding (§2.3 in DEEPAGENT_SPEC.md) that
-                        the model never stops subdividing on its own; it was never
-                        told where it stood. On by default.
+                        normally added to every generation prompt. On by default.
   --finalize ["<text>"] opt-in: at the deepest level (depth == max_depth), append a
                         universal "this is the last pass" instruction, plus <text>
                         as well if given (never replaces the universal one). Off by
@@ -75,18 +107,18 @@ Worker flags (parallel BFS):
   --ctx-worker N        context for parallel workers (default: same as --ctx)
 
 Generate examples:
-  /flow deepagent_md "REST API design with PostgreSQL" --maxdepth 3
-  /flow deepagent_md "Hamlet themes" --web 5 --maxdepth 3 plan: overview,analysis,evidence
-  /flow deepagent_md "heat equation in Java" --web --fix mid:1500,last:500
-  /flow deepagent_md "heat equation in Java" --preset balanced --maxdepth 2
-  /flow deepagent_md "hotel room features" --rag hotel --maxdepth 1
-  /flow deepagent_md "hotel room features" --rag hotel --rag-store C:\\MyProject --maxdepth 1
-  /flow deepagent_md "topic" --profile phones --ctx-worker 4 --maxdepth 3
+  /flow deepagent_tree_md "REST API design with PostgreSQL" --maxdepth 3
+  /flow deepagent_tree_md "Hamlet themes" --web 5 --maxdepth 3 plan: overview,analysis,evidence
+  /flow deepagent_tree_md "heat equation in Java" --web --fix mid:1500,last:500
+  /flow deepagent_tree_md "heat equation in Java" --preset balanced --maxdepth 2
+  /flow deepagent_tree_md "hotel room features" --rag hotel --maxdepth 1
+  /flow deepagent_tree_md "hotel room features" --rag hotel --rag-store C:\\MyProject --maxdepth 1
+  /flow deepagent_tree_md "topic" --profile phones --ctx-worker 4 --maxdepth 3
 
   Architecture decomposition (C4-flavored: Container/Component/Code) — mechanism-first
   <task> phrasing, matching plan: labels; depth never stops on its own, cap it deliberately
   (~3-5x nodes per extra level, verified empirically — see DEEPAGENT_SPEC.md §2.3):
-  /flow deepagent_md "how to implement such system" --ctx 2 --maxdepth 4 \\
+  /flow deepagent_tree_md "how to implement such system" --ctx 2 --maxdepth 4 \\
     plan: inter-module boundaries (frontend/backend/database), intra-module layers (e.g. MVC), concrete objects (class/method/route/table)
 
   Epic -> user story -> e2e-function decomposition — <task> itself reframed as a
@@ -94,14 +126,14 @@ Generate examples:
   label a full instruction rather than a bare word (validated against AnimalAlert,
   see DEEPAGENT_SPEC.md §2.5 — this is the run that actually produced non-overlapping,
   vertically-sliced epics and consistently-applied "As a user..." stories):
-  /flow deepagent_md "the feature list for this app's store page, written the way a user reads it before downloading — never mentioning backend, database, or implementation details" --ctx 2 --maxdepth 3 \\
+  /flow deepagent_tree_md "the feature list for this app's store page, written the way a user reads it before downloading — never mentioning backend, database, or implementation details" --ctx 2 --maxdepth 3 \\
     plan: a single non-overlapping user-facing capability — named the way a product manager would name a feature on a roadmap — never a technical mechanism or system layer or a non-functional/performance concern (those are not epics), one single user story within that capability — written strictly as "As a [app user] I want [one specific action] so that [one specific benefit]" — describe exactly one thing the user does in one sitting — never combine multiple actions or backend responsibilities into one story, the complete closed end-to-end technical flow that fully implements that one story — name the actual screen or UI element — the actual API endpoint and method — the actual database fields written or read — and the exact response the user sees
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  COMPOSE  — assemble generated tree into a single document
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage:
-  /flow deepagent_md compose <plan_dir> [--mode MODE] [--plan] [--ref MODE] [output]
+  /flow deepagent_tree_md compose <plan_dir> [--mode MODE] [--plan] [--ref MODE] [output]
 
 Output modes (--mode):
   flat (default)    single composed.md file
@@ -115,20 +147,20 @@ Extra flags:
   --ref distinct    append deduplicated bibliography at the end of the document
 
 Compose examples:
-  /flow deepagent_md compose plan1                             flat .md
-  /flow deepagent_md compose plan1 --mode linked               hypertext .md + cross-links
-  /flow deepagent_md compose plan1 --mode html                 hypertext .html + cross-links
-  /flow deepagent_md compose plan1 --mode html_plain --plan    single HTML with anchor TOC
-  /flow deepagent_md compose plan1 --plan                      PLAN.md outline only
-  /flow deepagent_md compose plan1 --ref all                   .md with inline references
-  /flow deepagent_md compose plan1 --ref distinct              .md with bibliography at end
-  /flow deepagent_md compose plan1 out.md                      flat to custom filename
+  /flow deepagent_tree_md compose plan1                             flat .md
+  /flow deepagent_tree_md compose plan1 --mode linked               hypertext .md + cross-links
+  /flow deepagent_tree_md compose plan1 --mode html                 hypertext .html + cross-links
+  /flow deepagent_tree_md compose plan1 --mode html_plain --plan    single HTML with anchor TOC
+  /flow deepagent_tree_md compose plan1 --plan                      PLAN.md outline only
+  /flow deepagent_tree_md compose plan1 --ref all                   .md with inline references
+  /flow deepagent_tree_md compose plan1 --ref distinct              .md with bibliography at end
+  /flow deepagent_tree_md compose plan1 out.md                      flat to custom filename
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  RESUME  — finish an interrupted run at its ORIGINAL maxdepth
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage:
-  /flow deepagent_md resume <plan_dir>
+  /flow deepagent_tree_md resume <plan_dir>
 
 The plain command (no subcommand) always creates a brand new planN via
 _make_plan_dir -- re-issuing the exact same command after a kill/crash does
@@ -143,13 +175,13 @@ and does NOT add depth -- it fills in the SAME maxdepth the interrupted run
 was already targeting.
 
 Resume example:
-  /flow deepagent_md resume plan3
+  /flow deepagent_tree_md resume plan3
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  CONTINUE  — expand one more labeled level onto an existing tree's leaves
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage:
-  /flow deepagent_md continue <plan_dir> plan: <new level label>[, ...] [list: a1,a2]
+  /flow deepagent_tree_md continue <plan_dir> plan: <new level label>[, ...] [list: a1,a2]
 
 Every fresh run persists its task/plan_labels/aspects/cfg to
 <plan_dir>/_deepagent_meta.yaml. `continue` reads that file (no need to
@@ -160,8 +192,8 @@ and paying for a full extra level everywhere, even branches that didn't
 need it. Sequential only — no --profile support yet.
 
 Continue examples:
-  /flow deepagent_md continue plan3 plan: classes and methods
-  /flow deepagent_md continue plan3 plan: classes and methods list: name concrete Java types
+  /flow deepagent_tree_md continue plan3 plan: classes and methods
+  /flow deepagent_tree_md continue plan3 plan: classes and methods list: name concrete Java types
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  OUTPUT STRUCTURE
@@ -183,35 +215,63 @@ _DEFAULT_MAXDEPTH = 3
 
 # ── prompts ───────────────────────────────────────────────────────────────────
 
+_DECOMPOSITION_RULES = """\
+"{title}" is the ABSTRACT WHOLE. Each sub-part below is a concrete PIECE of
+that whole -- together, the sub-parts must exactly compose "{title}": nothing
+left over, nothing added that isn't genuinely part of it.
+
+Structure your response as 2-6 sub-parts using this exact header format:
+## 1. Sub-part Title
+## 2. Sub-part Title
+
+Rules, all mandatory:
+1. PART-OF, NOT ABOUT -- a sub-part must be a real constituent of "{title}",
+   not a topic merely related to it. Test: if every sub-part were removed,
+   would "{title}" cease to exist? If yes, the split is real. If "{title}"
+   would still fully exist without one of them, that one does not belong here.
+2. HOMOGENEITY -- every sub-part must be the same kind and size of thing as
+   its siblings (same level of abstraction). If one sub-part is a whole
+   subsystem and another is a single field or line item, that is a level
+   violation -- merge or split until every sub-part matches its siblings.
+3. CEILING -- do not restate, re-justify, or re-derive anything that belongs
+   above "{title}" (its own parent's purpose, a sibling of "{title}", anything
+   already fixed higher up -- see "Parent section context" below if present).
+   If a sub-part needs one of those, name it in passing and move on.
+4. FLOOR -- do not reach into anything below the sub-parts themselves
+   (a sub-part's own internal breakdown, specific file names, method
+   signatures, field-by-field detail, cost line items). That is for a later,
+   deeper pass -- this pass stops exactly one level below "{title}".
+5. NO SMEARING -- each sub-part owns a distinct slice of "{title}" with zero
+   overlap. If two sub-parts would both need to describe the same concept to
+   make sense, the split is wrong: merge those sub-parts, or extract the
+   shared concept as its own sibling sub-part instead of repeating it.
+6. FULL ARTICLE, NOT A LABEL -- each sub-part needs a full paragraph (or
+   several) of real content, not a title, not a one-line gloss. Explain what
+   it is, why it is its own distinct sub-part, how it relates to its
+   siblings, and what makes it necessary -- staying strictly at "{title}"'s
+   own level (CEILING/FLOOR above still apply). Depth of EXPLANATION at this
+   level is expected and wanted; depth of DECOMPOSITION (reaching into what's
+   inside a sub-part, which belongs to FLOOR) is not -- these are different
+   axes, do not conflate brevity with staying at the right level.
+
+Be specific and concrete within each sub-part's own description. No preamble,
+no meta-commentary, no repetition of "{title}"'s own title."""
+
 _PROMPT = """\
-Write a detailed markdown analysis of: "{title}"
-This is part of a larger study on: "{root_task}"
+Decompose "{title}" into its direct sub-parts.
+This node exists within a larger structural breakdown of: "{root_task}"
 {focus_line}{aspects_block}{ctx_block}
-Structure your response with 2-5 sections using this exact header format:
-## 1. Section Title
-## 2. Section Title
-
-Be specific and concrete. No preamble, no meta-commentary, no repetition of the title.
-
-Every distinct concept (a data model, an entity, a component, a workflow state)
-must be fully defined in exactly ONE place across the whole document. If this
-section needs a concept that belongs to a different part of the document (e.g.
-an entity's fields, defined in a data-model section), reference it by name only
--- do not restate, redefine, or re-list its fields, structure, or behavior here."""
+""" + _DECOMPOSITION_RULES
 
 _PROMPT_WEB = """\
-Write a detailed markdown analysis of: "{title}"
-This is part of a larger study on: "{root_task}"
+Decompose "{title}" into its direct sub-parts.
+This node exists within a larger structural breakdown of: "{root_task}"
 {focus_line}{aspects_block}{ctx_block}
-Use the web research below as your primary source. Reference specific facts.
-Structure with 2-5 sections using: ## 1. Section Title format.
-No preamble or meta-commentary.
+Use the web research below as grounding for what the sub-parts actually are
+and how they're described -- reference specific facts, but the structural
+rules below still govern how you split them.
 
-Every distinct concept (a data model, an entity, a component, a workflow state)
-must be fully defined in exactly ONE place across the whole document. If this
-section needs a concept that belongs to a different part of the document (e.g.
-an entity's fields, defined in a data-model section), reference it by name only
--- do not restate, redefine, or re-list its fields, structure, or behavior here.
+""" + _DECOMPOSITION_RULES + """
 
 {web_context}"""
 
@@ -258,10 +318,10 @@ def _build_position_line(plan_dir: str, node_id: str, depth: int, max_depth: int
     'Position in this tree: 2 "Depletion Logic..." > 2.4 "Configuration
     Management" > 2.4.2 (this node) -- depth 3 of 3 (maximum).'
 
-    Deliberately titles only, never ancestor body text -- a parent's own
-    content shouldn't be restated here any more than anywhere else in the
-    document; this is purely positional self-awareness. Without it the
-    model has no way to judge whether further decomposition is still
+    Deliberately titles only, never ancestor body text -- CEILING already
+    forbids restating a parent's content, and full ancestor text would
+    invite exactly that. This is purely positional self-awareness. Without
+    it the model has no way to judge whether further decomposition is still
     warranted or whether this is already about as granular as things get --
     plausibly the real mechanism behind DEEPAGENT_SPEC.md's own finding that
     the model never stops subdividing on its own (it was never told where
@@ -713,10 +773,10 @@ def _on_interrupt(label: str) -> str:
     try:
         ans = input(f'\n  [{label}] interrupted/failed — retry? [Y/n/q]: ').strip().lower()
     except (EOFError, KeyboardInterrupt):
-        print('[deepagent_md] stopped')
+        print('[deepagent_tree_md] stopped')
         return 'quit'
     if ans.startswith('q'):
-        print('[deepagent_md] stopped')
+        print('[deepagent_tree_md] stopped')
         return 'quit'
     if ans.startswith('n'):
         print(f'  [skip] {label}')
@@ -896,7 +956,7 @@ def _generate_worker(host: str, model: str, prompt: str,
     """Direct HTTP POST to a specific Ollama worker (stream=False, thread-safe).
     `system` lets other flows (e.g. deepagent_spec) reuse this same HTTP-call
     function with their own system prompt instead of forking a duplicate;
-    defaults to deepagent_md's own research-writer prompt, unchanged for
+    defaults to deepagent_tree_md's own research-writer prompt, unchanged for
     existing callers."""
     import requests as _r
     msgs = [
@@ -970,7 +1030,7 @@ def _expand_bfs(chat, root_sections: list, root_task: str, plan_dir: str,
         depth = level_nodes[0][2]
         focus = plan_labels[depth - 1] if depth - 1 < len(plan_labels) else ""
         n_workers = len(workers) if workers else 1
-        print(f"\n[deepagent_md] level {depth}  nodes={len(level_nodes)}  workers={n_workers}")
+        print(f"\n[deepagent_tree_md] level {depth}  nodes={len(level_nodes)}  workers={n_workers}")
 
         def _one_node(args):
             node_id, title, d = args
@@ -1100,7 +1160,7 @@ def _compose_html_plain(plan_dir: str, output_file: str, with_toc: bool = False)
     try:
         md_text = open(md_tmp, encoding="utf-8").read()
     except OSError as e:
-        print(f"[deepagent_md] {e}"); return
+        print(f"[deepagent_tree_md] {e}"); return
     _os.remove(md_tmp)
 
     index_path = _os.path.join(plan_dir, "index.md")
@@ -1150,7 +1210,7 @@ def _compose_html_plain(plan_dir: str, output_file: str, with_toc: bool = False)
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(html_body)
-    print(f"[deepagent_md] html_plain -> {output_file}")
+    print(f"[deepagent_tree_md] html_plain -> {output_file}")
 
 
 def _compose(plan_dir: str, output_file: str, ref_mode: str = ""):
@@ -1195,7 +1255,7 @@ def _compose(plan_dir: str, output_file: str, ref_mode: str = ""):
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
-    print(f"[deepagent_md] composed {len(all_ids)} files -> {output_file}")
+    print(f"[deepagent_tree_md] composed {len(all_ids)} files -> {output_file}")
 
 
 # ── compose hypertext (linked / html) ────────────────────────────────────────
@@ -1368,7 +1428,7 @@ def _compose_hypertext(plan_dir: str, mode: str, show_title: bool = False):
         open(out, "w", encoding="utf-8").write(content)
         count += 1
 
-    print(f"[deepagent_md] hypertext ({mode}): {count} files -> {out_dir}")
+    print(f"[deepagent_tree_md] hypertext ({mode}): {count} files -> {out_dir}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -1396,7 +1456,7 @@ def run(chat, args: str):
 
         parts = rest.split()
         if not parts:
-            print("usage: /flow deepagent_md compose <plan_dir> [output.md] [--mode flat|linked|html]")
+            print("usage: /flow deepagent_tree_md compose <plan_dir> [output.md] [--mode flat|linked|html]")
             return
         show_plan  = "--plan" in rest
         rest_clean = rest.replace("--plan", "").strip()
@@ -1404,12 +1464,12 @@ def run(chat, args: str):
 
         plan_name = parts[0] if parts else ""
         if not plan_name or plan_name.startswith("--"):
-            print("usage: /flow deepagent_md compose <plan_dir> [--mode flat|linked|html] [--plan] [--ref all|distinct]")
+            print("usage: /flow deepagent_tree_md compose <plan_dir> [--mode flat|linked|html] [--plan] [--ref all|distinct]")
             return
         base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
         plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
         if not _os.path.isdir(plan_dir):
-            print(f"[deepagent_md] not found: {plan_dir}")
+            print(f"[deepagent_tree_md] not found: {plan_dir}")
             return
 
         all_ids = _collect_node_ids(plan_dir)
@@ -1419,7 +1479,7 @@ def run(chat, args: str):
             plan_file = _os.path.join(plan_dir, "PLAN.md")
             open(plan_file, "w", encoding="utf-8").write(plan_text)
             print(plan_text)
-            print(f"\n[deepagent_md] plan saved -> {plan_file}")
+            print(f"\n[deepagent_tree_md] plan saved -> {plan_file}")
 
         if mode in ("linked", "html"):
             _compose_hypertext(plan_dir, mode, show_title=show_plan)
@@ -1432,7 +1492,7 @@ def run(chat, args: str):
         return
 
     if args.startswith("resume"):
-        # /flow deepagent_md resume <plan_dir>
+        # /flow deepagent_tree_md resume <plan_dir>
         #
         # The plain (no-subcommand) path always calls _make_plan_dir(base),
         # which creates the first NON-existing planN directory -- meaning a
@@ -1452,17 +1512,17 @@ def run(chat, args: str):
         # and deepagent_spec's own per-file skip already rely on.
         plan_name = rest = args[6:].strip()
         if not plan_name:
-            print("usage: /flow deepagent_md resume <plan_dir>")
+            print("usage: /flow deepagent_tree_md resume <plan_dir>")
             return
         base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
         plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
         if not _os.path.isdir(plan_dir):
-            print(f"[deepagent_md] not found: {plan_dir}")
+            print(f"[deepagent_tree_md] not found: {plan_dir}")
             return
 
         meta = _load_meta(plan_dir)
         if meta is None:
-            print(f"[deepagent_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
+            print(f"[deepagent_tree_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
                   f"`resume` support (or the file was moved/deleted). Cannot resume "
                   f"without the original task/plan_labels/maxdepth.")
             return
@@ -1473,7 +1533,7 @@ def run(chat, args: str):
         use_web     = meta.get("use_web", False)
         maxdepth    = meta.get("maxdepth", _DEFAULT_MAXDEPTH)
         if not task:
-            print(f"[deepagent_md] {_META_FILENAME} has no task recorded — cannot resume")
+            print(f"[deepagent_tree_md] {_META_FILENAME} has no task recorded — cannot resume")
             return
 
         chat_ctx = _serialize_ctx(getattr(chat, "messages", []), 6)
@@ -1481,20 +1541,20 @@ def run(chat, args: str):
         stats = {"files": 0}
         stopped_early = False
 
-        print(f"[deepagent_md] resume  : {plan_dir}")
-        print(f"[deepagent_md] maxdepth: {maxdepth}")
+        print(f"[deepagent_tree_md] resume  : {plan_dir}")
+        print(f"[deepagent_tree_md] maxdepth: {maxdepth}")
 
         try:
             index_path = _os.path.join(plan_dir, "index.md")
             if _os.path.isfile(index_path):
-                print("[deepagent_md] index.md already exists — skipping")
+                print("[deepagent_tree_md] index.md already exists — skipping")
                 index_content = open(index_path, encoding="utf-8").read()
             else:
                 print(f"\n[gen] index: {task}")
                 index_content = _generate(chat, task, task, "", focus=plan_labels[0] if plan_labels else "",
                                           aspects=aspects, chat_ctx=chat_ctx, label="index")
                 if not index_content:
-                    print("[deepagent_md] failed to generate index — stopping")
+                    print("[deepagent_tree_md] failed to generate index — stopping")
                     return
                 with open(index_path, "w", encoding="utf-8") as f:
                     f.write(f"# {task}\n\n{index_content}")
@@ -1503,22 +1563,22 @@ def run(chat, args: str):
 
             top = _parse_sections(index_content)
             if not top:
-                print("[deepagent_md] no ## N. sections in index.md — check LLM output format")
+                print("[deepagent_tree_md] no ## N. sections in index.md — check LLM output format")
                 return
 
-            print(f"\n[deepagent_md] {len(top)} top-level sections, resuming to depth {maxdepth}...")
+            print(f"\n[deepagent_tree_md] {len(top)} top-level sections, resuming to depth {maxdepth}...")
             for i, title in enumerate(top, 1):
                 _expand(chat, str(i), title, task, plan_dir,
                         depth=1, max_depth=maxdepth, use_web=use_web,
                         plan_labels=plan_labels, aspects=aspects, stats=stats,
                         max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
         except _StopGeneration:
-            print("\n[deepagent_md] stopped by user — partial output saved")
+            print("\n[deepagent_tree_md] stopped by user — partial output saved")
             stopped_early = True
 
-        print(f"\n[deepagent_md] resume done: {stats['files']} new file(s) generated in {plan_dir}"
+        print(f"\n[deepagent_tree_md] resume done: {stats['files']} new file(s) generated in {plan_dir}"
               + ("  (stopped early)" if stopped_early else ""))
-        print(f"[deepagent_md] to join: /flow deepagent_md compose {_os.path.basename(plan_dir)}")
+        print(f"[deepagent_tree_md] to join: /flow deepagent_tree_md compose {_os.path.basename(plan_dir)}")
         return
 
     if args.startswith("continue"):
@@ -1536,18 +1596,18 @@ def run(chat, args: str):
         new_aspects = [l.strip() for l in list_m.group(1).split(',') if l.strip()] if list_m else []
         plan_name = rest[:anchor].strip()
         if not plan_name or not new_labels:
-            print("usage: /flow deepagent_md continue <plan_dir> plan: <new level label>[, ...] [list: a1,a2]")
+            print("usage: /flow deepagent_tree_md continue <plan_dir> plan: <new level label>[, ...] [list: a1,a2]")
             return
 
         base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
         plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
         if not _os.path.isdir(plan_dir):
-            print(f"[deepagent_md] not found: {plan_dir}")
+            print(f"[deepagent_tree_md] not found: {plan_dir}")
             return
 
         meta = _load_meta(plan_dir)
         if meta is None:
-            print(f"[deepagent_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
+            print(f"[deepagent_tree_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
                   f"`continue` support (or the file was moved/deleted). Cannot continue "
                   f"without the original task/plan_labels.")
             return
@@ -1558,19 +1618,19 @@ def run(chat, args: str):
         cfg         = meta.get("cfg", {}) or {}
         use_web     = meta.get("use_web", False)
         if not task:
-            print(f"[deepagent_md] {_META_FILENAME} has no task recorded — cannot continue")
+            print(f"[deepagent_tree_md] {_META_FILENAME} has no task recorded — cannot continue")
             return
 
         all_ids = _collect_node_ids(plan_dir)
         if not all_ids:
-            print(f"[deepagent_md] no nodes found in {plan_dir}")
+            print(f"[deepagent_tree_md] no nodes found in {plan_dir}")
             return
         leaves = sorted(
             [nid for nid in all_ids if not _child_ids(nid, all_ids)],
             key=lambda x: tuple(int(p) for p in x.split("."))
         )
         if not leaves:
-            print(f"[deepagent_md] every node in {plan_dir} already has children — nothing to continue")
+            print(f"[deepagent_tree_md] every node in {plan_dir} already has children — nothing to continue")
             return
 
         chat_ctx = _serialize_ctx(getattr(chat, "messages", []), ctx_n_continue)
@@ -1581,9 +1641,9 @@ def run(chat, args: str):
         max_parent_ctx = 500
         new_maxdepth = meta.get("maxdepth", 0)
 
-        print(f"[deepagent_md] continue : {plan_dir}")
-        print(f"[deepagent_md] leaves   : {len(leaves)}")
-        print(f"[deepagent_md] new level: {', '.join(new_labels)}")
+        print(f"[deepagent_tree_md] continue : {plan_dir}")
+        print(f"[deepagent_tree_md] leaves   : {len(leaves)}")
+        print(f"[deepagent_tree_md] new level: {', '.join(new_labels)}")
 
         labels_out = plan_labels
         try:
@@ -1599,12 +1659,12 @@ def run(chat, args: str):
                         plan_labels=labels_for_leaf, aspects=aspects, stats=stats,
                         max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
         except _StopGeneration:
-            print("\n[deepagent_md] stopped by user — partial output saved")
+            print("\n[deepagent_tree_md] stopped by user — partial output saved")
 
         chat.params = saved
         _save_meta(plan_dir, task, labels_out, aspects, new_maxdepth, use_web, cfg)
-        print(f"\n[deepagent_md] continue done: {stats['files']} files generated in {plan_dir}")
-        print(f"[deepagent_md] to join: /flow deepagent_md compose {_os.path.basename(plan_dir)}")
+        print(f"\n[deepagent_tree_md] continue done: {stats['files']} files generated in {plan_dir}")
+        print(f"[deepagent_tree_md] to join: /flow deepagent_tree_md compose {_os.path.basename(plan_dir)}")
         return
 
     # ── preset (sets defaults, explicit flags override) ───────────────────────
@@ -1755,11 +1815,11 @@ def run(chat, args: str):
             except Exception:
                 pass
         if workers:
-            print(f"[deepagent_md] profile  : {profile_name} ({len(workers)} workers)")
+            print(f"[deepagent_tree_md] profile  : {profile_name} ({len(workers)} workers)")
             for h, mdl, _ in workers:
                 print(f"               {h}  {mdl}")
         else:
-            print(f"[deepagent_md] profile '{profile_name}' not found — running single")
+            print(f"[deepagent_tree_md] profile '{profile_name}' not found — running single")
 
     plan_m = _re.search(r'\bplan:\s*(.+?)(?:\s+(?:list:|$))', args + " ")
     list_m = _re.search(r'\blist:\s*(.+?)(?:\s*$)', args)
@@ -1779,14 +1839,14 @@ def run(chat, args: str):
             file_content = open(task_file, encoding="utf-8").read().strip()
             task = (task + "\n\n" + file_content).strip() if task else file_content
         else:
-            print(f"[deepagent_md] --file not found: {task_file}")
+            print(f"[deepagent_tree_md] --file not found: {task_file}")
             return
 
     if not task:
-        print("usage: /flow deepagent_md <task> [--web] [--maxdepth N] [--file task.txt]")
-        print("       /flow deepagent_md compose <plan_dir> [output.md]")
-        print('  e.g. /flow deepagent_md "heat equation as Cauchy problem in Java" --web --maxdepth 3')
-        print('  e.g. /flow deepagent_md --file task.txt --maxdepth 2')
+        print("usage: /flow deepagent_tree_md <task> [--web] [--maxdepth N] [--file task.txt]")
+        print("       /flow deepagent_tree_md compose <plan_dir> [output.md]")
+        print('  e.g. /flow deepagent_tree_md "heat equation as Cauchy problem in Java" --web --maxdepth 3')
+        print('  e.g. /flow deepagent_tree_md --file task.txt --maxdepth 2')
         return
 
     base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
@@ -1796,26 +1856,26 @@ def run(chat, args: str):
     chat_ctx        = _serialize_ctx(getattr(chat, "messages", []), ctx_n)
     chat_ctx_worker = _serialize_ctx(getattr(chat, "messages", []), ctx_worker_n)
 
-    print(f"[deepagent_md] task          : {task}")
-    print(f"[deepagent_md] maxdepth      : {maxdepth}")
-    print(f"[deepagent_md] chat ctx      : {ctx_n} msgs local / {ctx_worker_n} msgs workers ({len(chat_ctx)} chars)")
-    print(f"[deepagent_md] parent ctx    : {'unlimited' if max_parent_ctx == 0 else max_parent_ctx}")
-    print(f"[deepagent_md] plan          : {' -> '.join(plan_labels)}")
+    print(f"[deepagent_tree_md] task          : {task}")
+    print(f"[deepagent_tree_md] maxdepth      : {maxdepth}")
+    print(f"[deepagent_tree_md] chat ctx      : {ctx_n} msgs local / {ctx_worker_n} msgs workers ({len(chat_ctx)} chars)")
+    print(f"[deepagent_tree_md] parent ctx    : {'unlimited' if max_parent_ctx == 0 else max_parent_ctx}")
+    print(f"[deepagent_tree_md] plan          : {' -> '.join(plan_labels)}")
     if aspects:
-        print(f"[deepagent_md] aspects  : {', '.join(aspects)}")
-    print(f"[deepagent_md] web      : {use_web}" + (f" (n={web_n})" if use_web else ""))
+        print(f"[deepagent_tree_md] aspects  : {', '.join(aspects)}")
+    print(f"[deepagent_tree_md] web      : {use_web}" + (f" (n={web_n})" if use_web else ""))
     if fix_spec:
-        print(f"[deepagent_md] fix      : {fix_spec}")
+        print(f"[deepagent_tree_md] fix      : {fix_spec}")
     if scan_to:
-        print(f"[deepagent_md] scan     : compact to {scan_to} chars")
+        print(f"[deepagent_tree_md] scan     : compact to {scan_to} chars")
     if use_prescan:
-        print(f"[deepagent_md] prescan  : on")
+        print(f"[deepagent_tree_md] prescan  : on")
     if use_ref:
-        print(f"[deepagent_md] ref      : tracking -> refs.json")
-    print(f"[deepagent_md] dir      : {plan_dir}")
+        print(f"[deepagent_tree_md] ref      : tracking -> refs.json")
+    print(f"[deepagent_tree_md] dir      : {plan_dir}")
 
     if rag_project:
-        print(f"[deepagent_md] rag       : project={rag_project} path={rag_path}")
+        print(f"[deepagent_tree_md] rag       : project={rag_project} path={rag_path}")
     cfg = {
         "web_n":       web_n,
         "fix_spec":    fix_spec,
@@ -1829,9 +1889,9 @@ def run(chat, args: str):
         "finalize":    finalize_text,
     }
     if noposition:
-        print("[deepagent_md] noposition: position breadcrumb disabled")
+        print("[deepagent_tree_md] noposition: position breadcrumb disabled")
     if finalize_text:
-        print(f"[deepagent_md] finalize  : on ({len(finalize_text)} chars)")
+        print(f"[deepagent_tree_md] finalize  : on ({len(finalize_text)} chars)")
     _save_meta(plan_dir, task, plan_labels, aspects, maxdepth, use_web, cfg)
 
     saved = dict(chat.params)
@@ -1845,7 +1905,7 @@ def run(chat, args: str):
     try:
         index_path = _os.path.join(plan_dir, "index.md")
         if _os.path.isfile(index_path):
-            print("[deepagent_md] resuming from existing index.md")
+            print("[deepagent_tree_md] resuming from existing index.md")
             index_content = open(index_path, encoding="utf-8").read()
         else:
             print(f"\n[gen] index: {task}")
@@ -1868,7 +1928,7 @@ def run(chat, args: str):
                                       focus=plan_labels[0] if plan_labels else "",
                                       aspects=aspects, chat_ctx=chat_ctx, label="index")
             if not index_content:
-                print("[deepagent_md] failed to generate index — stopping")
+                print("[deepagent_tree_md] failed to generate index — stopping")
                 chat.params = saved
                 return
             with open(index_path, "w", encoding="utf-8") as f:
@@ -1878,11 +1938,11 @@ def run(chat, args: str):
 
         top = _parse_sections(index_content)
         if not top:
-            print("[deepagent_md] no ## N. sections in index.md — check LLM output format")
+            print("[deepagent_tree_md] no ## N. sections in index.md — check LLM output format")
             chat.params = saved
             return
 
-        print(f"\n[deepagent_md] {len(top)} top-level sections, expanding to depth {maxdepth}...")
+        print(f"\n[deepagent_tree_md] {len(top)} top-level sections, expanding to depth {maxdepth}...")
 
         if workers:
             _expand_bfs(chat, top, task, plan_dir,
@@ -1897,11 +1957,11 @@ def run(chat, args: str):
                         plan_labels=plan_labels, aspects=aspects, stats=stats,
                         max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
     except _StopGeneration:
-        print("\n[deepagent_md] stopped by user — partial output saved")
+        print("\n[deepagent_tree_md] stopped by user — partial output saved")
         stopped_early = True
 
     chat.params = saved
     total = stats["files"]
-    print(f"\n[deepagent_md] done: {total} files generated in {plan_dir}"
+    print(f"\n[deepagent_tree_md] done: {total} files generated in {plan_dir}"
           + ("  (stopped early)" if stopped_early else ""))
-    print(f"[deepagent_md] to join: /flow deepagent_md compose {_os.path.basename(plan_dir)}")
+    print(f"[deepagent_tree_md] to join: /flow deepagent_tree_md compose {_os.path.basename(plan_dir)}")

@@ -1,0 +1,20 @@
+#POS:16
+# Runs deepagent_spec -> deepagent_task for an EXISTING plan. Skips
+# deepagent_md entirely -- use this when planMD/<plan> already exists and
+# you just need to resume/finish the spec step (or refresh tasks.md after
+# specs changed). deepagent_spec already skips any spec_<id>.<n>.md that's
+# already on disk, so re-running this after an interruption naturally
+# continues where it left off -- no separate "resume" mechanism needed for
+# this one, unlike deepagent_md.
+#
+# Required params:
+#   plan = the existing plan name (e.g. plan1)
+#
+# Usage:
+#   1bcoder --host openai://localhost:1234 --model qwen3-4b-instruct-2507 ^
+#       --scriptapply deepagent_spec_task.txt --param plan=plan1
+/param timeout 300
+/param think false
+/flow deepagent_tree_md {{task}}
+/flow deepagent_spec {{plan}}
+/flow deepagent_task {{plan}}
