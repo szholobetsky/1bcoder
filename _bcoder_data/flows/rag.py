@@ -225,7 +225,10 @@ def run(chat, args: str):
             return
 
         print(f"[rag] searching '{query}' in {cwd}")
-        out = _run_simargl(f'simargl search "{query}" --mode file --sort rank', cwd)
+        # retrieve (not search): returns the actual matched chunk text per
+        # file, ready for LLM context — search --mode file only returns a
+        # ranked path/score list with no document content at all.
+        out = _run_simargl(f'simargl retrieve "{query}" --mode file --top-n 5', cwd)
 
         if not out.strip():
             print("[rag] no results")
