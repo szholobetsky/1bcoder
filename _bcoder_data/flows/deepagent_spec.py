@@ -397,11 +397,170 @@ def _write_spec(spec_dir: str, project: str, leaf_id: str, sec_index: int,
         f.write(content)
 
 
+# ── interactive review gate (--review) ───────────────────────────────────────
+# Spec units are flat/independent (no parent/child among them, unlike
+# deepagent_md's tree), so this is a simplified [y]es/[n]o/[a]ll menu -- no
+# [b]ranch, there's no subtree to "stay inside". No live_index/dedup hook
+# existed in this file before -- radogast wiring here reuses the same
+# LivePlanIndex class deepagent_md's --dedup already uses, just seeded from
+# on-disk spec_*.md siblings instead of a plan_dir tree scan.
+
+def _make_review_index(spec_dir: str, use_review: bool):
+    if not use_review:
+        return None
+    try:
+        from radogast.live_index import LivePlanIndex
+    except ImportError:
+        print("[review] radogast not installed -- skipped (pip install radogast[embed])")
+        return None
+    live_index = LivePlanIndex()
+    seeded = 0
+    if _os.path.isdir(spec_dir):
+        for fname in sorted(_os.listdir(spec_dir)):
+            m = _re.match(r'^spec_([\d.]+)\.md$', fname)
+            if m:
+                text = open(_os.path.join(spec_dir, fname), encoding="utf-8").read()
+                live_index.add(m.group(1), text)
+                seeded += 1
+    print(f"[review] on (radogast dedup check, seeded {seeded} existing unit(s))")
+    return live_index
+
+
+def _review_prompt() -> str:
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        print("  [review] no interactive terminal -- auto-continuing")
+        return 'y'
+    while True:
+        ans = input("  Continue? [y]es [n]o [a]ll: ").strip().lower()
+        if ans in ("y", "n", "a", ""):
+            return ans or 'y'
+        print("  please enter y, n, or a")
+
+
+def _review_feedback_regen(chat, prompt: str, label: str, spec_dir: str, project: str,
+                           leaf_id: str, sec_index: int, sec_title: str, source_ref: str):
+    try:
+        feedback = input("  what should change? ").strip()
+    except (EOFError, KeyboardInterrupt):
+        feedback = ""
+    if not feedback:
+        print("  [review] no feedback given -- keeping as-is")
+        return None
+    content = _generate_local(chat, prompt + f"\n\nAdditional instruction: {feedback}", label)
+    if not content:
+        print("  [review] regeneration produced nothing -- keeping previous content")
+        return None
+    _write_spec(spec_dir, project, leaf_id, sec_index, sec_title, content, source_ref)
+    print(f"  -> spec_{leaf_id}.{sec_index}.md regenerated")
+    return content
+
+
+def _run_review_gate(chat, review_state, review_index, unit_id, content, prompt, label,
+                     spec_dir, project, leaf_id, sec_index, sec_title, source_ref):
+    match = review_index.check(unit_id, content) if review_index is not None else None
+    while True:
+        if match is not None:
+            print(f"  [radogast] {unit_id}: overlaps {match[0]} (similarity {match[1]:.2f})")
+        else:
+            print(f"  [radogast] {unit_id}: clean")
+        if review_state["mode"] == "all":
+            print("  [review] auto-continuing (all)")
+            break
+        ans = _review_prompt()
+        if ans == 'y':
+            break
+        if ans == 'a':
+            review_state["mode"] = "all"
+            break
+        # ans == 'n' -- regenerate with feedback, then re-check the fresh
+        # content so a bad regeneration can be rejected again.
+        new_content = _review_feedback_regen(chat, prompt, label, spec_dir, project,
+                                             leaf_id, sec_index, sec_title, source_ref)
+        if new_content is None:
+            continue
+        content = new_content
+        match = review_index.check(unit_id, content) if review_index is not None else None
+    if review_index is not None:
+        review_index.add(unit_id, content)
+    return content
+
+
 # ── entry point ──────────────────────────────────────────────────────────────
 
 def run(chat, args: str):
     """Transform an existing deepagent_md tree's leaves into atomic specs."""
     args = args.strip()
+
+    if args.startswith("redo"):
+        # /flow deepagent_spec redo <plan_dir> <unit_id> [--review]
+        #
+        # unit_id = "<leaf_id>.<sec_index>" (split on the LAST dot -- leaf_id
+        # itself is dot-separated). No subtree here -- spec units are flat
+        # and independent, so this just deletes and regenerates ONE file.
+        rest = args[4:].strip()
+        review_flag = bool(_re.search(r'--review\b', rest))
+        if review_flag:
+            rest = _re.sub(r'--review\b', '', rest).strip()
+        parts = rest.split()
+        if len(parts) < 2:
+            print("usage: /flow deepagent_spec redo <plan_dir> <unit_id> [--review]")
+            return
+        plan_name, unit_id = parts[0], parts[1]
+        if "." not in unit_id:
+            print(f"[deepagent_spec] {unit_id} is not a valid unit id (expected <leaf_id>.<sec_index>)")
+            return
+        leaf_id, sec_index_s = unit_id.rsplit(".", 1)
+        try:
+            sec_index = int(sec_index_s)
+        except ValueError:
+            print(f"[deepagent_spec] {unit_id} is not a valid unit id (expected <leaf_id>.<sec_index>)")
+            return
+
+        base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
+        plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
+        if not _os.path.isdir(plan_dir):
+            print(f"[deepagent_spec] not found: {plan_dir}")
+            return
+
+        spec_dir = _default_spec_dir(plan_dir)
+        project = _project_name(plan_dir)
+        leaf_title = _leaf_title(plan_dir, leaf_id)
+
+        sections = _leaf_sections(plan_dir, leaf_id)
+        match_sec = next((s for s in sections if s[0] == sec_index), None)
+        if match_sec is None:
+            print(f"[deepagent_spec] section {sec_index} not found under leaf {leaf_id} "
+                  f"in {plan_dir} — cannot redo")
+            return
+        _idx, sec_title, sec_body = match_sec
+        source_ref = f"item_{leaf_id}.md#{sec_index}"
+
+        spec_file = _spec_path(spec_dir, leaf_id, sec_index)
+        if _os.path.isfile(spec_file):
+            import time as _time
+            import shutil as _shutil
+            timestamp = _time.strftime("%Y%m%dT%H%M%S")
+            backup_dir = _os.path.join(spec_dir, "_superseded", f"{unit_id}_{timestamp}")
+            _os.makedirs(backup_dir, exist_ok=True)
+            dst = _os.path.join(backup_dir, _os.path.basename(spec_file))
+            _shutil.move(spec_file, dst)
+            print(f"[deepagent_spec] backed up {unit_id} -> {dst}")
+
+        prompt = _build_prompt(sec_title, sec_body, leaf_title, "", "")
+        content = _generate_local(chat, prompt, unit_id)
+        if not content:
+            print(f"[deepagent_spec] regeneration produced nothing for {unit_id}")
+            return
+        _write_spec(spec_dir, project, leaf_id, sec_index, sec_title, content, source_ref)
+        print(f"[deepagent_spec] redo done: spec_{unit_id}.md")
+
+        if review_flag:
+            review_index = _make_review_index(spec_dir, True)
+            review_state = {"mode": "ask"}
+            _run_review_gate(chat, review_state, review_index, unit_id, content, prompt,
+                             unit_id, spec_dir, project, leaf_id, sec_index, sec_title, source_ref)
+        return
 
     fm = _re.search(r'--focus\s+"([^"]*)"', args)
     focus = ""
@@ -419,6 +578,10 @@ def run(chat, args: str):
     ctx_n = int(cm.group(1)) if cm else 0
     if cm:
         args = (args[:cm.start()] + args[cm.end():]).strip()
+
+    use_review = bool(_re.search(r'--review\b', args))
+    if use_review:
+        args = _re.sub(r'--review\b', '', args).strip()
 
     om = _re.search(r'--output\s+(?:"([^"]+)"|(\S+))', args)
     output_override = None
@@ -497,6 +660,16 @@ def run(chat, args: str):
         else:
             print(f"[deepagent_spec] profile '{profile_name}' not found — running local")
 
+    if workers and use_review:
+        print("error: --review is incompatible with --profile "
+              "(parallel workers complete out of order, so a per-unit review "
+              "gate can't cleanly hold work back). "
+              "Drop --profile for a supervised run, or drop --review for an unattended one.")
+        return
+
+    review_index = _make_review_index(spec_dir, use_review)
+    review_state = {"mode": "ask"} if use_review else None
+
     saved = dict(chat.params)
     if predictable:
         # temperature/num_predict values are our own guess, tuned against
@@ -561,6 +734,10 @@ def run(chat, args: str):
                     _write_spec(spec_dir, project, leaf_id, sec_index, sec_title,
                                content, source_ref)
                     print(f"  [{done}/{len(work)}] spec_{leaf_id}.{sec_index}.md")
+                    if review_state is not None:
+                        _run_review_gate(chat, review_state, review_index, label, content,
+                                         prompt, label, spec_dir, project, leaf_id, sec_index,
+                                         sec_title, source_ref)
                 else:
                     print(f"  [{done}/{len(work)}] spec_{leaf_id}.{sec_index} — empty, skipped")
     except _dmd._StopGeneration:

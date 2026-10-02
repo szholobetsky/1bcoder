@@ -409,18 +409,18 @@ PROFILES_FILE        = os.path.join(BCODER_DIR, "profiles.txt")
 GLOBAL_PROFILES_FILE = os.path.join(HOME_BCODER_DIR, "profiles.txt")
 
 DEFAULT_AGENT_TOOLS = [
-    "read", "readln", "tree", "find", "insert", "save", "fim",
+    "read", "readln", "tree", "find", "insert_code", "save_code", "fim", "ls", "mkdir",
 ]
 
 DEFAULT_AGENT_TOOLS_ADVANCED = [
-    "read", "run", "insert", "save", "bkup", "diff", "patch",
-    "tree", "find",
+    "read", "run", "insert_code", "save_code", "bkup", "diff", "patch_code",
+    "tree", "find", "ls", "mkdir",
     "map index", "map find", "map idiff", "map diff", "map trace", "map keyword",
     "help",
 ]
 
 DEFAULT_AGENT_TOOLS_ASK = [
-    "read", "readln", "tree", "find",
+    "read", "readln", "tree", "find", "ls",
     "map index", "map find", "map trace", "map keyword",
 ]
 
@@ -434,16 +434,29 @@ To call a tool, write ACTION: on its own line. Wait for [tool result].
 Run one action at a time until the task is complete.
 When done, write a short summary with no ACTION and end with: Task is complete.
 
-To fix or edit a file:
-  ACTION: /fim <file> <description of what to fix>
+To fix or edit a file (also creates it if it does not exist yet):
+  ACTION: /fim <file> <description of what to fix, or what the new file should do>
   Example: ACTION: /fim calc.py fix the division by zero bug
   Example: ACTION: /fim main.py fix the indentation on line 5
+  Example: ACTION: /fim routes/alerts.py create endpoints for reporting an alert
+
+  /fim only sees the hint you write on this line — nothing else from this
+  conversation. Write a FULL description of what the file should contain.
+  If a short hint is enough because this was already discussed earlier in this
+  task, use ACTION: /fimctx <file> <short hint> instead — it auto-injects the
+  whole conversation so far, so the earlier detail doesn't need repeating.
 
 To read a file:
   ACTION: /read <file>
 
 To create or fully replace a file: write the full code block, then:
-  ACTION: /save <file> code
+  ACTION: /save_code <file>
+
+To create a directory (parent folders included, no error if it already exists):
+  ACTION: /mkdir <path>
+
+To list a directory's contents:
+  ACTION: /ls [path]
 
 Available tools:
 {tool_list}
@@ -455,11 +468,18 @@ You are an autonomous coding assistant. Complete the task using the available to
 To call a tool, write ACTION: followed by the command. Stop and wait for [tool result].
 When the task is complete, write a short summary and end with: Task is complete.
 
-How to write files (the keyword "code" means: use the last ``` ``` block written above):
-- To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch <file> code
+How to write files:
+- To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch_code <file>
   Or use FIM for targeted fixes: ACTION: /fim <file> <line or start-end> <hint>
-- To INSERT new code at a line: write the code block, then ACTION: /insert <file> <line> code
-- To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
+  /fim is isolated — only the hint you write reaches it, nothing else from this
+  conversation. If a short hint should be enough because this was already discussed,
+  use ACTION: /fimctx <file> <line or start-end> <short hint> instead — it auto-injects
+  this whole conversation so far, so you don't need to repeat the detail yourself.
+- To INSERT new code at a line: write the code block, then ACTION: /insert_code <file> <line>
+- To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save_code <file>
+- To CREATE MULTIPLE files in one reply: give each fence its own filename on the
+  opening ``` line (```python path/to/file.py), then a single ACTION: /save_code
+  (no arguments) saves every named block to its file in one call.
 
 SEARCH/REPLACE format:
 <<<<<<< SEARCH
@@ -472,6 +492,9 @@ Rules:
 - /readln a file before editing it
 - /bkup save <file> before modifying important files
 - /run to test after applying a fix
+- /mkdir <path> to create a directory before writing files into it — do not
+  rely on /run mkdir/md, which differs between Windows and Linux
+- /ls [path] to see a directory's contents before deciding what to do next
 
 Available tools:
 {tool_list}
@@ -539,6 +562,20 @@ Commands
           /tree src
           /tree src/java/com -d 6
           /tree static ctx
+
+/ls [path]
+    List a directory's contents (files and subdirectories), one level deep.
+    Skips noisy directories (.git, node_modules, __pycache__, etc. — same
+    list /tree and /find skip). Default path: current directory.
+    e.g.  /ls
+          /ls src
+
+/mkdir <path> [path2 ...]
+    Create a directory, including any missing parent directories.
+    No error if it already exists. Pure Python (os.makedirs) — behaves the
+    same on Windows and Linux, unlike /run mkdir/md.
+    e.g.  /mkdir tests
+          /mkdir src/utils data/cache
 
 /find <pattern> [-f] [-c] [-i] [--ext <ext>] [ctx]
     Search filenames and file content for <pattern> (regex supported).
@@ -622,6 +659,14 @@ Commands
     Most precise form — use when you know the exact line range.
     e.g.  /edit main.py 1-4 code
 
+/edit_code <file> [line|start-end]
+    Same as /edit ... code, without the 'code' keyword — always applies
+    the last AI reply's code block. Prefer this over /edit ... code in
+    agents (nothing to forget).
+    e.g.  /edit_code main.py
+          /edit_code main.py 312
+          /edit_code main.py 1-4
+
 /insert <file> <line>
     Insert last AI reply before line N (full text, no code extraction).
     e.g.  /insert notes.txt 5
@@ -633,6 +678,12 @@ Commands
     e.g.  /insert main.py 14 SET_SLEEP_DELAY = 10
           /insert config.py 1 import os
 
+/insert_code <file> <line>
+    Same as /insert <file> <line> code, without the 'code' keyword —
+    always inserts the extracted code block. Prefer this over
+    /insert ... code in agents (nothing to forget).
+    e.g.  /insert_code main.py 14
+
 /fix <file> [start-end] [hint]
     AI proposes one-line fix. Shows diff before applying.
     e.g.  /fix main.py
@@ -641,13 +692,28 @@ Commands
 
 /fim <file> [line or start-end] [-w N] [hint]
     FIM-based fix. Marks the line(s), passes file to model, diffs the result.
+    Isolated call — only the hint on this line reaches the model, nothing else
+    from the conversation. Use /fim when you can give a full, detailed instruction
+    for exactly what to do with that section of code; use /fimctx (below) instead
+    for a broader/shorter request that relies on context already discussed.
     Without a line number: passes the whole file with hint only (agent fallback mode).
+    If <file> does not exist and no line/range is given, creates it from the hint instead
+    (a line/range on a nonexistent file is still an error — nothing to mark).
     -w N  pass only N lines of context around the marked section (for large files).
     e.g.  /fim main.py 3
           /fim main.py 3 replace != with ==
           /fim main.py 3-5 fix the logic
           /fim huge.py 14567 -w 20 fix indentation
           /fim main.py fix the division by zero bug
+          /fim routes/alerts.py create endpoints for reporting an alert   (file doesn't exist yet)
+
+/fimctx <file> [line or start-end] [-w N] [hint]
+    Same as /fim, but also injects the full currently-active conversation into the
+    call: the agent's own turn history when run inside /agent, otherwise the main
+    chat. Use this when a short hint is enough because the model already discussed
+    the details earlier and shouldn't have to repeat them — plain /fim stays
+    isolated (hint alone must carry everything) and is cheaper when it's enough.
+    e.g.  /fimctx routes/alerts.py create the alert endpoints we just discussed
 
 /patch <file> [start-end] [hint]
     AI proposes a multi-line SEARCH/REPLACE edit. Shows unified diff before applying.
@@ -659,6 +725,12 @@ Commands
     Apply SEARCH/REPLACE block from the last AI reply directly (no new LLM call).
     Use in agent mode: write the block in the reply, then ACTION: /patch <file> code
     e.g.  /patch main.py code
+
+/patch_code <file>
+    Same as /patch <file> code, without the 'code' keyword — always
+    applies the SEARCH/REPLACE block from the last AI reply. Prefer this
+    over /patch ... code in agents (nothing to forget).
+    e.g.  /patch_code main.py
 
 /run <command>
     Run shell command, inject output into context.
@@ -680,6 +752,44 @@ Commands
           /save out.txt add-suffix   -> out_1.txt, out_2.txt ...
           /save @/result.txt code    -> pick dir with @/, save chosen_dir/result.txt
           /save @/r1.txt @/r2.txt code  -> pick dir once, save two files there
+
+/save_code <file> [file2 ...] [mode]
+    Same as /save <file> ... code, without the 'code' keyword — always
+    extracts and saves the code block(s). Same file/mode syntax as /save
+    above. Prefer this over /save ... code in agents (nothing to forget).
+    e.g.  /save_code main.py
+          /save_code index.html style.css
+          /save_code main.py -ab
+          /save_code @/result.txt    -> pick dir with @/, save chosen_dir/result.txt
+/save_code  (no file argument)
+    Auto-detect mode: a fence can name its own file on the opening ``` line
+    — ```python main.py, ```python:main.py, or bare ```main.py (a language
+    tag alone, e.g. ```python, or a bare ``` does not count as a name).
+    Saves every NAMED block to its own file; unnamed blocks are skipped —
+    never guessed. Use for a reply containing several files at once.
+    e.g.  /save_code
+          /save_code -ab           -> same auto-detect, mode applies to all
+
+/write
+    No arguments, ever. Saves the NEXT not-yet-consumed NAMED code fence from
+    the current AI reply (same naming rule as /save_code's auto-detect: a
+    fence names itself on its opening ``` line) to the file named in its own
+    header, in the order fences appear — first /write call this reply takes
+    the 1st fence, the next call takes the 2nd, and so on.
+    Unlike /save_code <file> (which always grabs the FIRST code block in the
+    whole reply — fine once, wrong if called several times in one reply for
+    several files), /write is meant to be called once right after each fence:
+    fence, ACTION: /write, fence, ACTION: /write, ... — each call correctly
+    gets its own file, since the filename comes from the fence itself, never
+    typed in the command.
+    e.g.  ```backend/main.py
+          ...
+          ```
+          /write
+          ```backend/models.py
+          ...
+          ```
+          /write
 
 /script list              List all scripts (* = current). Shows global scripts (g:) and project scripts.
 /script open              Select and load a script (type number). Includes global and project scripts.
@@ -1688,10 +1798,16 @@ def ai_fix(base_url, model, content, label, hint="", on_chunk=None, provider="ol
     return None, raw
 
 
-def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, provider="ollama", params=None):
+def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, provider="ollama", params=None, creating=False, context_msgs=None):
     """FIM-based fix: marks line range in the whole file, asks model for corrected file.
-    If start is None: no marker — whole file passed with hint only (agent fallback mode)."""
-    if start is None:
+    If start is None: no marker — whole file passed with hint only (agent fallback mode).
+    If creating: file does not exist yet — ask for new content instead of a fix.
+    If context_msgs: full currently-active conversation (agent or main chat, caller's
+    choice) — prepended so the call isn't isolated from what's already been discussed.
+    This is the /fimctx path; plain /fim never passes this (hint alone must be enough)."""
+    if creating:
+        user_msg = "The file does not exist yet. Create its complete content. Output the complete file."
+    elif start is None:
         file_content = "".join(file_lines)
         user_msg = file_content + "\nFix the issue. Output the complete corrected file."
     else:
@@ -1705,6 +1821,9 @@ def ai_fill(base_url, model, file_lines, start, end, hint="", on_chunk=None, pro
         user_msg = file_content + "\nFix the <<<...>>> section. Output the complete corrected file."
     if hint:
         user_msg = f"{hint}\n\n{user_msg}"
+    if context_msgs:
+        rendered = "\n".join(f"[{m.get('role', '?')}] {m.get('content', '')}" for m in context_msgs)
+        user_msg = f"Conversation context so far:\n{rendered}\n\n---\n\n{user_msg}"
     msgs = [{"role": "user", "content": user_msg}]
     chunks = []
     # num_predict: use file size * 1.5 as ceiling so model can output the corrected file,
@@ -1803,9 +1922,45 @@ def _extract_code_block(text):
     return m.group(1) if m else text
 
 
+def _fence_filename(info: str):
+    """Parse a filename out of a fence's info string (the text right after
+    the opening ``` on the same line), or None if it doesn't name one.
+
+    Accepted forms — last whitespace/colon-separated token, if it looks like
+    a real filename (has an extension, no spaces):
+      ```python main.py      -> main.py   (language + filename)
+      ```python:main.py      -> main.py   (language:filename)
+      ```main.py             -> main.py   (bare filename, no language)
+      ```python               -> None      (language tag only, no dot)
+      ```                     -> None      (nothing at all)
+    """
+    info = info.strip()
+    if not info:
+        return None
+    parts = [p for p in re.split(r'[\s:]+', info) if p]
+    if not parts:
+        return None
+    candidate = parts[-1]
+    if candidate.startswith('.'):
+        return None
+    if re.match(r'^[\w./\\-]+\.[A-Za-z0-9_]{1,10}$', candidate):
+        return candidate
+    return None
+
+
+def _extract_named_code_blocks(text):
+    """Return [(filename_or_None, content), ...] for every ```...``` block
+    in text, in order. filename comes from _fence_filename on the fence's
+    info string — the one place fence-filename parsing lives, so /save_code
+    (bare, auto-detect) and anything else that needs it stays in sync with
+    what a plain _extract_all_code_blocks call sees."""
+    return [(_fence_filename(m.group(1)), m.group(2))
+            for m in re.finditer(r'```([^\n]*)\n(.*?)```', text, re.DOTALL)]
+
+
 def _extract_all_code_blocks(text):
     """Return list of all ```...``` block contents found in text."""
-    return re.findall(r'```[^\n]*\n(.*?)```', text, re.DOTALL)
+    return [content for _fn, content in _extract_named_code_blocks(text)]
 
 
 def _copy_to_clipboard(text: str) -> None:
@@ -2557,8 +2712,10 @@ def _map_patch_remove(map_path: str, rel_prefix: str) -> int:
 # ── command fixer ──────────────────────────────────────────────────────────────
 
 _KNOWN_CMDS = [
-    "/read", "/readln", "/sec", "/view", "/insert", "/edit", "/save", "/run", "/script", "/mcp",
-    "/parallel", "/patch", "/fix", "/fim", "/bkup", "/diff", "/agent", "/tree",
+    "/read", "/readln", "/sec", "/view", "/insert", "/insert_code", "/edit", "/edit_code",
+    "/save", "/save_code", "/write", "/run", "/script", "/mcp",
+    "/parallel", "/patch", "/patch_code", "/fix", "/fim", "/fimctx", "/bkup", "/diff", "/agent", "/tree",
+    "/ls", "/mkdir",
     "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/stats", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
@@ -2569,15 +2726,30 @@ _KNOWN_CMDS = [
 # file_idx : position of the file-path argument (None = no file arg)
 # kw_idx   : position of the subcommand / keyword token (None = no keyword check)
 # keywords : valid values for that token
+#
+# The plain (non-"_code") entries below keep their historic 'code' keyword
+# spec unchanged — legacy syntax stays supported, see chat.py's _cmd_save /
+# _cmd_insert / _cmd_edit / _cmd_patch. Each "_code" sibling has no keyword
+# to fix (the command name itself replaces it) and MUST be listed here as
+# its own exact entry in _KNOWN_CMDS — without it, _fuzzy_fix's difflib step
+# (cutoff=0.65) mis-"corrects" e.g. "/save_code" back to "/save" (ratio
+# 2*5/15 = 0.667), silently breaking the command.
 _CMD_SPEC = {
     "/read":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/readln":   dict(file_idx=1, kw_idx=None, keywords=[]),
     "/view":     dict(file_idx=1, kw_idx=None, keywords=[]),
     "/insert":   dict(file_idx=1, kw_idx=3,    keywords=["code"]),
+    "/insert_code": dict(file_idx=1, kw_idx=None, keywords=[]),
     "/edit":     dict(file_idx=1, kw_idx=None, keywords=[]),
+    "/edit_code": dict(file_idx=1, kw_idx=None, keywords=[]),
     "/save":     dict(file_idx=1, kw_idx=None, keywords=["code", "overwrite",
                       "append-above", "append-below", "add-suffix"]),
+    "/save_code": dict(file_idx=1, kw_idx=None, keywords=["overwrite",
+                      "append-above", "append-below", "add-suffix"]),
     "/patch":    dict(file_idx=1, kw_idx=None, keywords=["code"]),
+    "/patch_code": dict(file_idx=1, kw_idx=None, keywords=[]),
+    "/ls":       dict(file_idx=1, kw_idx=None, keywords=[]),
+    "/mkdir":    dict(file_idx=1, kw_idx=None, keywords=[]),
     "/fix":      dict(file_idx=1, kw_idx=None, keywords=[]),
     "/bkup":     dict(file_idx=2, kw_idx=1,    keywords=["save", "restore"]),
     "/diff":     dict(file_idx=1, kw_idx=None, keywords=[]),
@@ -2676,7 +2848,7 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
         # 2. file path — skip for output commands where file need not exist yet
         #    also skip @ picker tokens (they are not real paths yet)
         fi = spec["file_idx"]
-        if fi is not None and len(tokens) > fi and cmd_root not in ("/save",):
+        if fi is not None and len(tokens) > fi and cmd_root not in ("/save", "/save_code"):
             if not tokens[fi].startswith("@"):
                 fixed_path = _fix_path(tokens[fi])
                 if fixed_path:
@@ -2701,9 +2873,12 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
                     tokens[ki] = fixed_kw
 
         # 4. for /save and /patch: also check LAST token for "code" keyword
+        # (/save_code shares this slot to typo-fix its mode flag, e.g.
+        # "owerwrite" -> "overwrite" — it has no "code" keyword to fix, its
+        # keywords list is mode flags only, see _CMD_SPEC above)
         # Use prefix-only matching (no difflib) to avoid false positives on hint words
         # e.g. "model" would fuzzy-match "code" — prefix won't trigger on it
-        if cmd_root in ("/save", "/patch") and len(tokens) > 2:
+        if cmd_root in ("/save", "/save_code", "/patch") and len(tokens) > 2:
             last_i = len(tokens) - 1
             if last_i not in fixes and last_i != spec.get("file_idx"):
                 if not tokens[last_i].startswith("@"):
@@ -3493,6 +3668,8 @@ class CoderCLI:
         self.models = models
         self.messages = []
         self.last_reply = ""
+        self._write_reply_ref = None   # identity of the reply /write is currently consuming fences from
+        self._write_idx = 0            # how many named fences /write has already consumed for it
         self.last_translated_reply = ""
         self.think_in_ctx = False  # False = strip <think> from context (default)
         self.think_show   = True   # True = show <think> blocks in terminal (default)
@@ -3817,34 +3994,35 @@ class CoderCLI:
 
     # ── REPL ──────────────────────────────────────────────────────────────────
 
-    def run(self):
-        print()
-        print(BANNER)
-        print()
-        print(f"  model    : {self.model}")
-        print(f"  host     : {self.base_url}")
-        print(f"  provider : {self.provider}")
-        print(f"  dir   : {os.getcwd()}")
-        print()
-        print("  /help for all commands   /init to create .1bcoder/ folder")
-        print("  Ctrl+C interrupts stream   /exit to quit")
-        print("  <cmd> -> var  capture output into variable   $ = last output   ~ = last input")
-        print("  @ = file picker   @/ = dir prefix picker   @p = profile picker   @r = rag project picker")
-        print("  tip: /agent ask <question> to analyze code   /read <file> to load   /tree to explore")
-        print()
-        _auto_cfg = {}
-        for _cfg_path in (CONFIG_FILE, GLOBAL_CONFIG_FILE):
-            if os.path.isfile(_cfg_path):
-                _c = self._load_config_file(_cfg_path)
-                if _c.get("auto"):
-                    _auto_cfg = _c
-                    break
-        if _auto_cfg:
-            # host/model already applied at startup — only apply remaining settings
-            _session_cfg = {k: v for k, v in _auto_cfg.items() if k not in ("host", "model")}
-            self._apply_config(_session_cfg)
+    def run(self, _resumed: bool = False):
+        if not _resumed:
             print()
-        self._translate_autoload()
+            print(BANNER)
+            print()
+            print(f"  model    : {self.model}")
+            print(f"  host     : {self.base_url}")
+            print(f"  provider : {self.provider}")
+            print(f"  dir   : {os.getcwd()}")
+            print()
+            print("  /help for all commands   /init to create .1bcoder/ folder")
+            print("  Ctrl+C interrupts stream   /exit to quit")
+            print("  <cmd> -> var  capture output into variable   $ = last output   ~ = last input")
+            print("  @ = file picker   @/ = dir prefix picker   @p = profile picker   @r = rag project picker")
+            print("  tip: /agent ask <question> to analyze code   /read <file> to load   /tree to explore")
+            print()
+            _auto_cfg = {}
+            for _cfg_path in (CONFIG_FILE, GLOBAL_CONFIG_FILE):
+                if os.path.isfile(_cfg_path):
+                    _c = self._load_config_file(_cfg_path)
+                    if _c.get("auto"):
+                        _auto_cfg = _c
+                        break
+            if _auto_cfg:
+                # host/model already applied at startup — only apply remaining settings
+                _session_cfg = {k: v for k, v in _auto_cfg.items() if k not in ("host", "model")}
+                self._apply_config(_session_cfg)
+                print()
+            self._translate_autoload()
         self._print_status()
         while True:
             try:
@@ -3860,25 +4038,39 @@ class CoderCLI:
             try:
                 self._route(user_input)
             except Exception as _exc:
-                import traceback as _tb
-                import datetime as _dt
-                print(f"\n[crash] {type(_exc).__name__}: {_exc}")
-                _tb.print_exc()
-                if self.messages:
-                    _save_dir = os.path.join(
-                        BCODER_DIR if os.path.isdir(BCODER_DIR) else HOME_BCODER_DIR,
-                        "autosave"
-                    )
-                    _stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                    _fpath = os.path.join(_save_dir, f"{_stamp}.txt")
+                # This whole block must never itself be able to raise past this
+                # point: confirmed live (2026-08-21, AnimalAlert/log.txt) that a
+                # print()/console write while handling a subprocess.TimeoutExpired
+                # inside a nested /run raised a SECOND, uncaught exception that
+                # killed the entire process ("During handling of the above
+                # exception, another exception occurred") despite this same
+                # except Exception already being here — the reporting code
+                # itself was the escape route, not the original exception.
+                try:
+                    import traceback as _tb
+                    import datetime as _dt
+                    print(f"\n[crash] {type(_exc).__name__}: {_exc}")
+                    _tb.print_exc()
+                    if self.messages:
+                        _save_dir = os.path.join(
+                            BCODER_DIR if os.path.isdir(BCODER_DIR) else HOME_BCODER_DIR,
+                            "autosave"
+                        )
+                        _stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        _fpath = os.path.join(_save_dir, f"{_stamp}.txt")
+                        try:
+                            os.makedirs(_save_dir, exist_ok=True)
+                            with open(_fpath, "w", encoding="utf-8") as _f:
+                                for _m in self.messages:
+                                    _f.write(f"=== {_m['role']} ===\n{_m['content']}\n\n")
+                            print(f"[crash] context auto-saved → {_fpath}")
+                        except OSError as _e:
+                            print(f"[crash] could not save context: {_e}")
+                except Exception as _inner_exc:
                     try:
-                        os.makedirs(_save_dir, exist_ok=True)
-                        with open(_fpath, "w", encoding="utf-8") as _f:
-                            for _m in self.messages:
-                                _f.write(f"=== {_m['role']} ===\n{_m['content']}\n\n")
-                        print(f"[crash] context auto-saved → {_fpath}")
-                    except OSError as _e:
-                        print(f"[crash] could not save context: {_e}")
+                        sys.stderr.write(f"[crash] (secondary error while reporting the above: {_inner_exc!r})\n")
+                    except Exception:
+                        pass
             self._print_status()
             if len(self.messages) > _msg_count_before:
                 self._do_autosave()
@@ -4047,18 +4239,32 @@ class CoderCLI:
             self._cmd_sec(user_input)
         elif user_input.startswith("/view"):
             self._cmd_view(user_input)
+        elif user_input.startswith("/insert_code"):
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_insert", _ha):
+                self._cmd_insert_code(user_input)
+                self._run_hook("after_insert", _ha)
         elif user_input.startswith("/insert"):
             _ha = self._extract_hook_args(user_input)
             if self._run_hook("before_insert", _ha):
                 self._cmd_insert(user_input)
                 self._run_hook("after_insert", _ha)
+        elif user_input.startswith("/edit_code"):
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_edit", _ha):
+                self._cmd_edit_code(user_input)
+                self._run_hook("after_edit", _ha)
         elif user_input.startswith("/edit"):
             _ha = self._extract_hook_args(user_input)
             if self._run_hook("before_edit", _ha):
                 self._cmd_edit(user_input)
                 self._run_hook("after_edit", _ha)
+        elif user_input.startswith("/save_code"):
+            self._cmd_save_code(user_input)
         elif user_input.startswith("/save"):
             self._cmd_save(user_input)
+        elif user_input.startswith("/write"):
+            self._cmd_write(user_input)
         elif user_input.startswith("/run"):
             parts = user_input.split(None, 1)
             if len(parts) < 2:
@@ -4085,11 +4291,18 @@ class CoderCLI:
             self._cmd_mcp(user_input)
         elif user_input.startswith("/parallel"):
             self._cmd_parallel(user_input)
+        elif user_input.startswith("/patch_code"):
+            _ha = self._extract_hook_args(user_input)
+            if self._run_hook("before_patch", _ha):
+                self._cmd_patch_code(user_input)
+                self._run_hook("after_patch", _ha)
         elif user_input.startswith("/patch"):
             _ha = self._extract_hook_args(user_input)
             if self._run_hook("before_patch", _ha):
                 self._cmd_patch(user_input)
                 self._run_hook("after_patch", _ha)
+        elif user_input.startswith("/fimctx"):
+            self._cmd_fill(user_input, use_ctx=True)
         elif user_input.startswith("/fim"):
             self._cmd_fill(user_input)
         elif user_input.startswith("/fix"):
@@ -4113,6 +4326,10 @@ class CoderCLI:
             self._cmd_agent(user_input)
         elif user_input.startswith("/tree"):
             self._cmd_tree(user_input)
+        elif user_input.startswith("/ls"):
+            self._cmd_ls(user_input)
+        elif user_input.startswith("/mkdir"):
+            self._cmd_mkdir(user_input)
         elif user_input.startswith("/find"):
             self._cmd_find(user_input)
         elif user_input.startswith("/team"):
@@ -5289,6 +5506,77 @@ advanced_tools =
                 self.messages.append({"role": "user", "content": ctx_text})
                 _ok(f"[tree] injected into context ({len(plain_lines)} lines)")
 
+    # ── /ls ────────────────────────────────────────────────────────────────────
+
+    def _cmd_ls(self, user_input: str):
+        tokens   = user_input.split()[1:]  # drop "/ls"
+        path_arg = tokens[0] if tokens else None
+
+        target = os.path.normpath(os.path.join(WORKDIR, path_arg) if path_arg else WORKDIR)
+        if not os.path.isdir(target):
+            _err(f"not a directory: {target}")
+            return
+
+        try:
+            entries = sorted(os.listdir(target))
+        except OSError as e:
+            _err(e)
+            return
+
+        dirs  = [e for e in entries
+                 if os.path.isdir(os.path.join(target, e)) and e not in self._FIND_SKIP_DIRS]
+        files = [e for e in entries if os.path.isfile(os.path.join(target, e))]
+
+        display = path_arg if path_arg else "."
+        lines = [f"{e}/" for e in dirs] + files
+        if not lines:
+            print(f"{display}/  (empty)")
+            output = f"{display}/  (empty)"
+        else:
+            print(f"{display}/")
+            for l in lines:
+                print(f"  {l}")
+            output = f"{display}/\n" + "\n".join(f"  {l}" for l in lines)
+
+        self._last_output = output
+        if not self._auto_apply:
+            self.messages.append(
+                {"role": "user", "content": f"[ls: {display}]\n```\n{output}\n```"}
+            )
+
+    # ── /mkdir ─────────────────────────────────────────────────────────────────
+
+    def _cmd_mkdir(self, user_input: str):
+        tokens = user_input.split()[1:]  # drop "/mkdir"
+        if not tokens:
+            print("usage: /mkdir <path> [path2 ...]")
+            return
+
+        created, failed = [], []
+        for path_arg in tokens:
+            target = os.path.normpath(os.path.join(WORKDIR, path_arg))
+            already = os.path.isdir(target)
+            try:
+                os.makedirs(target, exist_ok=True)
+            except OSError as e:
+                _err(f"{path_arg}: {e}")
+                failed.append(path_arg)
+                continue
+            if already:
+                print(f"[mkdir] already exists: {path_arg}")
+            else:
+                print(f"[mkdir] created: {path_arg}")
+                created.append(path_arg)
+
+        output = (f"created: {', '.join(created)}" if created
+                  else "nothing created — path(s) already existed" if not failed
+                  else "failed to create: " + ", ".join(failed))
+        self._last_output = output
+        if not self._auto_apply:
+            self.messages.append(
+                {"role": "user", "content": f"[mkdir: {' '.join(tokens)}]\n{output}"}
+            )
+
     # ── /find ──────────────────────────────────────────────────────────────────
 
     _FIND_SKIP_DIRS = frozenset({
@@ -5541,8 +5829,18 @@ advanced_tools =
                 content, total = read_file(path, start, end, line_numbers=ln)
                 self._stats["files_read"] += 1
                 label = path + (f" lines {start}-{end}" if start else f" ({total} lines)")
-                if self._auto_apply:
-                    # inside agent: print to stdout so Tee captures it for agent_msgs
+                if self._in_agent:
+                    # inside agent (any agent, regardless of its own auto_apply
+                    # config): print to stdout so Tee captures it for agent_msgs.
+                    # Was gated on self._auto_apply, which is only True for
+                    # agents whose OWN config sets auto_apply=true (coder,
+                    # terminator...) -- for auto_apply=false agents (advance),
+                    # that left this branch unreachable and the else branch
+                    # silently appended the file content to self.messages (the
+                    # MAIN session, not agent_msgs), so the agent itself never
+                    # saw it -- only the short "context: injected ..." line
+                    # printed alongside. Confirmed as a real, reproduced
+                    # failure: /agent advance reading a file.
                     print(f"[file: {label}]\n```\n{content}```")
                 else:
                     self.messages.append({"role": "user", "content": f"[file: {label}]\n```\n{content}```"})
@@ -5638,7 +5936,7 @@ advanced_tools =
         content = "".join(f"{start + 1 + i:4}: {ln}" for i, ln in enumerate(section))
         label = f"{os.path.basename(filepath)} [{mode}] lines {start+1}-{end+1}"
         msg = f"[file: {label}]\n```\n{content}```"
-        if self._auto_apply:
+        if self._in_agent:   # see _cmd_read for why this checks _in_agent, not _auto_apply
             print(msg)
         else:
             self.messages.append({"role": "user", "content": msg})
@@ -5688,7 +5986,13 @@ advanced_tools =
         has_prompt = bool(prompt_words)
         prompt = " ".join(prompt_words) if has_prompt else f"[image: {', '.join(labels)}]"
         msg = {"role": "user", "content": prompt, "images": b64_images}
-        if self._auto_apply:
+        if self._in_agent:   # see _cmd_read for why this checks _in_agent, not _auto_apply
+            # NOTE: this only prints a text label, never the actual image data --
+            # that's a pre-existing separate limitation (images can't flow through
+            # a stdout Tee capture the way text can), true for every agent, not
+            # just ones with auto_apply=false. Left as-is; the _in_agent fix here
+            # only makes advance's behavior consistent with the other agents'
+            # (equally limited) behavior instead of leaking into self.messages.
             print(f"[image: {', '.join(labels)}] {prompt}")
         else:
             self.messages.append(msg)
@@ -5709,7 +6013,101 @@ advanced_tools =
                 _ok(f"context: injected image(s): {', '.join(labels)}"
                     + ("" if keep else "  (use --keep to retain; default strips on next reply)"))
 
+    def _apply_edit_code(self, path: str, line_start, line_end, new_code: str) -> None:
+        """Shared apply-from-code logic for /edit ... code and /edit_code —
+        the only place this logic lives; both commands call in here instead
+        of each re-implementing the diff/confirm/write sequence."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                file_lines = f.readlines()
+        except FileNotFoundError:
+            file_lines = []
+            line_start = line_end = None
+            _info(f"[new file: {path}]")
+        except OSError as e:
+            _err(e)
+            return
+        new_lines = new_code.splitlines(keepends=True)
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] += "\n"
+        if line_start is not None:
+            offset = line_start - 1
+            if line_end is not None:
+                # range given: replace lines start–end
+                original_segment = file_lines[offset:line_end]
+                new_file_lines = file_lines[:offset] + new_lines + file_lines[line_end:]
+                label = f"{line_start}-{line_end}"
+            else:
+                # single line: insert before that line, nothing removed
+                original_segment = []
+                new_file_lines = file_lines[:offset] + new_lines + file_lines[offset:]
+                label = f"{line_start} (insert)"
+            diff = list(difflib.unified_diff(
+                original_segment, new_lines,
+                fromfile=f"{path}:{label} (current)",
+                tofile=f"{path}:{label} (proposed)",
+                lineterm="",
+            ))
+        else:
+            new_file_lines = new_lines
+            diff = list(difflib.unified_diff(
+                file_lines, new_lines,
+                fromfile=f"{path} (current)",
+                tofile=f"{path} (proposed)",
+                lineterm="",
+            ))
+        if not diff:
+            print("[no changes detected]")
+            return
+        for dline in diff:
+            print(_cdiff(dline))
+        if self._confirm("  apply? [Y/n]:"):
+            try:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(new_file_lines)
+                _ok(f"[saved {path}]")
+            except OSError as e:
+                _err(e)
+        else:
+            print("[skipped]")
+
+    def _cmd_edit_code(self, user_input: str):
+        """/edit_code <file> [line|start-end] — apply the last AI reply's
+        code block, no 'code' keyword needed (implied by the command name).
+        This is the one place the apply-from-code logic lives (see
+        _apply_edit_code); the legacy /edit <file> [line] code form (see
+        _cmd_edit) delegates here instead of re-implementing it."""
+        tokens = user_input.split()
+        if len(tokens) < 2:
+            print("usage: /edit_code <file> [line|start-end]")
+            return
+        path = tokens[1]
+        line_start = line_end = None
+        if len(tokens) > 2:
+            m = re.match(r'^(\d+)(?:-(\d+))?$', tokens[2])
+            if not m:
+                print("usage: /edit_code <file> [line|start-end]")
+                return
+            line_start = int(m.group(1))
+            line_end = int(m.group(2)) if m.group(2) else None
+        if not self.last_reply:
+            print("no AI response yet")
+            return
+        block = _extract_code_block(self.last_reply)
+        if not block:
+            print("[edit_code] no code block found in last reply")
+            return
+        new_code = "\n".join(_strip_line_numbers(block.splitlines()))
+        self._apply_edit_code(path, line_start, line_end, new_code)
+
     def _cmd_edit(self, user_input: str):
+        """Legacy /edit <file> <line> | /edit <file> [line] code. The
+        apply-from-code logic lives in _cmd_edit_code — when the 'code'
+        keyword is present, this delegates there instead of re-implementing
+        it; use /edit_code directly to skip the keyword requirement."""
         tokens = user_input.split()
         if len(tokens) < 3:
             print("usage: /edit <file> <line>  |  /edit <file> [line] code")
@@ -5718,7 +6116,8 @@ advanced_tools =
         rest = tokens[2:]
         has_code = rest[-1].lower()[:4] == "code"
         if self._in_agent and not has_code:
-            _warn(f"[agent] /edit {path} — missing 'code' keyword, agent reply won't be used")
+            _warn(f"[agent] /edit {path} — missing 'code' keyword, agent reply won't be used. "
+                  f"Use /edit_code instead to always use the agent reply.")
         if has_code:
             rest = rest[:-1]
         line_start = line_end = None
@@ -5730,127 +6129,36 @@ advanced_tools =
             line_start = int(m.group(1))
             line_end = int(m.group(2)) if m.group(2) else None
         if has_code:
-            if not self.last_reply:
-                print("no AI response yet")
-                return
-            new_code = "\n".join(
-                _strip_line_numbers(_extract_code_block(self.last_reply).splitlines())
-            )
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    file_lines = f.readlines()
-            except FileNotFoundError:
-                file_lines = []
-                line_start = line_end = None
-                _info(f"[new file: {path}]")
-            except OSError as e:
-                _err(e)
-                return
-            new_lines = new_code.splitlines(keepends=True)
-            if new_lines and not new_lines[-1].endswith("\n"):
-                new_lines[-1] += "\n"
+            resynth = f"/edit_code {path}"
             if line_start is not None:
-                offset = line_start - 1
-                if line_end is not None:
-                    # range given: replace lines start–end
-                    original_segment = file_lines[offset:line_end]
-                    new_file_lines = file_lines[:offset] + new_lines + file_lines[line_end:]
-                    label = f"{line_start}-{line_end}"
-                else:
-                    # single line: insert before that line, nothing removed
-                    original_segment = []
-                    new_file_lines = file_lines[:offset] + new_lines + file_lines[offset:]
-                    label = f"{line_start} (insert)"
-                diff = list(difflib.unified_diff(
-                    original_segment, new_lines,
-                    fromfile=f"{path}:{label} (current)",
-                    tofile=f"{path}:{label} (proposed)",
-                    lineterm="",
-                ))
-            else:
-                new_file_lines = new_lines
-                diff = list(difflib.unified_diff(
-                    file_lines, new_lines,
-                    fromfile=f"{path} (current)",
-                    tofile=f"{path} (proposed)",
-                    lineterm="",
-                ))
-            if not diff:
-                print("[no changes detected]")
-                return
-            for dline in diff:
-                print(_cdiff(dline))
-            if self._confirm("  apply? [Y/n]:"):
-                try:
-                    parent = os.path.dirname(path)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.writelines(new_file_lines)
-                    _ok(f"[saved {path}]")
-                except OSError as e:
-                    _err(e)
-            else:
-                print("[skipped]")
-        else:
-            if line_start is None:
-                print("hint: to save whole file use /edit <file> code  |  to patch use /patch <file> code")
-                return
-            try:
-                content, _ = read_file(path, line_start, line_start)
-                current = content.split(":", 1)[1].strip() if ":" in content else content.strip()
-                print(f"  current [{line_start}]: {current}")
-            except (FileNotFoundError, OSError) as e:
-                _err(e)
-                return
-            new_content = self._prompt_input("  new content (blank = keep):")
-            if new_content:
-                try:
-                    edit_line(path, line_start, new_content)
-                    print(f"[line {line_start} updated in {path}]")
-                except (ValueError, OSError) as e:
-                    _err(e)
-            else:
-                print("[no change]")
-
-    def _cmd_insert(self, user_input: str):
-        """Insert last AI reply (or its code block) before line N in file."""
-        tokens = user_input.split()
-        # /insert <file> <line> [code]
-        if len(tokens) < 3:
-            print("usage: /insert <file> <line> [code]")
+                resynth += f" {line_start}" + (f"-{line_end}" if line_end else "")
+            self._cmd_edit_code(resynth)
             return
-        path = tokens[1]
+        if line_start is None:
+            print("hint: to save whole file use /edit <file> code  |  to patch use /patch <file> code")
+            return
         try:
-            line_n = int(tokens[2])
-        except ValueError:
-            print("usage: /insert <file> <line> [code]  — line must be a number")
+            content, _ = read_file(path, line_start, line_start)
+            current = content.split(":", 1)[1].strip() if ":" in content else content.strip()
+            print(f"  current [{line_start}]: {current}")
+        except (FileNotFoundError, OSError) as e:
+            _err(e)
             return
-        has_code   = len(tokens) > 3 and tokens[3].lower() == "code"
-        if self._in_agent and not has_code:
-            _warn(f"[agent] /insert {tokens[1] if len(tokens)>1 else ''} — missing 'code' keyword, agent reply won't be used")
-        inline_text = None
-        if len(tokens) > 3 and tokens[3].lower() != "code":
-            # Preserve indentation: skip past cmd, file, line_n in original string,
-            # then take everything verbatim (including leading spaces).
-            m = re.match(r'\S+\s+\S+\s+\S+(.*)', user_input, re.DOTALL)
-            inline_text = m.group(1) if m else user_input.split(None, 3)[3]
-
-        if inline_text is not None:
-            text = inline_text
+        new_content = self._prompt_input("  new content (blank = keep):")
+        if new_content:
+            try:
+                edit_line(path, line_start, new_content)
+                print(f"[line {line_start} updated in {path}]")
+            except (ValueError, OSError) as e:
+                _err(e)
         else:
-            if not self.last_reply:
-                print("no AI response yet")
-                return
-            if has_code:
-                raw = _extract_code_block(self.last_reply)
-                if not raw:
-                    print("[insert] no code block found in last reply")
-                    return
-                text = "\n".join(_strip_line_numbers(raw.splitlines()))
-            else:
-                text = self.last_reply.strip()
+            print("[no change]")
 
+    def _apply_insert(self, path: str, line_n: int, text: str) -> None:
+        """Shared apply logic for /insert ... code, /insert_code, and the
+        inline-text form of /insert — the only place this logic lives; all
+        three call in here instead of each re-implementing the diff/confirm/
+        write sequence."""
         new_lines = text.splitlines(keepends=False)
         new_lines = [ln + "\n" for ln in new_lines]
 
@@ -5885,6 +6193,76 @@ advanced_tools =
                 _err(e)
         else:
             print("[skipped]")
+
+    def _cmd_insert_code(self, user_input: str):
+        """/insert_code <file> <line> — insert the last AI reply's code
+        block before line N, no 'code' keyword needed (implied by the
+        command name). This is the one place the extract-and-insert logic
+        lives (see _apply_insert for the write step); the legacy
+        /insert <file> <line> code form (see _cmd_insert) delegates here
+        instead of re-implementing it."""
+        tokens = user_input.split()
+        if len(tokens) < 3:
+            print("usage: /insert_code <file> <line>")
+            return
+        path = tokens[1]
+        try:
+            line_n = int(tokens[2])
+        except ValueError:
+            print("usage: /insert_code <file> <line>  — line must be a number")
+            return
+        if not self.last_reply:
+            print("no AI response yet")
+            return
+        raw = _extract_code_block(self.last_reply)
+        if not raw:
+            print("[insert_code] no code block found in last reply")
+            return
+        text = "\n".join(_strip_line_numbers(raw.splitlines()))
+        self._apply_insert(path, line_n, text)
+
+    def _cmd_insert(self, user_input: str):
+        """Legacy /insert <file> <line> [code|inline text]. The
+        extract-and-insert logic lives in _cmd_insert_code — when the
+        'code' keyword is present, this delegates there instead of
+        re-implementing it; use /insert_code directly to skip the keyword
+        requirement. The inline-text form is unrelated to the 'code'
+        qualifier and is kept here as-is."""
+        tokens = user_input.split()
+        # /insert <file> <line> [code]
+        if len(tokens) < 3:
+            print("usage: /insert <file> <line> [code]")
+            return
+        path = tokens[1]
+        try:
+            line_n = int(tokens[2])
+        except ValueError:
+            print("usage: /insert <file> <line> [code]  — line must be a number")
+            return
+        has_code   = len(tokens) > 3 and tokens[3].lower() == "code"
+        if self._in_agent and not has_code:
+            _warn(f"[agent] /insert {tokens[1] if len(tokens)>1 else ''} — missing 'code' keyword, agent reply won't be used. "
+                  f"Use /insert_code instead to always use the agent reply.")
+        if has_code:
+            self._cmd_insert_code(f"/insert_code {path} {line_n}")
+            return
+
+        inline_text = None
+        if len(tokens) > 3:
+            # Preserve indentation: skip past cmd, file, line_n in original string,
+            # then take everything verbatim (including leading spaces).
+            m = re.match(r'\S+\s+\S+\s+\S+(.*)', user_input, re.DOTALL)
+            inline_text = m.group(1) if m else user_input.split(None, 3)[3]
+
+        if inline_text is not None:
+            text = inline_text
+        else:
+            if not self.last_reply:
+                print("no AI response yet")
+                return
+            text = self.last_reply.strip()
+
+        self._apply_insert(path, line_n, text)
 
     def _cmd_fix(self, user_input: str):
         parts = user_input[4:].strip().split(None, 2)
@@ -5946,13 +6324,21 @@ advanced_tools =
         else:
             print("[skipped]")
 
-    def _cmd_fill(self, user_input: str):
-        parts = user_input[4:].strip().split(None, 2)
+    def _cmd_fill(self, user_input: str, use_ctx: bool = False):
+        """/fim (use_ctx=False): isolated call — hint must carry everything needed.
+        /fimctx (use_ctx=True): same, plus the full currently-active conversation
+        (agent context if inside /agent, else the main chat) is auto-injected —
+        for a short hint given by a model that already has that context in its
+        own head but tends to forget to repeat it (see chat.py:7998 for the same
+        agent-vs-chat context selection used by /web)."""
+        cmd_word = user_input.split(None, 1)[0]
+        usage_cmd = cmd_word if cmd_word in ("/fim", "/fimctx") else ("/fimctx" if use_ctx else "/fim")
+        parts = user_input[len(cmd_word):].strip().split(None, 2)
         path = parts[0] if parts else ""
         start = end = None
         hint = ""
         if not path:
-            print("usage: /fim <file> <line or start-end> [-w N] [hint]")
+            print(f"usage: {usage_cmd} <file> <line or start-end> [-w N] [hint]")
             return
         if len(parts) >= 2:
             m = re.match(r'^(\d+)(?:-(\d+))?$', parts[1])
@@ -5963,18 +6349,27 @@ advanced_tools =
             else:
                 hint = " ".join(parts[1:])
         if start is None and not hint:
-            print("usage: /fim <file> [line or start-end] [-w N] [hint]")
+            print(f"usage: {usage_cmd} <file> [line or start-end] [-w N] [hint]")
             return
+        tag = usage_cmd[1:]   # "fim" or "fimctx" — for status messages below
         # extract -w <window> from hint
         window = None
         wm = re.search(r'(?:^|\s)-w\s+(\d+)', hint)
         if wm:
             window = int(wm.group(1))
             hint = (hint[:wm.start()] + hint[wm.end():]).strip()
+        creating = False
         try:
             with open(path, "r", encoding="utf-8") as f:
                 file_lines = f.readlines()
-        except (FileNotFoundError, OSError) as e:
+        except FileNotFoundError:
+            if start is not None:
+                _err(f"[Errno 2] No such file or directory: '{path}' (line range needs an existing file)")
+                return
+            file_lines = []
+            creating = True
+            print(f"[{tag}] {path} does not exist — creating from description")
+        except OSError as e:
             _err(e)
             return
         total = len(file_lines)
@@ -5995,13 +6390,18 @@ advanced_tools =
         if hint:
             print(f"hint: {hint}")
         if window is not None:
-            print(f"[fim] window: lines {w_start+1}–{w_end} of {total}")
+            print(f"[{tag}] window: lines {w_start+1}–{w_end} of {total}")
+        context_msgs = None
+        if use_ctx:
+            context_msgs = self._agent_msgs if (self._in_agent and self._agent_msgs) else self.messages
+            src = "agent" if (self._in_agent and self._agent_msgs) else "chat"
+            print(f"[{tag}] injecting {len(context_msgs)} {src} context message(s)")
         self._sep("AI")
         def on_chunk(c):
             sys.stdout.write(c)
             sys.stdout.flush()
         try:
-            raw = ai_fill(self.base_url, self.model, slice_lines, rel_start, rel_end, hint, on_chunk, self.provider, self.params)
+            raw = ai_fill(self.base_url, self.model, slice_lines, rel_start, rel_end, hint, on_chunk, self.provider, self.params, creating=creating, context_msgs=context_msgs)
         except KeyboardInterrupt:
             print("\n[interrupted]")
             return
@@ -6021,16 +6421,22 @@ advanced_tools =
         full_new = file_lines[:w_start] + new_slice + file_lines[w_end:]
         diff = list(difflib.unified_diff(file_lines, full_new, fromfile=path, tofile=path + " (fixed)", lineterm=""))
         if not diff:
-            print("[fim] no changes detected — try a different hint or model")
+            print(f"[{tag}] no changes detected — try a different hint or model")
             return
         for dline in diff:
             print(_cdiff(dline))
         if self._confirm("  apply? [Y/n]:"):
             try:
+                dirpart = os.path.dirname(path)
+                if dirpart:
+                    os.makedirs(dirpart, exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
                     f.writelines(full_new)
-                changed = sum(1 for d in diff if d.startswith('+') and not d.startswith('+++'))
-                print(f"[{changed} line(s) updated in {path}]")
+                if creating:
+                    print(f"[{tag}] created {len(full_new)} line(s) in {path}")
+                else:
+                    changed = sum(1 for d in diff if d.startswith('+') and not d.startswith('+++'))
+                    print(f"[{changed} line(s) updated in {path}]")
             except OSError as e:
                 _err(e)
         else:
@@ -6222,51 +6628,12 @@ advanced_tools =
         else:
             _err(f"unknown subcommand '{sub}' — use save or restore")
 
-    def _cmd_patch(self, user_input: str):
-        parts = user_input[6:].strip().split(None, 2)
-        path = parts[0] if parts else ""
-        start = end = None
-        hint = ""
-        if not path:
-            print("usage: /patch <file> [start-end] [hint]  |  /patch <file> code")
-            return
-
-        # /patch <file> code — apply SEARCH/REPLACE block from last AI reply
-        if self._in_agent and (len(parts) < 2 or parts[-1].lower() != "code"):
-            _warn(f"[agent] /patch {path} — missing 'code' keyword, will run interactive mode instead of using agent reply")
-        if len(parts) >= 2 and parts[-1].lower() == "code":
-            if not self.last_reply:
-                print("no AI response yet")
-                return
-            raw = self.last_reply
-        else:
-            if len(parts) >= 2:
-                if re.match(r'^\d+-\d+$', parts[1]):
-                    try:
-                        s, e = parts[1].split("-")
-                        start, end = int(s), int(e)
-                    except ValueError:
-                        pass
-                    hint = parts[2] if len(parts) >= 3 else ""
-                else:
-                    hint = " ".join(parts[1:])
-            try:
-                content, total = read_file(path, start, end, line_numbers=False)
-                label = path + (f" lines {start}-{end}" if start else f" ({total} lines)")
-            except (FileNotFoundError, OSError) as e:
-                _err(e)
-                return
-            user_msg = f"Fix the code in this file ({label}):\n```\n{content}```"
-            if hint:
-                user_msg = f"{hint}\n\n{user_msg}"
-            msgs = [
-                {"role": "system", "content": PATCH_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ]
-            self._sep("AI")
-            raw = self._stream_chat(msgs)
-            if not raw:
-                return
+    def _apply_patch(self, path: str, raw: str) -> None:
+        """Shared apply logic for /patch ... code, /patch_code, and the
+        AI-generated form of /patch — the only place this logic lives; all
+        three arrive here once `raw` (the text containing a SEARCH/REPLACE
+        block) is resolved, and call in here instead of each
+        re-implementing the parse/diff/confirm/write sequence."""
         search_text, replace_text = _parse_patch(raw)
         if search_text is None:
             print("could not parse SEARCH/REPLACE block — try a more capable model")
@@ -6322,41 +6689,90 @@ advanced_tools =
         else:
             print("[skipped]")
 
-    def _cmd_save(self, user_input: str):
-        _MODE_KEYWORDS = {
-            "code", "overwrite",
-            "append-above", "append_above", "-aa",
-            "append-below", "append_below", "-ab",
-            "add-suffix", "add_suffix",
-        }
-        raw_tokens = user_input.split()[1:]
-        if not raw_tokens:
-            print("usage: /save <file> [code] [overwrite|append-above|append-below|add-suffix]")
+    def _cmd_patch_code(self, user_input: str):
+        """/patch_code <file> — apply the SEARCH/REPLACE block from the last
+        AI reply, no 'code' keyword needed (implied by the command name).
+        This is the one place the use-last-reply logic lives (see
+        _apply_patch for the parse/apply step); the legacy
+        /patch <file> code form (see _cmd_patch) delegates here instead of
+        re-implementing it."""
+        tokens = user_input.split()
+        path = tokens[1] if len(tokens) > 1 else ""
+        if not path:
+            print("usage: /patch_code <file>")
             return
         if not self.last_reply:
             print("no AI response yet")
             return
-        tokens = [p for t in raw_tokens for p in t.split(",") if p]
-        files = [t for t in tokens if t.lower() not in _MODE_KEYWORDS]
-        flags = {t.lower() for t in tokens if t.lower() in _MODE_KEYWORDS}
-        if not files:
-            print("usage: /save <file> [code] [mode]")
+        self._apply_patch(path, self.last_reply)
+
+    def _cmd_patch(self, user_input: str):
+        """Legacy /patch <file> [start-end] [hint] | /patch <file> code. The
+        use-last-reply logic lives in _cmd_patch_code — when the 'code'
+        keyword is present, this delegates there instead of re-implementing
+        it; use /patch_code directly to skip the keyword requirement. The
+        AI-generation form (no 'code' keyword) is unrelated to the 'code'
+        qualifier and is kept here as-is, sharing only the final apply step
+        via _apply_patch."""
+        parts = user_input[6:].strip().split(None, 2)
+        path = parts[0] if parts else ""
+        start = end = None
+        hint = ""
+        if not path:
+            print("usage: /patch <file> [start-end] [hint]  |  /patch <file> code")
             return
+
+        # /patch <file> code — apply SEARCH/REPLACE block from last AI reply
+        if self._in_agent and (len(parts) < 2 or parts[-1].lower() != "code"):
+            _warn(f"[agent] /patch {path} — missing 'code' keyword, will run interactive mode instead of using agent reply. "
+                  f"Use /patch_code instead to always use the agent reply.")
+        if len(parts) >= 2 and parts[-1].lower() == "code":
+            self._cmd_patch_code(f"/patch_code {path}")
+            return
+
+        if len(parts) >= 2:
+            if re.match(r'^\d+-\d+$', parts[1]):
+                try:
+                    s, e = parts[1].split("-")
+                    start, end = int(s), int(e)
+                except ValueError:
+                    pass
+                hint = parts[2] if len(parts) >= 3 else ""
+            else:
+                hint = " ".join(parts[1:])
+        try:
+            content, total = read_file(path, start, end, line_numbers=False)
+            label = path + (f" lines {start}-{end}" if start else f" ({total} lines)")
+        except (FileNotFoundError, OSError) as e:
+            _err(e)
+            return
+        user_msg = f"Fix the code in this file ({label}):\n```\n{content}```"
+        if hint:
+            user_msg = f"{hint}\n\n{user_msg}"
+        msgs = [
+            {"role": "system", "content": PATCH_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ]
+        self._sep("AI")
+        raw = self._stream_chat(msgs)
+        if not raw:
+            return
+        self._apply_patch(path, raw)
+
+    def _save_mode_from_flags(self, flags: set) -> str:
+        """Shared mode-flag resolution for /save and /save_code."""
         if flags & {"-ab", "append-below", "append_below"}:
-            action = "append_below"
-        elif flags & {"-aa", "append-above", "append_above"}:
-            action = "append_above"
-        elif flags & {"add-suffix", "add_suffix"}:
-            action = "add_suffix"
-        else:
-            action = "overwrite"
-        if self._in_agent and "code" not in flags:
-            _warn(f"[agent] /save {files[0] if files else ''} — missing 'code' keyword, raw reply will be saved instead of code block")
-        if "code" in flags:
-            blocks = _extract_all_code_blocks(self.last_reply) or [self.last_reply]
-            contents = [blocks[i] if i < len(blocks) else blocks[-1] for i in range(len(files))]
-        else:
-            contents = [self.last_reply] * len(files)
+            return "append_below"
+        if flags & {"-aa", "append-above", "append_above"}:
+            return "append_above"
+        if flags & {"add-suffix", "add_suffix"}:
+            return "add_suffix"
+        return "overwrite"
+
+    def _write_saved_files(self, files: list, contents: list, action: str) -> None:
+        """Shared write step for /save and /save_code — the only place this
+        logic lives; both call in here once `contents` (raw reply or
+        extracted code block, one per file) is resolved."""
         for path, content in zip(files, contents):
             try:
                 dirpart = os.path.dirname(path)
@@ -6385,6 +6801,124 @@ advanced_tools =
                     print(f"saved → {target}")
             except OSError as e:
                 _err(e)
+
+    def _cmd_save_code(self, user_input: str):
+        """/save_code [file] [file2 ...] [mode] — save the last AI reply's
+        code block(s) to file(s), no 'code' keyword needed (implied by the
+        command name). This is the one place the extract-and-save logic
+        lives (see _write_saved_files for the write step); the legacy
+        /save <file> code form (see _cmd_save) delegates here instead of
+        re-implementing it.
+
+        With no file argument at all: auto-detect named fences instead —
+        every ```lang path/to/file.ext (or bare ```file.ext) block gets
+        saved to the file named in its own fence, via _extract_named_code_blocks.
+        Unnamed fences (```lang or bare ```) are skipped, never guessed."""
+        _MODE_KEYWORDS = {
+            "overwrite",
+            "append-above", "append_above", "-aa",
+            "append-below", "append_below", "-ab",
+            "add-suffix", "add_suffix",
+        }
+        raw_tokens = user_input.split()[1:]
+        if not self.last_reply:
+            print("no AI response yet")
+            return
+        tokens = [p for t in raw_tokens for p in t.split(",") if p]
+        files = [t for t in tokens if t.lower() not in _MODE_KEYWORDS]
+        flags = {t.lower() for t in tokens if t.lower() in _MODE_KEYWORDS}
+        action = self._save_mode_from_flags(flags)
+
+        if not files:
+            named = [(fn, content) for fn, content in _extract_named_code_blocks(self.last_reply) if fn]
+            if not named:
+                print("usage: /save_code <file> [file2 ...] [mode]")
+                print("       /save_code  (no file) needs at least one named fence, "
+                      "e.g. ```python main.py ... ```  or  ```main.py ... ```")
+                return
+            files    = [fn for fn, _c in named]
+            contents = [c for _fn, c in named]
+            self._write_saved_files(files, contents, action)
+            return
+
+        blocks = _extract_all_code_blocks(self.last_reply) or [self.last_reply]
+        contents = [blocks[i] if i < len(blocks) else blocks[-1] for i in range(len(files))]
+        self._write_saved_files(files, contents, action)
+
+    def _cmd_write(self, user_input: str):
+        """/write — no arguments. Saves the NEXT not-yet-consumed named code
+        fence from the current AI reply (```path/to/file.ext, in the order
+        fences appear), to the file named in its own header. Meant to be
+        called once right after each fence, so a reply that writes several
+        files (fence, ACTION: /write, fence, ACTION: /write, ...) gets each
+        fence routed to its own file correctly.
+
+        This exists because /save_code <file> (explicit filename form) always
+        grabs the FIRST code block in the whole reply (chat.py:6821-6822,
+        blocks[0] for a single-file call) — fine for one file, but wrong the
+        moment a reply contains several /save_code <file> calls for several
+        files: every one of them saves the same first block. /write sidesteps
+        that by tracking how many fences it has already consumed for the
+        current reply (self._write_idx, reset whenever self.last_reply
+        changes) and taking the next one each time, instead of indexing from
+        the start of the whole reply. Unnamed fences are skipped, same as
+        /save_code's own auto-detect mode."""
+        if not self.last_reply:
+            print("no AI response yet")
+            return
+        if self.last_reply is not self._write_reply_ref:
+            self._write_reply_ref = self.last_reply
+            self._write_idx = 0
+        named = [(fn, content) for fn, content in _extract_named_code_blocks(self.last_reply) if fn]
+        if self._write_idx >= len(named):
+            print(f"[write] no more named fences in the current reply "
+                  f"({self._write_idx} already saved, {len(named)} found total)")
+            return
+        path, content = named[self._write_idx]
+        self._write_idx += 1
+        self._write_saved_files([path], [content], "overwrite")
+
+    def _cmd_save(self, user_input: str):
+        """Legacy /save <file> [code] [mode]. The extract-and-save logic
+        lives in _cmd_save_code — when the 'code' keyword is present, this
+        delegates there instead of re-implementing it; use /save_code
+        directly to skip the keyword requirement. The raw-reply form (no
+        'code' keyword) is unrelated to the 'code' qualifier and is kept
+        here as-is, sharing only the final write step via
+        _write_saved_files."""
+        _MODE_KEYWORDS = {
+            "code", "overwrite",
+            "append-above", "append_above", "-aa",
+            "append-below", "append_below", "-ab",
+            "add-suffix", "add_suffix",
+        }
+        raw_tokens = user_input.split()[1:]
+        if not self.last_reply:
+            print("no AI response yet")
+            return
+        tokens = [p for t in raw_tokens for p in t.split(",") if p]
+        files = [t for t in tokens if t.lower() not in _MODE_KEYWORDS]
+        flags = {t.lower() for t in tokens if t.lower() in _MODE_KEYWORDS}
+        if not files and "code" not in flags:
+            print("usage: /save <file> [code] [overwrite|append-above|append-below|add-suffix]")
+            return
+        if self._in_agent and "code" not in flags:
+            _warn(f"[agent] /save {files[0] if files else ''} — missing 'code' keyword, raw reply will be saved instead of code block. "
+                  f"Use /save_code instead to always save the code block.")
+        if "code" in flags:
+            # files may be empty here ("/save code") -- _cmd_save_code treats
+            # that as auto-detect-named-fences, same as bare /save_code.
+            mode = self._save_mode_from_flags(flags)
+            mode_kw = {"overwrite": "", "append_below": "-ab", "append_above": "-aa", "add_suffix": "add-suffix"}[mode]
+            resynth = "/save_code " + " ".join(files) + (f" {mode_kw}" if mode_kw else "")
+            self._cmd_save_code(resynth)
+            return
+        if not files:
+            print("usage: /save <file> [mode]")
+            return
+        action = self._save_mode_from_flags(flags)
+        contents = [self.last_reply] * len(files)
+        self._write_saved_files(files, contents, action)
 
     def _cmd_diff(self, user_input: str):
         tokens = user_input.split()
@@ -11119,11 +11653,26 @@ Config stored in ~/.1bcoder/translate.json
                 if stop_agent:
                     break
 
-                # postaction gates — run AFTER ACTIONs executed; FAIL sends feedback and retries
+                # postaction gates — run AFTER ACTIONs executed; FAIL sends feedback and retries.
+                # Skip only VERIFICATION-style procs (currently: autocheck) when every action
+                # this turn was read-only/inspection -- nothing changed, so a functional check
+                # would only ever spuriously FAIL, rejecting a plain /read before any fix was
+                # even attempted (confirmed, real failure: /agent terminator's postaction
+                # autocheck rejected turn 1's bare "ACTION: /read radar.py"). This is per-proc,
+                # not a blanket skip of the whole gates_post list: a proc like `ladder` (evidence
+                # tracking) is the OPPOSITE case -- it specifically NEEDS to see read results to
+                # do its job, so it must still run on read-only turns.
+                _READ_ONLY_VERBS = {"/read", "/readln", "/tree", "/find", "/ls", "/view", "/diff", "/map", "/mkdir"}
+                _action_verbs = {c.strip().split()[0] for c in actions if c.strip()}
+                _all_read_only = bool(_action_verbs) and _action_verbs <= _READ_ONLY_VERBS
+                _SKIP_ON_READ_ONLY = {"autocheck"}
                 if use_procs and self._proc_gates_post:
                     post_failures: list[str] = []
                     post_success:  list[str] = []
                     for _gp in self._proc_gates_post:
+                        _proc_name = _gp.strip().split()[0] if _gp.strip() else ""
+                        if _all_read_only and _proc_name in _SKIP_ON_READ_ONLY:
+                            continue
                         gp_out = self._run_proc(_gp, auto=True)
                         if gp_out:
                             for line in gp_out.splitlines():
@@ -11939,7 +12488,25 @@ def main():
         cli = CoderCLI(base_url, model, models, provider)
         if args.ctx:
             cli._cmd_ctx(f"/ctx load {args.ctx}")
-        cli.run()
+        _resumed = False
+        while True:
+            try:
+                cli.run(_resumed=_resumed)
+                break
+            except KeyboardInterrupt:
+                break
+            except Exception as _fatal_exc:
+                # Last-resort net: run()'s own except-Exception around _route
+                # already catches normal command failures — this only fires if
+                # something escaped even that (confirmed possible: see the
+                # comment in run()). Resume the REPL instead of letting the
+                # whole process die; cli.messages is untouched, so context
+                # survives.
+                import traceback as _tb
+                print(f"\n[fatal] {type(_fatal_exc).__name__}: {_fatal_exc}")
+                _tb.print_exc()
+                print("[fatal] session resumed — context preserved\n")
+                _resumed = True
 
 
 if __name__ == "__main__":

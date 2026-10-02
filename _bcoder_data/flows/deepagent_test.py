@@ -163,6 +163,96 @@ def _run_test(test_path: str, lang_cfg: dict) -> tuple:
     return False, "test execution not supported for this language"
 
 
+# ── interactive review gate (--review) ───────────────────────────────────────
+# Test units are flat/independent (one per function, no parent/child), so
+# this mirrors deepagent_spec.py's simplified [y]es/[n]o/[a]ll menu -- no
+# [b]ranch. No live_index/dedup hook existed in this file before -- reuses
+# the same LivePlanIndex class deepagent_md's --dedup uses, seeded from
+# on-disk test_*.<ext> siblings. Note: generated tests for different
+# functions are expected to share substantial boilerplate, so this
+# similarity signal is noisier here than for prose -- shipped anyway for
+# consistency, revisit threshold tuning later if it proves too noisy.
+
+def _make_review_index(test_dir: str, use_review: bool):
+    if not use_review:
+        return None
+    try:
+        from radogast.live_index import LivePlanIndex
+    except ImportError:
+        print("[review] radogast not installed -- skipped (pip install radogast[embed])")
+        return None
+    live_index = LivePlanIndex()
+    seeded = 0
+    if _os.path.isdir(test_dir):
+        for fname in sorted(_os.listdir(test_dir)):
+            if not fname.startswith("test_") or fname.endswith(".md"):
+                continue
+            func_name = fname[len("test_"):].rsplit(".", 1)[0]
+            text = open(_os.path.join(test_dir, fname), encoding="utf-8").read()
+            live_index.add(func_name, text)
+            seeded += 1
+    print(f"[review] on (radogast dedup check, seeded {seeded} existing unit(s))")
+    return live_index
+
+
+def _review_prompt() -> str:
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        print("  [review] no interactive terminal -- auto-continuing")
+        return 'y'
+    while True:
+        ans = input("  Continue? [y]es [n]o [a]ll: ").strip().lower()
+        if ans in ("y", "n", "a", ""):
+            return ans or 'y'
+        print("  please enter y, n, or a")
+
+
+def _review_feedback_regen(chat, func_name, func_code, test_path):
+    try:
+        feedback = input("  what should change? ").strip()
+    except (EOFError, KeyboardInterrupt):
+        feedback = ""
+    if not feedback:
+        print("  [review] no feedback given -- keeping as-is")
+        return None
+    prompt = _build_test_prompt(func_name, func_code, "") + f"\n\nAdditional instruction: {feedback}"
+    raw = _generate_with_retry(chat, _TEST_SYSTEM, prompt, func_name)
+    if not raw:
+        print("  [review] regeneration produced nothing -- keeping previous content")
+        return None
+    test_code, _ = _extract_code(raw)
+    with open(test_path, "w", encoding="utf-8") as f:
+        f.write(test_code)
+    print(f"  -> {_os.path.basename(test_path)} regenerated")
+    return test_code
+
+
+def _run_review_gate(chat, review_state, review_index, func_name, content, func_code, test_path):
+    match = review_index.check(func_name, content) if review_index is not None else None
+    while True:
+        if match is not None:
+            print(f"  [radogast] {func_name}: overlaps {match[0]} (similarity {match[1]:.2f})")
+        else:
+            print(f"  [radogast] {func_name}: clean")
+        if review_state["mode"] == "all":
+            print("  [review] auto-continuing (all)")
+            break
+        ans = _review_prompt()
+        if ans == 'y':
+            break
+        if ans == 'a':
+            review_state["mode"] = "all"
+            break
+        new_content = _review_feedback_regen(chat, func_name, func_code, test_path)
+        if new_content is None:
+            continue
+        content = new_content
+        match = review_index.check(func_name, content) if review_index is not None else None
+    if review_index is not None:
+        review_index.add(func_name, content)
+    return content
+
+
 # ── main flow ────────────────────────────────────────────────────────────────
 
 def _process_one_test(func_name, func_code, i, total, test_dir, ext,
@@ -261,7 +351,8 @@ def _process_one_test(func_name, func_code, i, total, test_dir, ext,
 
 def _generate_tests(chat, joined_path: str, test_dir: str, lang_cfg: dict,
                     lang: str, workers: list, use_think: bool, use_syntax: bool,
-                    use_run: bool, max_retries: int, stats: dict):
+                    use_run: bool, max_retries: int, stats: dict,
+                    review_state=None, review_index=None):
     ext = lang_cfg["ext"]
 
     code = open(joined_path, encoding="utf-8").read()
@@ -322,6 +413,11 @@ def _generate_tests(chat, joined_path: str, test_dir: str, lang_cfg: dict,
                               test_dir, ext, lang_cfg, use_think, use_syntax,
                               use_run, max_retries, _call_llm)
         results.append(r)
+        if review_state is not None and r.get("file") and r["status"] not in ("skipped", "error"):
+            test_path = _os.path.join(test_dir, r["file"])
+            content = open(test_path, encoding="utf-8").read()
+            _run_review_gate(chat, review_state, review_index, func_name, content,
+                             func_code, test_path)
         if r["status"] == "generated":
             stats["generated"] += 1
         elif r["status"] == "passed":
@@ -429,6 +525,78 @@ def run(chat, args: str):
         _join_tests(test_dir, LANGS.get(lang, LANGS["py"]))
         return
 
+    # ── subcommand: redo ──────────────────────────────────────────────────
+    if args.startswith("redo"):
+        # /flow deepagent_test redo <joined_path> <func_name> [--lang py] [--review]
+        #
+        # No subtree here -- test units are flat and independent (one per
+        # function), so this just deletes and regenerates ONE test file
+        # (+ its think-plan .md if present).
+        rest = args[4:].strip()
+        review_flag = bool(_re.search(r'--review\b', rest))
+        if review_flag:
+            rest = _re.sub(r'--review\b', '', rest).strip()
+        lang = "py"
+        m = _re.search(r'--lang\s+(\S+)', rest)
+        if m:
+            lang = m.group(1).lower()
+            rest = (rest[:m.start()] + rest[m.end():]).strip()
+        parts = rest.split()
+        if len(parts) < 2:
+            print("usage: /flow deepagent_test redo <joined_path> <func_name> [--lang py] [--review]")
+            return
+        joined_path, func_name = parts[0], parts[1]
+
+        if not _os.path.isabs(joined_path):
+            base = _os.path.join(_os.getcwd(), ".1bcoder", "code")
+            joined_path = _os.path.join(base, joined_path)
+        if not _os.path.isfile(joined_path):
+            print(f"[error] file not found: {joined_path}")
+            return
+        if lang not in LANGS:
+            print(f"[error] unsupported language: {lang}")
+            return
+        lang_cfg = LANGS[lang]
+        ext = lang_cfg["ext"]
+
+        code = open(joined_path, encoding="utf-8").read()
+        functions = _extract_functions(code)
+        func_code = next((fc for fn, fc in functions if fn == func_name), None)
+        if func_code is None:
+            print(f"[deepagent_test] function {func_name} not found in {joined_path}")
+            return
+
+        test_dir = _os.path.join(_os.path.dirname(joined_path), "tests")
+        test_path = _os.path.join(test_dir, f"test_{func_name}{ext}")
+        md_path = _os.path.join(test_dir, f"test_{func_name}.md")
+
+        import time as _time
+        import shutil as _shutil
+        for p in (test_path, md_path):
+            if _os.path.isfile(p):
+                timestamp = _time.strftime("%Y%m%dT%H%M%S")
+                backup_dir = _os.path.join(test_dir, "_superseded", f"{func_name}_{timestamp}")
+                _os.makedirs(backup_dir, exist_ok=True)
+                dst = _os.path.join(backup_dir, _os.path.basename(p))
+                _shutil.move(p, dst)
+                print(f"[deepagent_test] backed up -> {dst}")
+
+        def _call_llm(sys_prompt, user_prompt, _fn=func_name):
+            return _generate_with_retry(chat, sys_prompt, user_prompt, _fn)
+
+        r = _process_one_test(func_name, func_code, 1, 1, test_dir, ext, lang_cfg,
+                              False, False, False, 2, _call_llm)
+        print(f"[deepagent_test] redo done: {r['status']} ({r.get('file', '')})")
+
+        if review_flag and r.get("file"):
+            review_index = _make_review_index(test_dir, True)
+            review_state = {"mode": "ask"}
+            regen_path = _os.path.join(test_dir, r["file"])
+            content = open(regen_path, encoding="utf-8").read()
+            _run_review_gate(chat, review_state, review_index, func_name, content,
+                             func_code, regen_path)
+        return
+
     # ── subcommand: report ────────────────────────────────────────────────
     if args.startswith("report"):
         rest = args[6:].strip()
@@ -474,6 +642,10 @@ def run(chat, args: str):
         profile_name = m.group(1)
         args = (args[:m.start()] + args[m.end():]).strip()
 
+    use_review = bool(_re.search(r'--review\b', args))
+    if use_review:
+        args = _re.sub(r'--review\b', '', args).strip()
+
     joined_path = args.strip().strip('"').strip("'")
     if not joined_path:
         print("usage: /flow deepagent_test <path/to/joined.py> --lang py [--think] [--syntax] [--run]")
@@ -501,6 +673,13 @@ def run(chat, args: str):
         else:
             print(f"[deepagent_test] profile '{profile_name}' not found")
 
+    if workers and use_review:
+        print("error: --review is incompatible with --profile "
+              "(parallel workers complete out of order, so a per-unit review "
+              "gate can't cleanly hold work back). "
+              "Drop --profile for a supervised run, or drop --review for an unattended one.")
+        return
+
     # create test dir alongside joined file
     code_dir = _os.path.dirname(joined_path)
     test_dir = _os.path.join(code_dir, "tests")
@@ -515,11 +694,15 @@ def run(chat, args: str):
     if flags:
         print(f"[deepagent_test] flags:  {', '.join(flags)}")
 
+    review_index = _make_review_index(test_dir, use_review)
+    review_state = {"mode": "ask"} if use_review else None
+
     stats = {"generated": 0, "passed": 0, "failed": 0}
     try:
         results = _generate_tests(chat, joined_path, test_dir, lang_cfg, lang,
                                   workers, use_think, use_syntax, use_run,
-                                  max_retries, stats)
+                                  max_retries, stats,
+                                  review_state=review_state, review_index=review_index)
     except _StopGeneration:
         results = [{"name": "interrupted", "status": "stopped", "file": ""}]
 

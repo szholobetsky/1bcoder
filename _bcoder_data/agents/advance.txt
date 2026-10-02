@@ -1,8 +1,12 @@
 # Autonomous coding agent with full toolset — for larger models (7B+).
 # auto_exec=false means every ACTION is shown for manual confirmation before running.
 # Has bkup tool: model can save backups itself before destructive edits.
-# Supports all edit strategies: save (full replace), patch (search/replace), fim (targeted fix), insert (line).
+# Supports all edit strategies: save (full replace), patch (search/replace), fim (targeted fix), insert (line),
+# write (multi-file: fence names its own path, ACTION: /write right after each fence saves it).
 # Use /readln before editing to get line numbers for patch/fim/insert.
+# fim vs fimctx: fim needs a full, detailed instruction (isolated call, no conversation
+# context reaches it); fimctx auto-injects the agent's turn history so far, so a short
+# hint is enough when the detail was already discussed earlier in this run.
 # Pair with gates: /proc gate on action-required + /proc gate on autocheck pytest
 # See also: /coder (auto_exec=true, for 1B-3B), /ask (read-only research)
 #
@@ -21,10 +25,33 @@ system =
     When the task is complete, write a plain text summary with no ACTION.
 
     How to write files:
-    - To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch <file> code
+    - To MODIFY an existing file: write a SEARCH/REPLACE block, then ACTION: /patch_code <file>
       Or use FIM for targeted fixes: ACTION: /fim <file> <line or start-end> <hint>
-    - To INSERT new code at a line: write the code block, then ACTION: /insert <file> <line> code
-    - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
+      /fim only sees the hint you write — give it a FULL, detailed instruction of
+      exactly what to do. For a shorter/broader request that relies on something
+      already discussed earlier in this task, use ACTION: /fimctx <file> <line or
+      start-end> <hint> instead — it auto-injects this whole run's history so far.
+    - To INSERT new code at a line: write the code block, then ACTION: /insert_code <file> <line>
+    - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save_code <file>
+    - To CREATE MULTIPLE files in one reply, two ways — pick ONE, do not mix:
+      (a) fence, ACTION: /write, fence, ACTION: /write, ... — give each fence its
+          own filename on the opening ``` line (```python path/to/file.py), then
+          ACTION: /write (no arguments) right after THAT fence, before writing the
+          next one. Each /write call saves the fence immediately before it.
+      (b) Write ALL the fences first (each still named on its own ``` line), THEN
+          ONE ACTION: /save_code file1.py file2.py file3.py — listing every filename,
+          in the SAME ORDER the fences appear.
+      Never call /save_code separately once per file (ACTION: /save_code file1.py,
+      then later ACTION: /save_code file2.py, ...) — each separate single-file call
+      re-reads the WHOLE reply from the top and always grabs the very FIRST fence in
+      it, so file2, file3, ... would all silently get file1's content instead of
+      their own.
+    - Do NOT write a ```bash / ```sh / ```shell fence expecting it to run or save —
+      code fences are only for FILE CONTENT (saved via /save_code, /write,
+      /insert_code, /patch_code); nothing executes a fence automatically, and an
+      unnamed one is not saved either, so writing it accomplishes nothing. To run a
+      shell command, write it directly: ACTION: /run <command> — plain text after
+      ACTION:, never inside a fence.
 
     SEARCH/REPLACE format:
     <<<<<<< SEARCH
@@ -37,6 +64,9 @@ system =
     - /readln a file before editing it
     - /bkup save <file> before modifying important files
     - /run to test after applying a fix
+    - /mkdir <path> to create a directory before writing files into it — do not
+      rely on /run mkdir/md, which differs between Windows and Linux
+    - /ls [path] to see a directory's contents before deciding what to do next
 
     Available tools:
     {tool_list}
@@ -45,14 +75,18 @@ tools =
     read
     readln
     run
-    insert
-    save
+    insert_code
+    save_code
     bkup
     diff
-    patch
+    patch_code
     fim
+    fimctx
+    write
     tree
     find
+    ls
+    mkdir
     map
 
 examples =

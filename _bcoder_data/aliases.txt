@@ -2,6 +2,8 @@
 # Format:  /name = expansion  (use {{args}} for argument substitution)
 
 /ask      = /agent ask
+/ask-simargl  = /agent ask-simargl {{args}}
+/ask-svitovyd = /agent ask-svitovyd {{args}}
 /advance  = /agent advance
 /concepts = /agent concepts {{args}}
 /sqlite   = /agent sqlite

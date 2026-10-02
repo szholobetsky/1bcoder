@@ -1,10 +1,12 @@
-# Minimal coding agent — same as coder but only three commands, for 1B models.
-# No /fim, no /insert, no /run. Use /save_code and /patch_code (aliases, no "code" keyword confusion).
+# Minimal coding agent — same as coder but stripped to a handful of commands, for 1B models.
+# No /fim, no /insert, no /run, no /tree, no /find, no /ls. Use /save_code and /patch_code
+# (aliases, no "code" keyword confusion). /mkdir kept since save_code into a new subfolder
+# would otherwise silently fail — everything else exploratory (tree/find/ls) stays cut.
 # Pair with: /proc gate on action-required
 #            /proc gate postaction on autocheck cmd:"python calc.py" ok:exit0
 #
 # See also: /coder (full toolset)
-description = Minimal coding agent for 1B models. Three commands: read, save_code, patch_code.
+description = Minimal coding agent for 1B models. Commands: read, save_code, patch_code, mkdir.
 max_turns = 20
 auto_exec = false
 auto_apply = true
@@ -39,6 +41,7 @@ system =
 
     Rules:
     - Before editing: ACTION: /read <file>
+    - ACTION: /mkdir <path> to create a directory before writing a new file into it
     - Write clean code. Do not add comments unless they are part of the task requirement.
     - If you get a FAIL message — read it carefully, fix the issue, and try again.
     - Do not declare done until the task requirement is met.
@@ -48,6 +51,9 @@ system =
 
 tools =
     read
+    save_code
+    patch_code
+    mkdir
 
 examples =
     /codex fix the indentation error in calc.py

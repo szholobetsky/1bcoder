@@ -34,9 +34,24 @@ from typing import List, Optional, Tuple
 
 # ── turn parsing ──────────────────────────────────────────────────────────────
 
-TOOL_HDR_RE = re.compile(r'^\[(run|file|read|tool|web|webask|webfetch|search|fetch)[:\s]', re.IGNORECASE)
+TOOL_HDR_RE = re.compile(r'^\[(run|file|read|readln|tool|web|webask|webfetch|search|fetch)[:\s]', re.IGNORECASE)
 EXIT_OK_RE  = re.compile(r'\(exit code 0\)')
 EXIT_ERR_RE = re.compile(r'\(exit code ([1-9]\d*)\)')
+
+# A successful WRITE action's tool result is a terse confirmation ("saved ->
+# file.py"/"[patched file.py: lines 3-5 replaced]") with none of the task's
+# actual terms in it -- those live in the code the assistant wrote in the
+# SAME turn as the ACTION: line, not in the confirmation that follows. Rung
+# 2/3 require evidence inside a successful tool result, so without special
+# handling a perfectly correct write is invisible to the ladder: a write
+# action can never satisfy witnessed/co-occurred on its own, no matter how
+# right the code is. Confirmed as a real, reproduced failure: /agent
+# terminator wrote a fully correct Kivy app via ACTION: /save_code radar.py
+# (all task terms present in the code) and ladder still rejected it with
+# "Terms appeared only in model prose".
+_ACTION_LINE_RE = re.compile(r'ACTION:\s*(/\S+)')
+_WRITE_VERBS = {"/save", "/save_code", "/patch", "/patch_code",
+                "/insert", "/insert_code", "/edit", "/edit_code", "/fim", "/fix"}
 
 
 @dataclass
@@ -132,11 +147,22 @@ def _snake_terms(text: str) -> List[str]:
 
 
 def _plain_terms(text: str) -> List[str]:
-    """Long plain words from text — low confidence, heavily filtered."""
+    """Plain words from text — low confidence, heavily filtered.
+
+    Threshold was 8+ chars; lowered to 4+ because the 8+ cutoff systematically
+    excludes exactly the short concrete nouns most likely to actually appear
+    in generated code (flash, sound, meters, seconds, button) while keeping
+    long abstract/grammatical words that never will (application, pressing,
+    calculate). Confirmed as a real, reproduced failure: a task written in
+    plain English (no code-fenced/CamelCase/snake_case terms to prefer)
+    extracted only long words, none of which ever appeared in an otherwise
+    fully correct implementation -- rung 3 (co-occurrence) was structurally
+    unreachable regardless of how right the code was. _STOP still filters
+    common short words, so this isn't unfiltered noise, just a lower floor."""
     result = []
     # remove URLs first
     text = re.sub(r'https?://\S+', ' ', text)
-    for m in re.finditer(r'\b([a-zA-Z]{8,})\b', text):
+    for m in re.finditer(r'\b([a-zA-Z]{4,})\b', text):
         w = m.group(1)
         wl = w.lower()
         if wl in _STOP:
@@ -209,9 +235,29 @@ class LadderReport:
     co_occurred: Rung
     articulated: Rung
     highest: int                # sequential rung count (0-4)
+    has_tool_result: bool = False   # any tool call (ok or failed) already ran this session
 
     def passed(self) -> bool:
-        return self.highest >= 3 and not self.co_occurred.weak
+        if self.highest >= 3 and not self.co_occurred.weak:
+            return True
+        # Cold start: rungs 2/3 require a TOOL RESULT to exist, but as a
+        # pre-action gate this check runs BEFORE the model's proposed
+        # ACTION: has executed. If no tool has ever run yet in this session,
+        # rungs 2/3 are structurally unreachable no matter what the model
+        # does — and on FAIL, 1bcoder's agent loop discards the proposed
+        # ACTION entirely and retries (see chat.py _run_agent_loop), so a
+        # strict rung>=3 bar here is an unwinnable deadlock: the only thing
+        # that could produce the required evidence (running a tool) is
+        # exactly what gets blocked. Rung 1 (presence — the model is at
+        # least naming the right terms while proposing its first action) is
+        # the most that can honestly be asked before any tool has been
+        # allowed to run even once. Confirmed as a real, reproduced failure:
+        # /agent terminator's first-ever ACTION: /readln <file> rejected
+        # every retry until retry_cap was exhausted and the agent gave up,
+        # having never executed a single action.
+        if not self.has_tool_result and self.presence.reached:
+            return True
+        return False
 
     def fail_hint(self) -> str:
         if self.highest == 0:
@@ -242,7 +288,54 @@ def _snip(content: str, term: str) -> str:
     return content[s:e].replace("\n", " ").strip()[:120]
 
 
+def _augment_write_evidence(turns: List[Turn]) -> List[Turn]:
+    """When a tool-result turn immediately follows an assistant turn whose
+    ACTION verb is a write primitive (see _WRITE_VERBS) AND that tool result
+    succeeded: add a synthetic tool-result turn carrying the ASSISTANT
+    turn's own content (where the real terms are, in the code it just
+    wrote) instead of the terse confirmation. This is not speculative --
+    the write succeeded, so that content is now genuinely part of the
+    codebase, exactly as if a /read had just confirmed it. See module-level
+    comment above _ACTION_LINE_RE for why this is needed at all."""
+    augmented = list(turns)
+    for i, t in enumerate(turns):
+        if not (t.is_tool and t.tool_ok and i > 0):
+            continue
+        prev = turns[i - 1]
+        if prev.role != "assistant":
+            continue
+        m = _ACTION_LINE_RE.search(prev.content)
+        if m and m.group(1) in _WRITE_VERBS:
+            augmented.append(Turn(role="user", content=prev.content, is_tool=True, tool_ok=True))
+
+    # The CURRENT (last) turn, if it's an assistant turn proposing a write
+    # action, counts as its own evidence even before it has executed. This
+    # check runs as a PRE-action gate (see chat.py _run_agent_loop), so a
+    # write action's own tool result cannot exist yet BY CONSTRUCTION --
+    # rejecting it for lacking evidence that is structurally impossible to
+    # have yet is an unconditional deadlock for a session's first write,
+    # not a real signal of hallucination. Unlike a /read claim (which could
+    # describe file content that was never actually confirmed), a
+    # /save_code's own content genuinely IS what is about to become the
+    # codebase the instant the ACTION executes -- there is nothing left to
+    # "witness" beyond what the model already wrote. rung 2/3 still require
+    # the priority terms to actually be present in that content, so this
+    # isn't a blanket bypass, only a relocation of WHERE evidence for a
+    # not-yet-executed write is allowed to come from. Confirmed as a real,
+    # reproduced failure: a from-scratch rewrite of an unrelated stale file
+    # (so no prior tool result could possibly share any task term) was
+    # rejected on its very first /save_code proposal, every retry, with
+    # nothing left that could ever satisfy the old rule.
+    if turns and turns[-1].role == "assistant":
+        m = _ACTION_LINE_RE.search(turns[-1].content)
+        if m and m.group(1) in _WRITE_VERBS:
+            augmented.append(Turn(role="user", content=turns[-1].content, is_tool=True, tool_ok=True))
+
+    return augmented
+
+
 def run_ladder(turns: List[Turn], terms: List[str]) -> LadderReport:
+    turns = _augment_write_evidence(turns)
     priority = terms[:5]   # top terms used for co-occurrence
 
     # Rung 1: Presence — any term in any turn
@@ -322,6 +415,7 @@ def run_ladder(turns: List[Turn], terms: List[str]) -> LadderReport:
         terms=terms, priority=priority,
         presence=r1, witnessed=r2, co_occurred=r3, articulated=r4,
         highest=height,
+        has_tool_result=any(t.is_tool for t in turns),
     )
 
 

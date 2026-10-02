@@ -329,6 +329,63 @@ def _load_meta(plan_dir: str):
         return None
 
 
+# ── live dedup index (radogast, optional) ───────────────────────────────────
+# --dedup only runs in the sequential _expand() path -- BFS (--profile) can
+# generate cross-branch siblings at the same tree depth concurrently, which
+# would race against a single growing in-process index. Not solved here.
+
+def _make_live_index(plan_dir: str, cfg: dict, workers=None):
+    if not ((cfg or {}).get("dedup") or (cfg or {}).get("review")):
+        return None
+    if workers:
+        print("[dedup] requested but --profile is parallel -- dedup only runs "
+              "in sequential mode, skipped")
+        return None
+    try:
+        from radogast.live_index import LivePlanIndex
+    except ImportError:
+        print("[dedup] requested but radogast not installed -- skipped "
+              "(pip install radogast[embed])")
+        return None
+    live_index = LivePlanIndex(threshold=cfg.get("dedup_threshold", 0.85))
+    live_index.seed(plan_dir)
+    print(f"[dedup] on (threshold={live_index.threshold}, "
+          f"seeded {len(live_index.ids)} existing node(s))")
+    return live_index
+
+
+def _dedup_context(plan_dir: str, matched_id: str, query_text: str) -> str:
+    """Return the most relevant chunk of matched_id's file for query_text via
+    simargl (incremental reindex + chunk search), or the whole file if
+    simargl isn't installed or Stage 2 fails for any reason -- explicit
+    fallback, not a bug: the corrective prompt still gets grounding either
+    way, just coarser."""
+    matched_path = _item_path(plan_dir, matched_id)
+    try:
+        whole = open(matched_path, encoding="utf-8").read()
+    except OSError:
+        return ""
+    try:
+        from simargl.indexer import index_files as _sim_index
+        from simargl.searcher import search as _sim_search, get_chunk_text as _sim_get_chunk
+    except ImportError:
+        return whole
+    store_dir = _os.path.join(plan_dir, ".simargl")
+    try:
+        _sim_index(plan_dir, project_id="plan", store_dir=store_dir)
+        result = _sim_search(query_text[:1000], project_id="plan", mode="file",
+                             store_dir=store_dir, top_n=3)
+        for f in result.get("files", []):
+            if _os.path.basename(f.get("path", "")) == _os.path.basename(matched_path):
+                chunk = _sim_get_chunk(matched_path, f.get("chunk_n", 0),
+                                       project_id="plan", store_dir=store_dir)
+                if chunk:
+                    return chunk
+    except Exception:
+        pass
+    return whole
+
+
 def _labels_with_new_at(base_labels: list, start_idx: int, new_labels: list) -> list:
     """Return a copy of base_labels with new_labels placed starting at
     start_idx (padding with "" as needed) — used to slot a `continue`'s new
@@ -514,7 +571,7 @@ def _rag_research(query: str, project_id: str, store_dir: str,
                   top_n: int = 5, top_k: int = 10) -> str:
     """Query simargl file index, read files from .simargl_web/, return text."""
     try:
-        from simargl.searcher import search as _sim_search
+        from simargl.searcher import search as _sim_search, get_chunk_text as _sim_get_chunk
     except ImportError:
         print("  [rag] simargl not installed")
         return ""
@@ -541,33 +598,45 @@ def _rag_research(query: str, project_id: str, store_dir: str,
     for f in result.get("files", [])[:top_n]:
         raw_path = f.get("path", "")
         score = f.get("score", 0)
+        chunk_n = f.get("chunk_n", 0)
         filename = _os2.path.basename(raw_path)
 
-        # try webindex directory first, then raw path if absolute
+        # try webindex directory first, then project-relative convention, then raw path
         candidates = [
             _os2.path.join(web_dir, filename),
+            _os2.path.join(store_dir, project_id, raw_path),  # ~/.vyrii/<project>/<relpath> convention
             raw_path if _os2.path.isabs(raw_path) else None,
         ]
+
+        # extraction (fix_spec/scan_to) needs the whole file to find boundaries;
+        # otherwise ground the snippet in the actual matched chunk, not the file's head
+        want_full = bool(chat and (fix_spec or scan_to))
         text = ""
         for candidate in candidates:
-            if candidate and _os2.path.isfile(candidate):
-                try:
+            if not candidate or not _os2.path.isfile(candidate):
+                continue
+            try:
+                if want_full:
                     text = open(candidate, encoding="utf-8", errors="ignore").read()
+                else:
+                    text = _sim_get_chunk(candidate, chunk_n, project_id=project_id,
+                                          store_dir=simargl_store)
+                if text:
                     break
-                except Exception:
-                    continue
+            except Exception:
+                continue
 
         if not text:
             continue
 
-        if chat and (fix_spec or scan_to):
+        if want_full:
             text = _apply_extract(chat, text, fix_spec, scan_to)
         else:
             # cap per file so total RAG fits in ~50% of context window
             per_file = max(500, (getattr(chat, "num_ctx", 2048) * 2) // top_n) if chat else 3000
             text = text[:per_file]
 
-        parts.append(f"[RAG {filename}  score:{score:.3f}]\n{text}")
+        parts.append(f"[RAG {filename}  score:{score:.3f}  chunk:{chunk_n}]\n{text}")
 
     return "\n\n".join(parts)
 
@@ -751,12 +820,112 @@ def _generate(chat, title: str, root_task: str, web_ctx: str = "",
             msgs[-1] = {"role": "user", "content": prompt + f"\n\nAdditional instruction: {hint}"}
 
 
+# ── interactive review gate (--review) ───────────────────────────────────────
+# Runs AFTER a node has already been generated and written successfully -- a
+# different trigger point than _on_interrupt (which only fires on a *failed*
+# chat._stream_chat call). review_state is one dict, created once per run in
+# run(), threaded through _expand's existing live_index-style parameter and
+# mutated in place: {"mode": "ask"|"branch"|"all", "branch_depth": int|None}.
+
+def _review_report(node_id: str, match) -> None:
+    if match is not None:
+        matched_id, score = match
+        print(f"  [radogast] {node_id}: overlaps {matched_id} (similarity {score:.2f})")
+    else:
+        print(f"  [radogast] {node_id}: clean")
+
+
+def _review_prompt() -> str:
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        print("  [review] no interactive terminal -- auto-continuing")
+        return 'y'
+    while True:
+        ans = input("  Continue? [y]es [n]o [b]ranch [a]ll: ").strip().lower()
+        if ans in ("y", "n", "b", "a", ""):
+            return ans or 'y'
+        print("  please enter y, n, b, or a")
+
+
+def _review_feedback_regen(chat, node_id, title, root_task, web_ctx, focus, aspects,
+                           parent_ctx, chat_ctx, extra_ctx, filepath):
+    """[n]o path: ask for free-text feedback, fold it into the prompt, and
+    regenerate this node in place -- reuses the dedup-retry block's shape
+    (hint folded into extra_ctx, re-call _generate, rewrite filepath), not
+    _on_interrupt's call site, which is unreachable from here."""
+    try:
+        feedback = input("  what should change? ").strip()
+    except (EOFError, KeyboardInterrupt):
+        feedback = ""
+    if not feedback:
+        print("  [review] no feedback given -- keeping as-is")
+        return None
+    note = f"Additional instruction: {feedback}"
+    extra_ctx2 = (extra_ctx + "\n\n" + note) if extra_ctx else note
+    content = _generate(chat, title, root_task, web_ctx, focus, aspects, parent_ctx, chat_ctx,
+                        label=node_id, extra_ctx=extra_ctx2)
+    if not content:
+        print("  [review] regeneration produced nothing -- keeping previous content")
+        return None
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"# {title}\n\n{content}")
+    print(f"  -> {_os.path.basename(filepath)} regenerated ({len(content)} chars)")
+    return content
+
+
+def _run_review_gate(chat, review_state, node_id, depth, title, root_task, web_ctx, focus,
+                     aspects, parent_ctx, chat_ctx, extra_ctx, filepath, live_index,
+                     match, needs_manual_review):
+    """Post-node --review gate. Mutates review_state in place."""
+    while True:
+        skip_prompt = review_state["mode"] == "all"
+        if review_state["mode"] == "branch":
+            if depth > review_state["branch_depth"]:
+                skip_prompt = True
+            else:
+                review_state["mode"] = "ask"
+                review_state["branch_depth"] = None
+
+        if needs_manual_review:
+            # safety override: an unresolved radogast flag always forces the
+            # prompt back up, even mid-branch/all-trust.
+            skip_prompt = False
+            review_state["mode"] = "ask"
+            review_state["branch_depth"] = None
+
+        _review_report(node_id, match)
+        if skip_prompt:
+            print(f"  [review] auto-continuing ({review_state['mode']})")
+            return
+
+        ans = _review_prompt()
+        if ans == 'y':
+            return
+        if ans == 'b':
+            review_state["mode"] = "branch"
+            review_state["branch_depth"] = depth
+            return
+        if ans == 'a':
+            review_state["mode"] = "all"
+            return
+
+        # ans == 'n' -- regenerate with feedback, then re-run this gate on
+        # the fresh content so a bad regeneration can be rejected again.
+        new_content = _review_feedback_regen(chat, node_id, title, root_task, web_ctx, focus,
+                                             aspects, parent_ctx, chat_ctx, extra_ctx, filepath)
+        if new_content is None:
+            continue
+        match = live_index.check(node_id, new_content) if live_index is not None else None
+        needs_manual_review = False
+
+
 # ── recursive expand ──────────────────────────────────────────────────────────
 
 def _expand(chat, node_id: str, title: str, root_task: str,
             plan_dir: str, depth: int, max_depth: int, use_web: bool,
             plan_labels: list, aspects: list, stats: dict,
-            max_parent_ctx: int = 500, chat_ctx: str = "", cfg: dict = None):
+            max_parent_ctx: int = 500, chat_ctx: str = "", cfg: dict = None,
+            live_index=None, review_state=None):
     if depth > max_depth:
         return
 
@@ -809,10 +978,49 @@ def _expand(chat, node_id: str, title: str, root_task: str,
             print(f"{indent}  [skip] empty reply")
             return
 
+        match = None
+        needs_manual_review = False
+        if live_index is not None:
+            match = live_index.check(node_id, content)
+            if match:
+                matched_id, score = match
+                print(f"{indent}  [dedup] {node_id} overlaps {matched_id} "
+                      f"({score:.2f}) -- regenerating")
+                snippet = _dedup_context(plan_dir, matched_id, content)
+                dedup_note = (
+                    f"Note: your draft overlaps heavily (similarity {score:.2f}) with "
+                    f"section {matched_id}, already written:\n\n---\n{snippet}\n---\n\n"
+                    "Do not redefine what's already established there. Reference it "
+                    f"explicitly (e.g. 'uses the X defined in §{matched_id}') and cover "
+                    "only what is specific to this section's own position in the plan. "
+                    "If, after removing the overlap, there is genuinely nothing new to "
+                    "say, state that explicitly instead of padding."
+                )
+                extra_ctx2 = (extra_ctx + "\n\n" + dedup_note) if extra_ctx else dedup_note
+                content2 = _generate(chat, title, root_task, web_ctx, focus, aspects, parent_ctx, chat_ctx,
+                                     label=node_id, extra_ctx=extra_ctx2)
+                if content2:
+                    content = content2
+                    match = live_index.check(node_id, content)
+                    if match:
+                        print(f"{indent}  [dedup] {node_id}: still close to {matched_id} "
+                              f"after retry -- kept, needs manual review")
+                        needs_manual_review = True
+            live_index.add(node_id, content)
+
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(f"# {title}\n\n{content}")
         stats["files"] += 1
         print(f"{indent}  -> {_os.path.basename(filepath)} ({len(content)} chars)")
+
+        if review_state is not None:
+            _run_review_gate(chat, review_state, node_id, depth, title, root_task, web_ctx,
+                             focus, aspects, parent_ctx, chat_ctx, extra_ctx, filepath,
+                             live_index, match, needs_manual_review)
+            content = open(filepath, encoding="utf-8").read()
+            # strip the "# title\n\n" header back off so downstream section
+            # parsing sees the same shape it would have from a fresh _generate
+            content = content.split("\n\n", 1)[1] if "\n\n" in content else content
 
     if depth < max_depth:
         sections = _parse_sections(content)
@@ -822,7 +1030,7 @@ def _expand(chat, node_id: str, title: str, root_task: str,
         for i, child_title in enumerate(sections, 1):
             _expand(chat, f"{node_id}.{i}", child_title, root_task,
                     plan_dir, depth + 1, max_depth, use_web, plan_labels, aspects, stats,
-                    max_parent_ctx, chat_ctx, cfg)
+                    max_parent_ctx, chat_ctx, cfg, live_index, review_state)
 
 
 # ── compose flat ─────────────────────────────────────────────────────────────
@@ -1246,6 +1454,13 @@ def _child_ids(node_id: str, all_ids: set) -> list:
     return sorted(kids, key=lambda x: tuple(int(p) for p in x.split(".")))
 
 
+def _descendant_ids(node_id: str, all_ids: set) -> set:
+    """node_id itself plus every id below it in the tree -- a plain prefix
+    filter works because ids are dot-joined integers, so no need to walk
+    _child_ids() level by level."""
+    return {i for i in all_ids if i == node_id or i.startswith(node_id + ".")}
+
+
 def _top_level_ids(all_ids: set) -> list:
     return sorted([i for i in all_ids if "." not in i], key=int)
 
@@ -1431,6 +1646,115 @@ def run(chat, args: str):
             _compose(plan_dir, out, ref_mode=ref_mode)
         return
 
+    if args.startswith("redo"):
+        # /flow deepagent_md redo <plan_dir> <node_id> [--review]
+        #
+        # Hand-edit the numbered `## N.` section in node_id's PARENT file
+        # first (that section is what the child's own prompt is drawn from
+        # via _extract_parent_section), then run this to wipe node_id's own
+        # descendant subtree (backed up, not deleted -- see _superseded/)
+        # and regenerate it + everything below it via the normal _expand
+        # recursion, now reading the edited section.
+        rest = args[4:].strip()
+        review_flag = bool(_re.search(r'--review\b', rest))
+        if review_flag:
+            rest = _re.sub(r'--review\b', '', rest).strip()
+        parts = rest.split()
+        if len(parts) < 2:
+            print("usage: /flow deepagent_md redo <plan_dir> <node_id> [--review]")
+            return
+        plan_name, node_id = parts[0], parts[1]
+
+        base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
+        plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
+        if not _os.path.isdir(plan_dir):
+            print(f"[deepagent_md] not found: {plan_dir}")
+            return
+
+        meta = _load_meta(plan_dir)
+        if meta is None:
+            print(f"[deepagent_md] no {_META_FILENAME} in {plan_dir} — this plan predates "
+                  f"`redo` support (or the file was moved/deleted). Cannot redo "
+                  f"without the original task/plan_labels/maxdepth.")
+            return
+        task        = meta.get("task", "")
+        plan_labels = list(meta.get("plan_labels", []))
+        aspects     = list(meta.get("aspects", []))
+        cfg         = meta.get("cfg", {}) or {}
+        use_web     = meta.get("use_web", False)
+        maxdepth    = meta.get("maxdepth", _DEFAULT_MAXDEPTH)
+        if not task:
+            print(f"[deepagent_md] {_META_FILENAME} has no task recorded — cannot redo")
+            return
+
+        all_ids = _collect_node_ids(plan_dir)
+        if node_id not in all_ids:
+            print(f"[deepagent_md] {node_id} not found in {plan_dir} — nothing to redo")
+            return
+        victims = _descendant_ids(node_id, all_ids)
+
+        # re-derive node_id's title the same way the original _expand
+        # recursion did: parse the (unedited-except-by-hand) parent file's
+        # own numbered sections and pick the one node_id corresponds to.
+        id_parts = node_id.split(".")
+        if len(id_parts) < 2:
+            parent_file = _os.path.join(plan_dir, "index.md")
+            sec_num = int(id_parts[0])
+        else:
+            parent_id   = ".".join(id_parts[:-1])
+            sec_num     = int(id_parts[-1])
+            parent_file = _os.path.join(plan_dir, f"item_{parent_id}.md")
+        if not _os.path.isfile(parent_file):
+            print(f"[deepagent_md] parent file missing for {node_id} ({parent_file}) — cannot redo")
+            return
+        parent_sections = _parse_sections(open(parent_file, encoding="utf-8").read())
+        if sec_num < 1 or sec_num > len(parent_sections):
+            print(f"[deepagent_md] section {sec_num} not found in {parent_file} — cannot redo "
+                  f"(has {len(parent_sections)} numbered section(s))")
+            return
+        title = parent_sections[sec_num - 1]
+
+        use_review = review_flag or bool(cfg.get("review"))
+        if use_review and not cfg.get("review"):
+            cfg = dict(cfg, review=True)
+
+        import time as _time
+        import shutil as _shutil
+        timestamp  = _time.strftime("%Y%m%dT%H%M%S")
+        backup_dir = _os.path.join(plan_dir, "_superseded", f"{node_id}_{timestamp}")
+        _os.makedirs(backup_dir, exist_ok=True)
+        for vid in sorted(victims, key=lambda x: tuple(int(p) for p in x.split("."))):
+            src = _item_path(plan_dir, vid)
+            if _os.path.isfile(src):
+                dst = _os.path.join(backup_dir, _os.path.basename(src))
+                _shutil.move(src, dst)
+                print(f"[deepagent_md] backed up {vid} -> {dst}")
+
+        chat_ctx       = _serialize_ctx(getattr(chat, "messages", []), 6)
+        max_parent_ctx = 500
+        stats          = {"files": 0}
+        live_index     = _make_live_index(plan_dir, cfg, workers=None)
+        review_state   = {"mode": "ask", "branch_depth": None} if use_review else None
+        depth          = node_id.count(".") + 1
+
+        print(f"[deepagent_md] redo    : {node_id} in {plan_dir}")
+        print(f"[deepagent_md] subtree : {len(victims)} node(s) backed up and rebuilding")
+
+        stopped_early = False
+        try:
+            _expand(chat, node_id, title, task, plan_dir,
+                    depth=depth, max_depth=maxdepth, use_web=use_web,
+                    plan_labels=plan_labels, aspects=aspects, stats=stats,
+                    max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg,
+                    live_index=live_index, review_state=review_state)
+        except _StopGeneration:
+            print("\n[deepagent_md] stopped by user — partial output saved")
+            stopped_early = True
+
+        print(f"\n[deepagent_md] redo done: {stats['files']} file(s) regenerated in {plan_dir}"
+              + ("  (stopped early)" if stopped_early else ""))
+        return
+
     if args.startswith("resume"):
         # /flow deepagent_md resume <plan_dir>
         #
@@ -1450,9 +1774,13 @@ def run(chat, args: str):
         # already written stays untouched, only what's missing gets filled
         # in -- same principle deepagent_architect's --next/--loop resume
         # and deepagent_spec's own per-file skip already rely on.
-        plan_name = rest = args[6:].strip()
+        rest = args[6:].strip()
+        review_flag = bool(_re.search(r'--review\b', rest))
+        if review_flag:
+            rest = _re.sub(r'--review\b', '', rest).strip()
+        plan_name = rest
         if not plan_name:
-            print("usage: /flow deepagent_md resume <plan_dir>")
+            print("usage: /flow deepagent_md resume <plan_dir> [--review]")
             return
         base = _os.path.join(_os.getcwd(), ".1bcoder", "planMD")
         plan_dir = plan_name if _os.path.isabs(plan_name) else _os.path.join(base, plan_name)
@@ -1479,6 +1807,11 @@ def run(chat, args: str):
         chat_ctx = _serialize_ctx(getattr(chat, "messages", []), 6)
         max_parent_ctx = 500
         stats = {"files": 0}
+        use_review = review_flag or bool(cfg.get("review"))
+        if use_review and not cfg.get("review"):
+            cfg = dict(cfg, review=True)
+        live_index = _make_live_index(plan_dir, cfg, workers=None)
+        review_state = {"mode": "ask", "branch_depth": None} if use_review else None
         stopped_early = False
 
         print(f"[deepagent_md] resume  : {plan_dir}")
@@ -1511,7 +1844,8 @@ def run(chat, args: str):
                 _expand(chat, str(i), title, task, plan_dir,
                         depth=1, max_depth=maxdepth, use_web=use_web,
                         plan_labels=plan_labels, aspects=aspects, stats=stats,
-                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg,
+                        live_index=live_index, review_state=review_state)
         except _StopGeneration:
             print("\n[deepagent_md] stopped by user — partial output saved")
             stopped_early = True
@@ -1523,6 +1857,9 @@ def run(chat, args: str):
 
     if args.startswith("continue"):
         rest = args[8:].strip()
+        review_flag = bool(_re.search(r'--review\b', rest))
+        if review_flag:
+            rest = _re.sub(r'--review\b', '', rest).strip()
         cm = _re.search(r'--ctx\s+(\d+)', rest)
         ctx_n_continue = int(cm.group(1)) if cm else 6
         if cm:
@@ -1578,6 +1915,11 @@ def run(chat, args: str):
         if "temperature" not in chat.params:
             chat.params["temperature"] = 0.8
         stats = {"files": 0}
+        use_review = review_flag or bool(cfg.get("review"))
+        if use_review and not cfg.get("review"):
+            cfg = dict(cfg, review=True)
+        live_index = _make_live_index(plan_dir, cfg, workers=None)
+        review_state = {"mode": "ask", "branch_depth": None} if use_review else None
         max_parent_ctx = 500
         new_maxdepth = meta.get("maxdepth", 0)
 
@@ -1597,7 +1939,8 @@ def run(chat, args: str):
                 _expand(chat, leaf_id, title, task, plan_dir,
                         depth=leaf_depth, max_depth=target_depth, use_web=use_web,
                         plan_labels=labels_for_leaf, aspects=aspects, stats=stats,
-                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg,
+                        live_index=live_index, review_state=review_state)
         except _StopGeneration:
             print("\n[deepagent_md] stopped by user — partial output saved")
 
@@ -1697,6 +2040,21 @@ def run(chat, args: str):
         finalize_text = _DEFAULT_FINALIZE_TEXT + (f"\n\n{custom}" if custom else "")
         args = (args[:fzm.start()] + args[fzm.end():]).strip()
 
+    # ── dedup (plan-wide near-duplicate detection via radogast, opt-in) ────────
+    use_dedup = bool(_re.search(r'--dedup\b', args))
+    if use_dedup:
+        args = _re.sub(r'--dedup\b', '', args).strip()
+    dedup_threshold = 0.85
+    dtm = _re.search(r'--dedup-threshold\s+([\d.]+)', args)
+    if dtm:
+        dedup_threshold = float(dtm.group(1))
+        args = (args[:dtm.start()] + args[dtm.end():]).strip()
+
+    # ── review (interactive per-node gate, opt-in) ──────────────────────────
+    use_review = bool(_re.search(r'--review\b', args))
+    if use_review:
+        args = _re.sub(r'--review\b', '', args).strip()
+
     maxdepth = _DEFAULT_MAXDEPTH
     m = _re.search(r'--maxdepth\s+(\d+)', args)
     if m:
@@ -1760,6 +2118,12 @@ def run(chat, args: str):
                 print(f"               {h}  {mdl}")
         else:
             print(f"[deepagent_md] profile '{profile_name}' not found — running single")
+
+    if workers and (use_dedup or use_review):
+        print("error: --dedup/--review are incompatible with --profile "
+              "(parallel mode has no per-node review point). "
+              "Drop --profile for a supervised run, or drop --dedup/--review for an unattended one.")
+        return
 
     plan_m = _re.search(r'\bplan:\s*(.+?)(?:\s+(?:list:|$))', args + " ")
     list_m = _re.search(r'\blist:\s*(.+?)(?:\s*$)', args)
@@ -1827,6 +2191,9 @@ def run(chat, args: str):
         "rw_ratio":    rw_ratio,
         "noposition":  noposition,
         "finalize":    finalize_text,
+        "dedup":            use_dedup,
+        "dedup_threshold":  dedup_threshold,
+        "review":           use_review,
     }
     if noposition:
         print("[deepagent_md] noposition: position breadcrumb disabled")
@@ -1839,6 +2206,8 @@ def run(chat, args: str):
         chat.params["temperature"] = 0.8
 
     stats = {"files": 0}
+    live_index = _make_live_index(plan_dir, cfg, workers)
+    review_state = {"mode": "ask", "branch_depth": None} if use_review else None
 
     # generate index
     stopped_early = False
@@ -1895,7 +2264,8 @@ def run(chat, args: str):
                 _expand(chat, str(i), title, task, plan_dir,
                         depth=1, max_depth=maxdepth, use_web=use_web,
                         plan_labels=plan_labels, aspects=aspects, stats=stats,
-                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg)
+                        max_parent_ctx=max_parent_ctx, chat_ctx=chat_ctx, cfg=cfg,
+                        live_index=live_index, review_state=review_state)
     except _StopGeneration:
         print("\n[deepagent_md] stopped by user — partial output saved")
         stopped_early = True

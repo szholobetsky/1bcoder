@@ -15,6 +15,9 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+dedup = ["radogast[embed]"]
+
 [project.urls]
 Homepage = "https://github.com/szholobetsky/1bcoder"
 Repository = "https://github.com/szholobetsky/1bcoder"

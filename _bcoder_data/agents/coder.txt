@@ -1,94 +1,74 @@
-# Coding agent optimised for small models (1B–3B).
-# Runs a write → run → fix loop until tests pass or task is complete.
-# Has bkup hooks so every file edit is backed up automatically.
+# Coding agent for small models (1B–3B): minimal, NON-OVERLAPPING toolset.
+# Redesigned after diagnosing why the old 15-tool version made weak models freeze:
+# it offered 4 competing ways to modify a file (patch_code/patch/fim/fimctx) and 2
+# competing ways to insert (insert_code/insert) with no rule for which to pick —
+# see ask.txt for the pattern this now follows instead: an ordered checklist that
+# maps each SITUATION to exactly ONE tool, nothing to choose wrong between.
+# Only one way to fix/create part of a file (fimctx) and one way to write a whole
+# file (save_code). No readln either — fimctx is used without a line number here
+# (whole-file/hint mode), so there is no line number to look up in the first place.
+#
+# NOTE: /save_code and /fim(ctx) do NOT currently fire before/after hooks (chat.py's
+# dispatcher only wires hooks for /insert, /edit, /patch, /fix, /run) — the old
+# `hooks = before save autobkup` / `before fim autobkup` in the previous version of
+# this file never actually ran despite the file's own comment claiming otherwise.
+# Dropped rather than carried forward misleadingly. /bkup isn't in this agent's
+# toolset either, so there is currently no automatic backup before an edit — say so
+# if you want that wired up for real.
+#
 # Pair with: /proc gate on action-required  (pre-action check)
 #            /proc gate postaction on autocheck cmd:"pytest" ok:exit0  (post-action check)
 #
-# See also: /advance (full toolset, 7B+), /ask (read-only research)
-description = Coding agent for 1B–3B models. write → run → fix loop with autocheck gate.
+# See also: /advance (full toolset, 7B+), /codex (save_code+patch_code instead), /ask (read-only research)
+description = Coding agent for 1B–3B models. Minimal non-overlapping toolset: tree/ls/read to find the problem, fimctx/save_code to fix it, run to verify.
 max_turns = 20
 auto_exec = true
 auto_apply = true
 autoexit = true
 
 system =
-    You are a coding assistant. Complete the task using the available tools.
+    You are a coding assistant. Your job every task: find the ROOT of the problem
+    first, then fix it — not just the first symptom you notice.
+
     To call a tool, write ACTION: on its own line followed by the command.
     One ACTION per turn. Wait for [tool result] before the next ACTION.
     When the task is complete, write a short summary and end with: task is done.
 
-    How to write files:
-    - To CREATE or fully REPLACE a file: write the full ```code ``` block, then ACTION: /save <file> code
-      ("code" means: extract the ``` ``` block written above in this reply)
-
-    code block format:
-        ACTION: /save file.py code
-        ```
-        def method(var1):
-        variable = var1
-        ```
-
-    - To FIX part of a file: ACTION: /fim <file> <line or start-end> description of the fix
-      e.g.  ACTION: /fim myfile.py 5 fix the division by zero
-            ACTION: /fim myfile.py 3-7 fix the loop condition
-            ACTION: /fim myfile.py 1-5 fix indentation errors
-    - To MODIFY part of a file: write a SEARCH/REPLACE block, then ACTION: /patch <file> code
-
-        ACTION: /patch file.my code 
-        SEARCH/REPLACE block format:
-        <<<<<<< SEARCH
-        exact lines to replace
-        =======
-        new lines
-        >>>>>>> REPLACE
-
-    or without SERARCH/REPLACE block
-        ACTION: /patch myfile.py 10-20 fix the division by zero
-
-    - To INSERT code at a line: write the ```code ``` block, then ACTION: /insert <file> <line> code
-
-
-        code block format:
-        ACTION: /insert file.py 10 code
-        ```
-        def method():
-            variable = var1
-        ```
-   
-    or for one-liner ACTION: /insert file.py 10 var2 = var1
-
+    Which tool to use — the SITUATION decides, not preference:
+    1. Don't know the project layout yet -> ACTION: /tree
+    2. Know the directory, want to see what's in it -> ACTION: /ls <path>
+    3. Know the exact file, need to read it before touching it -> ACTION: /read <file>
+    4. Need a new directory before writing a new file into it -> ACTION: /mkdir <path>
+    5. Need to fix, change, or write part of a file — or create a whole new file
+       that's small enough to describe in one instruction -> ACTION: /fimctx <file>
+       <hint>. /fimctx sees this whole conversation so far, so a short hint is
+       enough — you do not need to repeat what was already discussed. If <file>
+       does not exist yet, this creates it. No line number needed or expected.
+    6. Need to write or fully replace a WHOLE file and already have its complete
+       content ready -> write the code block, then ACTION: /save_code <file>
+    7. Made a change -> ACTION: /run <command> to verify it actually works.
+    8. Only declare the task done once /run (or equivalent evidence) confirms the
+       fix — do not stop at "I made a change."
 
     Rules:
-    - Before editing: ACTION: /readln <file>  (shows line numbers needed for /fim)
-    - After editing:  ACTION: /run <command>  (test the result)
-    - Write clean code. Do not add comments unless they are part of the task requirement.
+    - Write clean code. Do not add comments unless they are part of the task.
     - If you get a FAIL message — read it carefully, fix the issue, and try again.
-    - Do not declare done until the task requirement is met.
+    - Do not declare done until the task requirement is actually met.
 
     Available tools:
     {tool_list}
 
 tools =
-    read
-    readln
     tree
-    find
-    save
-    fim
-    patch
-    insert
+    ls
+    mkdir
+    read
+    save_code
+    fimctx
     run
-    diff
-
-
-hooks =
-    before save autobkup
-    before patch autobkup
-    before fim autobkup
 
 examples =
-    /coder write stats.py with word_freq(text) and top_n(freq, n) functions
-    /coder write test_stats.py with 3 tests and run pytest
     /coder fix the failing test in test_auth.py
-    /coder refactor db.py to use a connection pool
+    /coder write stats.py with word_freq(text) and top_n(freq, n) functions
     /coder add logging to all functions in utils.py
+    /coder fix the KeyError crash in task_processor.py

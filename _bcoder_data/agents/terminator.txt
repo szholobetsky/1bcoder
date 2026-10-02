@@ -1,63 +1,79 @@
-# Supervised coding agent — external ladder supervision for small models (1B-3B).
+# Supervised coding agent for small models (1B-3B).
 # Implements §3 MVP of AUTOMATICAL_AGENTS_LOGICAL_EXTERNAL_APPROACH.
 #
 # Gate order per turn:
 #   gates (pre-action):
 #     1. action-required  — model must have issued an ACTION: call
-#     2. ladder           — context must be building toward task terms
 #   [ACTIONs executed here]
 #   gates_post (post-action):
-#     3. autocheck        — verify the change worked (tests pass, output correct)
+#     2. autocheck         — verify the change worked (tests pass, output correct), opt-in
 #
 # agent_ctx = 8000 keeps context tight — small models lose thread past 4-6K tokens.
 # max_turns = 30 allows up to 15 action+verify cycles before giving up.
+# num_predict deliberately NOT set here — inherits the provider's own default
+# (usually unbounded within context), same "don't cap it" convention as
+# flows/creator.py. 300 was the original value and it silently truncated any
+# real file mid-write (confirmed: cut a Kivy app off mid-fence via
+# ACTION: /save_code <file>, which then failed every check since the file was
+# incomplete); 1500 was tried next and was still too small for a "big file"
+# ask. If a model reliably rambles past what you want, set it explicitly
+# with /param num_predict <n> before running — don't hardcode a cap here.
 #
-# To add autocheck, add to gates_post section below, e.g.:
-#   autocheck cmd:"pytest" ok:exit0
-#   autocheck cmd:"python calc.py" keyword:passed
+# To add autocheck, add it to the gates_post section below (NOT gates — a
+# postaction check must run after an edit exists to check, otherwise it fails
+# every turn including plain reads, before any fix was attempted; confirmed
+# failure mode: `/proc gate on autocheck ...` instead of
+# `/proc gate postaction on autocheck ...` rejected a bare ACTION: /read
+# before it ever ran). Use exactly:
+#   /proc gate postaction on autocheck cmd:"pytest" ok:exit0
+#   /proc gate postaction on autocheck cmd:"python calc.py" keyword:passed
 #
-# See also: /coder (no ladder gate, simpler), /advance (manual confirm, 7B+)
+# See also: /coder (auto_exec=true, no gates), /advance (manual confirm, 7B+)
 #
 # Usage:
 #   /agent terminator <task description>
 #   /terminator <task description>
-description = Supervised agent with external ladder tracking. Gates ensure context builds toward task. Best for 1B-3B.
+description = Supervised agent for 1B-3B models. action-required gate keeps it issuing real ACTIONs; pair with postaction autocheck to force it to fix, not quit.
 max_turns = 30
 auto_exec = true
 auto_apply = true
 
 params =
     agent_ctx = 8000
-    num_predict = 300
     retry_cap = 3
 
 gates =
     action-required
-    ladder
 
 gates_post =
 
 system =
     You are a coding assistant working under external supervision.
-    A gate checks your progress after each turn — it verifies that
-    your actions are building evidence toward the task goal.
+    Every turn must either issue an ACTION or explicitly declare the task
+    done — a gate rejects turns that do neither.
 
     To call a tool, write ACTION: on its own line followed by the command.
     One ACTION per turn. Wait for [tool result] before the next ACTION.
     When the task is complete, write a short summary and end with: task is done.
 
     How to write files:
-    - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save <file> code
-      ("code" means: extract the ``` ``` block written above in this reply)
+    - To CREATE or fully REPLACE a file: write the full code block, then ACTION: /save_code <file>
     - To FIX part of a file: ACTION: /fim <file> <line or start-end> description of the fix
+      /fim only sees the description you write here — give a FULL, detailed
+      instruction of what to do with that section of code.
       e.g.  ACTION: /fim calc.py 5 fix the division by zero
             ACTION: /fim calc.py 3-7 fix the loop condition
             ACTION: /fim calc.py 1-5 fix indentation errors
-    - To INSERT code at a line: write the code block, then ACTION: /insert <file> <line> code
+      For a broader/shorter request that relies on something already discussed
+      earlier in this task, use ACTION: /fimctx <file> <line or start-end> <hint>
+      instead — it auto-injects this whole run's history so far.
+    - To INSERT code at a line: write the code block, then ACTION: /insert_code <file> <line>
 
     Rules:
     - /readln a file before editing it (shows line numbers needed for /fim)
     - /run to test after applying a fix
+    - /mkdir <path> to create a directory before writing files into it
+    - /ls [path] to see a directory's contents before deciding what to do next
     - If you get a FAIL message — read it carefully, fix the issue, and try again.
     - Do not declare done until the task requirement is met.
 
@@ -69,10 +85,13 @@ tools =
     readln
     tree
     find
-    save
+    ls
+    mkdir
+    save_code
     fim
-    patch
-    insert
+    fimctx
+    patch_code
+    insert_code
     run
     diff
     map index

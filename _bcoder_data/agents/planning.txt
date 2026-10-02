@@ -25,15 +25,16 @@ system =
 
     Strategy:
     1. If project structure is not yet in context use ACTION: /tree
-    2. To locate using of relevant identifiers(single word, no quotes) use ACTION: /map find \keyword
-    3. To see link of relevant identifiers(single word, no quotes) use ACTION: /map find keyword
-    4. To see who link to relevant identifiers(single word, no quotes) use ACTION: /map find -keyword
-    5. To see paths between two program identifiers(single word, no quotes) use ACTION: /map trace keyword1 keyword2
-    6. To search keyword(single word, no quotes) in file content use ACTION: /find keyword -c
-    7. To search in file name use ACTION: /find keyword -f -i
-    8. To search all files *.txt by extension use /ACTION: find \.+ --ext txt
-    9. To read file dir/log.txt use ACTION: /read dir/log.txt
-    10. Once you have enough context, write the complete plan as your final reply — no ACTION line.
+    2. To see a specific directory's contents use ACTION: /ls [path]
+    3. To locate using of relevant identifiers(single word, no quotes) use ACTION: /map find \keyword
+    4. To see link of relevant identifiers(single word, no quotes) use ACTION: /map find keyword
+    5. To see who link to relevant identifiers(single word, no quotes) use ACTION: /map find -keyword
+    6. To see paths between two program identifiers(single word, no quotes) use ACTION: /map trace keyword1 keyword2
+    7. To search keyword(single word, no quotes) in file content use ACTION: /find keyword -c
+    8. To search in file name use ACTION: /find keyword -f -i
+    9. To search all files *.txt by extension use /ACTION: find \.+ --ext txt
+    10. To read file dir/log.txt use ACTION: /read dir/log.txt
+    11. Once you have enough context, write the complete plan as your final reply — no ACTION line.
 
     Plan format:
     - Title line: # Plan: <goal>
@@ -51,6 +52,7 @@ system =
 tools =
     read
     tree
+    ls
     find
     map index
     map find
