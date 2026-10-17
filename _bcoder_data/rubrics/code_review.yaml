@@ -1,0 +1,47 @@
+name: code_review
+description: "Triage of a code change (diff hunk or file): which parts deserve a closer look. /loop cmd:\"/diff ...\" re:\"^@@\" --jev code_review"
+criteria:
+  # ── mechanical (regex) ───────────────────────────────────────────────────────
+  - id: no_debug_output
+    check: regex
+    pattern: '(?m)^\+.*\b(print\(|console\.log\(|System\.out\.print|pdb\.set_trace|breakpoint\(\))'
+    fail_if: match
+    message: "DEBUG - added debug output or breakpoint"
+
+  - id: no_new_todo
+    check: regex
+    pattern: '(?m)^\+.*\b(TODO|FIXME|HACK|XXX)\b'
+    fail_if: match
+    message: "TODO - added TODO/FIXME"
+
+  # ── semantic (jev) ───────────────────────────────────────────────────────────
+  - id: swallowed_errors
+    type: noul
+    instructions: "Does this code catch an error or exception and ignore it silently, without logging, re-raising or handling it?"
+    pass_when: false
+    message: "ERRORS - an exception is swallowed silently"
+
+  - id: names_match
+    type: noul
+    instructions: "Do the names of the functions and variables in this code match what they actually do?"
+    message: "NAMING - a name does not match what the code does"
+
+  - id: hidden_side_effects
+    type: noul
+    instructions: "Does a function in this code change global state, files or its input arguments while its name suggests it only reads or computes?"
+    pass_when: false
+    message: "SIDE EFFECTS - a function changes state its name does not suggest"
+
+  - id: dead_code
+    type: noul
+    instructions: "Does this code contain commented-out code, unreachable code or unused variables?"
+    pass_when: false
+    message: "DEAD CODE - commented-out, unreachable or unused code"
+
+  - id: magic_values
+    type: noul
+    instructions: "Does this code use unexplained literal numbers or strings where a named constant would make the meaning clear?"
+    pass_when: false
+    # pass needs p(no magic values) >= 0.4: on tev1:4b clean code read 0.48, planted 0.07
+    threshold: 0.4
+    message: "MAGIC VALUES - unexplained literals, use named constants"

@@ -1,0 +1,13 @@
+# commit-msg — a commit message for the staged changes (git diff --staged)
+# When: before git commit; stage the files first (git add)
+# Model: 1B: a small diff; 4B: up to ~300 changed lines
+# Usage:
+#   /command commit-msg
+/run git diff --staged
+/param temperature 0.2
+<<<
+Write a git commit message for the diff above:
+a subject line of at most 60 characters in the imperative mood,
+a blank line, then 1-4 lines on what changed and why.
+Output only the message.
+>>>

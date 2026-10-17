@@ -1,0 +1,13 @@
+name: definition_not_narrower
+description: "Glossary --redefine: the judged text is the old definition; is {{new_definition}} at least as broad. Needs tev1:4b; even 4b misses a much shorter definition as narrower"
+criteria:
+  - id: scope
+    type: choice
+    instructions: "Compare the definition in this text with this new definition: {{new_definition}}. How does the new definition relate to the one in the text?"
+    levels:
+      "broader": "The new definition covers everything the text says and more"
+      "equivalent": "The new definition says the same thing in other words"
+      "narrower": "The new definition loses part of what the text says"
+      "different": "The new definition describes something else"
+    pass: ["broader", "equivalent"]
+    message: "the new definition is narrower than or different from the old one"

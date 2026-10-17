@@ -1,0 +1,20 @@
+name: change_kind
+description: "Classify a change (commit message, diff or release note line) — no pass/fail, for sorting: /loop ... --jev change_kind"
+criteria:
+  - id: kind
+    type: choice
+    instructions: "What kind of change does this text describe?"
+    levels:
+      "feature": "New user-visible functionality"
+      "fix": "Fixes a bug or wrong behavior"
+      "refactor": "Restructures code without changing behavior"
+      "docs": "Documentation or comments only"
+      "test": "Tests only"
+      "internal": "Build, dependencies, configuration or tooling"
+
+  - id: user_visible
+    type: noul
+    instructions: "Would a user of the software notice this change?"
+    criteria:
+      "true": "Users notice it"
+      "false": "Users do not notice it"

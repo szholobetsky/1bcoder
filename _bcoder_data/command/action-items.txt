@@ -1,0 +1,12 @@
+# action-items — every task, assignment and promise in a text file, as a table
+# When: meeting notes, an email thread, a spec — who has to do what, by when
+# Model: 1B: short notes; 4B: up to ~4k tokens
+# Usage:
+#   /command action-items meeting.md
+/read {{1}}
+/param temperature 0.1
+<<<
+List every task, assignment or promise in the text above as a markdown table
+with the columns:  who | what | by when | words of the text
+Write "-" where the text does not say. Take only what the text says, invent nothing.
+>>>

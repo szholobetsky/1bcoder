@@ -14,8 +14,9 @@ Output params:
   ACTION: /read <first_file>     auto-opens single result (run mode only)
 
 Supported extensions:
-  .py .js .ts .java .cs .go .rs .cpp .c .h .rb .php .kt
-  .sql .yaml .yml .toml .json .xml .sh .bat .md .txt .cfg .conf .env
+  .py .js .ts .tsx .jsx .mjs .vue .java .cs .go .rs .cpp .c .h .rb .php .kt .kts .scala
+  .css .scss .less .html .snap .properties .gradle .ddl .proto .graphql
+  .sql .yaml .yml .toml .json .xml .sh .bat .md .txt .cfg .conf .env .ini
 
 Examples:
   > ask "which file handles user login?"
@@ -35,8 +36,11 @@ import sys, re
 reply = sys.stdin.read()
 
 # match paths like auth.py, src/auth.py, com/example/Auth.java, config.yaml ...
-candidates = re.findall(r'\b[\w./\\-]+\.(?:py|js|ts|java|cs|go|rs|cpp|c|h|rb|php|kt|'
-                        r'sql|yaml|yml|toml|json|xml|sh|bat|md|txt|cfg|conf|env)\b', reply)
+# front-end (tsx, css, snapshots), JVM build and resource files included: a list of files to
+# change for a web feature is mostly those
+candidates = re.findall(r'\b[\w./\\-]+\.(?:py|js|ts|tsx|jsx|mjs|vue|java|cs|go|rs|cpp|c|h|rb|php|kt|kts|scala|'
+                        r'css|scss|less|html|snap|properties|gradle|ddl|proto|graphql|'
+                        r'sql|yaml|yml|toml|json|xml|sh|bat|md|txt|cfg|conf|env|ini)\b', reply)
 
 seen = set()
 files = [f for f in candidates if not (f in seen or seen.add(f))]

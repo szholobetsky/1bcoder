@@ -1,0 +1,13 @@
+name: implements_rule
+description: "Does this code implement a business rule: {{rule}} (e.g. /loop dir:src file:*.py --jev implements_rule)"
+criteria:
+  - id: implements
+    type: choice
+    instructions: "Does this code implement the following rule: {{rule}}"
+    levels:
+      "yes": "The code implements this rule"
+      "partially": "The code implements part of this rule or calls the code that does"
+      "no": "The code works with related data but does not implement this rule"
+      "unrelated": "The code has nothing to do with this rule"
+    pass: ["yes", "partially"]
+    message: "does not implement: {{rule}}"

@@ -1,0 +1,32 @@
+# Which files to change for a task: the indexes search first, then the model judges.
+# gamayun (ontology of the task history) and simargl (similar past tasks) run on the task
+# text and their results land in the context, so even a small model starts from leads
+# instead of guessing what to grep. The model names keywords, then the read-only /ask
+# agent opens what it needs and lists the most relevant files.
+# Optional last step (ontology_check=Y): gamayun takes the files of that answer and lists
+# the files that changed together with them in past tasks (co_changes_with) but are not in
+# it - the tests, styles, snapshots and messages a model tends to miss - and the model
+# revises its list.
+#
+# Run from the repository root: simargl reads its index from .simargl/ there.
+#   /script run TaskIndexSearch.txt project=sonar index=default task="Project creation form validation is buggy"
+#   /script run TaskIndexSearch.txt project=sonar index=default ontology_check=Y task="..."
+#   1bcoder --scriptapply TaskIndexSearch.txt --param project=sonar --param index=default --param task="..." --model qwen3:1.7b
+# project         a gamayun project built from the task history (see: gamayun list)
+# index           a simargl project of this repository (usually: default)
+# task            the task text; keep double quotes out of it, it is passed to the indexers on a command line
+# ontology_check  Y = add the co-change check; anything else or not given = skip it
+#
+# Needs: pip install gamayun simargl, a gamayun project and a simargl index of the task history.
+/param run_timeout 300
+/param timeout 900
+/run gamayun search --project {{project}} --k 8 "{{task}}"
+/run simargl search --project {{index}} --mode task --top-k 4 --top-n 8 "{{task}}"
+Using the task and the index results above, list the code identifiers and words worth searching for in the code to fix this task. Reply with one comma-separated line, nothing else. Task: {{task}} -> keywords
+/ask -t 10 print out list of the most relevant files for fix the task: {{task}} (keywords to search: {{keywords}})
+/save .1bcoder/TaskIndexSearch-answer.md
+GATE: expr_gate('"{{ontology_check}}".strip().upper() == "Y"') > :END
+/run gamayun companions --project {{project}} --k 5 --from .1bcoder/TaskIndexSearch-answer.md
+Above are files that changed together with the files you chose in past tasks, but are not in your list. Keep every file of your list, and add those of them this task needs too (tests, styles, snapshots, messages of the same feature); leave out the rest. Print the final list - your files first, then the added ones - one path per line, nothing else.
+/save .1bcoder/TaskIndexSearch-answer.md
+:END

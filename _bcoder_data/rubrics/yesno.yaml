@@ -1,0 +1,10 @@
+name: yesno
+description: "Any yes/no question about the text: {{question}} (bind it as a gate or loop over it)"
+criteria:
+  - id: answer
+    type: noul
+    instructions: "{{question}}"
+    criteria:
+      "true": "Yes"
+      "false": "No"
+    message: "the answer to '{{question}}' is no"

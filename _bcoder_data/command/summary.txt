@@ -1,0 +1,12 @@
+# summary — the 5 main insights of a text file, one numbered line each
+# When: a document, notes, a log — to see what it says before reading it in full
+# Model: 1B: up to ~2k tokens of text; 4B: up to ~6k
+# Usage:
+#   /command summary notes.md
+/read {{1}}
+/param temperature 0.2
+<<<
+Read the text above. Write its 5 most important insights.
+One numbered line each, at most 25 words per line.
+Nothing before or after the list.
+>>>

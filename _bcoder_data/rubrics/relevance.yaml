@@ -1,0 +1,13 @@
+name: relevance
+description: How relevant a text is to the task or question it was produced for (e.g. /rag or /web results)
+criteria:
+  - id: relevance
+    type: score
+    instructions: "How relevant is this text to the task or question it was produced for?"
+    levels:
+      - "Unrelated"
+      - "Tangential"
+      - "Partly relevant"
+      - "Directly relevant"
+    threshold: 0.6
+    message: "text is not relevant enough to the task"

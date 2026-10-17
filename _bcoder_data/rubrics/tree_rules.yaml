@@ -1,0 +1,67 @@
+name: tree_rules
+description: Decomposition contract of deepagent_tree / deepagent_tree_md (DEEPAGENT_TREE.md section 2)
+threshold: 0.5
+split: "## "
+
+criteria:
+  # ── mechanical checks (regex, run first, no model call) ──────────────────────
+  - id: no_bare_headings
+    check: regex
+    # a level-2+ heading followed only by whitespace and then another heading.
+    # Level 1 is excluded: every deepagent item file opens with its own "# Title"
+    # line directly followed by "## 1. ...", which is not a bare section.
+    pattern: '(?m)^#{2,6} .+\n\s*(?=^#{1,6} )'
+    fail_if: match
+    message: "NO BARE HEADINGS - every heading needs at least one real sentence under it"
+
+  - id: no_meta_preamble
+    check: regex
+    pattern: '(?i)\A\s*(okay|sure|here''s|here is|certainly)\b'
+    fail_if: match
+    message: "meta preamble - start with the content itself, not with 'Okay, here is...'"
+
+  # ── semantic checks (jev, noul) ──────────────────────────────────────────────
+  - id: part_of_not_about
+    type: noul
+    instructions: "Are all the sub-parts described in this text genuine constituents of their parent (if every sub-part were removed, the parent would cease to exist), rather than topics merely related to it?"
+    criteria:
+      "true": "Every sub-part is a real constituent of the parent"
+      "false": "Some sub-parts are only topics about or related to the parent, not parts of it"
+    pass_when: true
+    message: "PART-OF, NOT ABOUT - a sub-part is a related topic, not a constituent of the parent"
+
+  - id: homogeneity
+    type: noul
+    instructions: "Are all sibling sub-parts in this text the same kind and roughly the same size of thing?"
+    criteria:
+      "true": "All siblings are of the same kind and level of granularity"
+      "false": "Siblings mix levels, e.g. a whole subsystem next to a single field"
+    pass_when: true
+    message: "HOMOGENEITY - siblings are not the same kind and size of thing"
+
+  - id: ceiling
+    type: noul
+    instructions: "Does this text restate, re-justify or re-derive content that belongs to an ancestor level (the parent or higher), instead of only breaking its own node down?"
+    criteria:
+      "true": "It restates ancestor content"
+      "false": "It only decomposes its own node"
+    pass_when: false
+    message: "CEILING - restates ancestor content"
+
+  - id: floor
+    type: noul
+    instructions: "Does this text reach into file names, method signatures or sub-part internals, i.e. details that belong to a level not yet decided?"
+    criteria:
+      "true": "It names files, method signatures or the internal breakdown of its sub-parts"
+      "false": "It stays at its own level of abstraction"
+    pass_when: false
+    message: "FLOOR - reaches into file names, method signatures or sub-part internals"
+
+  - id: no_smearing
+    type: noul
+    instructions: "Do two or more sub-parts in this text overlap, covering the same concept or responsibility?"
+    criteria:
+      "true": "Two sub-parts overlap"
+      "false": "Each sub-part owns a distinct slice with no overlap"
+    pass_when: false
+    message: "NO SMEARING - two sub-parts overlap; a shared concept should be its own sibling"

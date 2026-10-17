@@ -1,4 +1,5 @@
-"""RAG project manager — wraps simargl CLI with a global project registry.
+"""RAG project manager — wraps simargl CLI with a global project registry. The task/commit
+database itself is gathered by mokosh (init, ingest); simargl only indexes and searches.
 
 Global registry: ~/.1bcoder/rag_projects.txt
   Format: name: /absolute/path/to/project  # optional comment
@@ -10,8 +11,8 @@ Usage:
   /rag list                    show all registered projects
   /rag add [name] [path]       register cwd (or given path) as a named project
   /rag remove <name>           remove project from registry
-  /rag init                    run simargl init wizard in cwd
-  /rag ingest [--phase git|tasks] [--force]  run simargl ingest (task DB mode)
+  /rag init                    run the mokosh init wizard in cwd (repository + tracker -> .mokosh/project.yaml)
+  /rag ingest [--phase git|tasks] [--force]  run mokosh ingest (commits + tasks -> units.db)
   /rag status                  run simargl status in cwd
 
 Workflow for any folder with files:
@@ -176,9 +177,9 @@ def run(chat, args: str):
     # ── init ──────────────────────────────────────────────────────────────────
     if sub == "init":
         cwd = _os.getcwd()
-        print(f"[rag] running simargl init in {cwd}")
+        print(f"[rag] running mokosh init in {cwd}")
         print("[rag] (interactive — follow the wizard)")
-        _os.system("simargl init")
+        _os.system("mokosh init")
         return
 
     # ── index ─────────────────────────────────────────────────────────────────
@@ -194,8 +195,8 @@ def run(chat, args: str):
     if sub == "ingest":
         rest = " ".join(tokens[1:])
         cwd, rest = _extract_path(rest)
-        print(f"[rag] running simargl ingest {rest} in {cwd}".strip())
-        out = _run_simargl(f"simargl ingest {rest}".strip(), cwd)
+        print(f"[rag] running mokosh ingest {rest} in {cwd}".strip())
+        out = _run_simargl(f"mokosh ingest {rest}".strip(), cwd)
         print(out)
         return
 
@@ -235,6 +236,7 @@ def run(chat, args: str):
             return
 
         print(out)
+        chat._last_output = out   # $, /jev and /loop last see the results
         chat.messages.append({"role": "user",      "content": f"[rag search: {query}]\n{out}"})
         chat.messages.append({"role": "assistant", "content": f"[rag results injected into context]"})
         print("[rag] results added to context")

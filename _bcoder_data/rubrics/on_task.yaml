@@ -1,0 +1,13 @@
+name: on_task
+description: "Does the text work on the task {{task}} (gate an agent against drifting off it)"
+criteria:
+  - id: on_task
+    type: score
+    instructions: "How well does this text work on the task: {{task}}"
+    levels:
+      - "Unrelated to the task"
+      - "Only mentions the task"
+      - "Works on part of the task or on a side issue"
+      - "Works directly on the task"
+    threshold: 0.6
+    message: "drifted from the task: {{task}}"

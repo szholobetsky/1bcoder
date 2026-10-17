@@ -261,6 +261,17 @@ Examples:
 1bcoder --scriptapply my-fixes.txt --param file=calc.py --param range=1-4
 ```
 
+### In herdr and orca (`/ade`)
+
+- **herdr** — start `1bcoder` in a herdr pane, nothing to install. 1bcoder sees herdr's
+  `HERDR_ENV` / `HERDR_PANE_ID` and reports the pane as agent `1bcoder`: *idle* at the `>` prompt,
+  *blocked* at a question (y/n, pick a number), *working* otherwise. herdr shows the state in its
+  agents list like any known agent; on exit the pane is released. herdr 0.9.2+ also starts
+  1bcoder again in the pane after a herdr restart (an older herdr shows the state only).
+- **orca** — orca has a fixed list of agents and no way to add one. Add a Quick command
+  (Settings → Terminal → Quick commands) with the command `1bcoder`.
+- `/ade` inside 1bcoder shows what herdr and orca see.
+
 ---
 
 ## Quick start
@@ -1902,7 +1913,7 @@ For human input, the corrected command is shown with `[fix?]` and you are asked 
 
 ## Part of the SIMARGL toolkit
 
-1bcoder is one of eight tools that together form an **intellectual development support system**:
+1bcoder is one of ten tools that together form an **intellectual development support system**:
 
 | Tool | Role |
 |---|---|
@@ -1914,8 +1925,10 @@ For human input, the corrected command is shown with `[fix?]` and you are asked 
 | **[vyrii](https://github.com/szholobetsky/vyrii)** | Local AI web UI — chat, translate, web research, RAG, and file management via Gradio; powered by Ollama or any OpenAI-compatible backend |
 | **[syryn](https://github.com/szholobetsky/syryn)** | Bluetooth identity beacon — returns hostname, mDNS, and active network interfaces for headless devices |
 | **[alkonost](https://github.com/szholobetsky/alkonost)** | Task-board viewer/editor — Trello-style board and backlog over 1bcoder's `deepagent_task` output, with full spec rendering and autosave |
+| **[gamayun](https://github.com/szholobetsky/gamayun)** | Statistical ontology without an LLM — builds triples of terms, identifiers, files and modules from task history or a folder of documents and code; every triple carries its significance test |
+| **[mokosh](https://github.com/szholobetsky/mokosh)** | Dataset gathering — commits of a git repository and the tasks of its tracker (Jira, GitHub, GitLab, YouTrack) in one SQLite database that the other tools read |
 
-- **simargl** answers: *what code is related to this task?*
+- **simargl** finds the code related to a task by vector search over the task history (embeddings).
 - **svitovyd** answers: *how is the code structured and what depends on what?*
 - **1bcoder** answers: *how do I work with local models efficiently?*
 - **yasna** answers: *where did I already discuss this?*
@@ -1923,6 +1936,8 @@ For human input, the corrected command is shown with `[fix?]` and you are asked 
 - **vyrii** answers: *how do I access all of this through a browser?*
 - **syryn** answers: *what is the address of this headless device?*
 - **alkonost** answers: *where do I see and edit the tasks generated from a spec tree?*
+- **gamayun** finds the code related to a task through an ontology of significant links between words, files and modules (no LLM).
+- **mokosh** prepares the initial dataset from version control and the issue tracker.
 
 Together they cover the full development loop: understand the codebase, find relevant history, work with AI locally, remember what was decided, and verify the context stays on target.
 

@@ -1,0 +1,24 @@
+name: answer_hygiene
+description: Basic quality of an LLM reply (bind as /jev on or /jev gate on for an agent)
+criteria:
+  # ── mechanical (regex) ───────────────────────────────────────────────────────
+  - id: no_meta_preamble
+    check: regex
+    pattern: '(?i)\A\s*(okay|sure|certainly|of course|here''s|here is|great question)\b'
+    fail_if: match
+    message: "PREAMBLE - start with the content, not with 'Sure, here is...'"
+
+  - id: no_placeholders
+    check: regex
+    pattern: '(?i)(\.\.\.\s*\(?\s*(rest|remaining|existing|other|previous) (of )?(the )?(code|implementation|methods|file)|#\s*(your|add) (code|implementation) here|//\s*(your|add) (code|implementation) here|\bpass\s*#\s*TODO)'
+    fail_if: match
+    message: "PLACEHOLDER - write the full code, no '... rest of code' or 'your code here'"
+
+  # ── semantic (jev) ───────────────────────────────────────────────────────────
+  - id: answers
+    type: noul
+    instructions: "Does this text give a concrete answer or result, rather than only restating the question, asking for more details or describing what it would do?"
+    criteria:
+      "true": "It gives a concrete answer or result"
+      "false": "It only restates, asks back or announces plans"
+    message: "NO ANSWER - give the result itself, not a plan or a question back"

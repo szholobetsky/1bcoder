@@ -1,0 +1,49 @@
+name: spec_unit
+description: Atomic spec unit of deepagent_spec (WHO/WHAT template, DEEPAGENT_SPEC.md section 3). Semantic criteria need tev1:4b
+criteria:
+  # ── mechanical (regex) ───────────────────────────────────────────────────────
+  - id: has_template
+    check: regex
+    pattern: '(?m)^WHO:.*\n(?:.*\n)*?^WHAT:'
+    fail_if: nomatch
+    message: "TEMPLATE - WHO: and WHAT: lines are missing"
+
+  - id: has_acceptance
+    check: regex
+    pattern: '(?m)^ACCEPTANCE CRITERIA:\s*\n\s*- '
+    fail_if: nomatch
+    message: "TEMPLATE - no ACCEPTANCE CRITERIA list"
+
+  # ── semantic (jev) ───────────────────────────────────────────────────────────
+  - id: single_action
+    type: noul
+    instructions: "Does this specification describe one single responsibility, rather than several separate features bundled together?"
+    criteria:
+      "true": "One responsibility"
+      "false": "Several separate features in one unit"
+    message: "ATOMIC - several responsibilities in one unit, split it"
+
+  - id: testable
+    type: noul
+    instructions: "Can each acceptance criterion in this specification be checked by an observable outcome?"
+    criteria:
+      "true": "Every criterion has an observable, checkable outcome"
+      "false": "Some criteria are vague and cannot be checked"
+    message: "TESTABLE - an acceptance criterion has no observable outcome"
+
+  - id: no_implementation
+    type: noul
+    instructions: "Does this specification prescribe implementation details such as class names, functions, libraries or database tables?"
+    criteria:
+      "true": "It prescribes implementation details"
+      "false": "It describes behavior only"
+    pass_when: false
+    message: "WHAT, NOT HOW - prescribes implementation details"
+
+  - id: has_boundaries
+    type: noul
+    instructions: "Does this specification state clearly what is out of its scope?"
+    criteria:
+      "true": "Scope boundaries are stated"
+      "false": "Nothing says what is out of scope"
+    message: "BOUNDARIES - nothing says what is out of scope"

@@ -1,0 +1,11 @@
+name: fact_is_new
+description: "Glossary: is {{new_fact}} absent from the recorded FACTS (the judged text), even in other words. Needs tev1:4b (0.8b does not discriminate)"
+criteria:
+  - id: already_stated
+    type: noul
+    instructions: "Does this text already state the following fact, possibly in other words: {{new_fact}}"
+    criteria:
+      "true": "The text already states this fact"
+      "false": "The fact is new, the text does not state it"
+    pass_when: false
+    message: "already recorded: {{new_fact}}"

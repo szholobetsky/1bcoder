@@ -1,0 +1,10 @@
+name: triple_grounded
+description: "Ontology: is the statement {{statement}} really made by the judged text chunk (used by /flow ontology index). Needs tev1:4b — 0.8b only catches off-topic statements"
+criteria:
+  - id: grounded
+    type: noul
+    instructions: "Does this text state or directly imply the following: {{statement}}?"
+    criteria:
+      "true": "The text states or directly implies it"
+      "false": "The text does not say this"
+    message: "not stated in the source: {{statement}}"

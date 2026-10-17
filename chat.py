@@ -39,24 +39,456 @@ _GRAY  = "\033[90m"
 _LBLUE = "\033[94m"
 
 
+# ── native tool calls → ACTION lines ──────────────────────────────────────────
+# Larger models (gpt-oss, qwen3, lfm...) are trained to act through native tool
+# calls: the action arrives in message.tool_calls and the text content is empty.
+# 1bcoder's agent reads ACTION lines from the text, so such a model looked silent.
+# Each call is rewritten as "ACTION: /<command> <argument values>"; common tool
+# names map onto 1bcoder commands, a namespace prefix (repo_browser.print_tree)
+# is dropped, and anything unknown passes through as /<name> for the agent's own
+# command matching to resolve or report.
+_TOOL_ALIASES = {
+    "read": "read", "read_file": "read", "open_file": "read", "view": "read", "view_file": "read", "cat": "read",
+    "ls": "ls", "list_dir": "ls", "list_directory": "ls", "list_files": "ls",
+    "tree": "tree", "print_tree": "tree", "list_tree": "tree",
+    "find": "find", "find_files": "find",
+    "grep": "grep", "rg": "grep", "ripgrep": "grep", "search": "grep", "search_files": "grep",
+    "search_code": "grep", "grep_search": "grep",
+    "run": "run", "bash": "run", "shell": "run", "exec": "run", "execute": "run", "run_command": "run",
+}
+
+
+def _run_shell(cmd: str, timeout, stdin=None):
+    """Run a shell command, return (returncode, stdout+stderr, timed_out).
+    On timeout the whole process tree goes: subprocess.run kills only the shell,
+    and on Windows a grandchild (bash -> sed) keeps the output pipe open, so
+    waiting for the output then never ends."""
+    kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" \
+        else {"start_new_session": True}
+    p = subprocess.Popen(cmd, shell=True, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         encoding="utf-8", errors="replace", **kw)
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, (out or "") + (err or ""), False
+    except subprocess.TimeoutExpired:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+        else:
+            import signal
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                p.kill()
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        return p.returncode, (out or "") + (err or ""), True
+
+
+# reading a file through the shell (sed -n 'A,Bp' f, cat f, head -n N f) -> /read f A-B
+_SHELL_READ = [
+    (re.compile(r"""^sed\s+-n\s+['"]?(\d+),(\d+)p['"]?\s+(\S+)\s*$"""), lambda m: f"/read {m[3]} {m[1]}-{m[2]}"),
+    (re.compile(r"""^head\s+(?:-n\s*|-)(\d+)\s+(\S+)\s*$"""), lambda m: f"/read {m[2]} 1-{m[1]}"),
+    (re.compile(r"""^cat\s+(\S+)\s*$"""), lambda m: f"/read {m[1]}"),
+]
+
+
+# arguments that only cap a result list: they are not part of a 1bcoder command
+_TOOL_LIMIT_ARGS = {"max_results", "max_result", "limit", "max", "max_count", "count", "top_k", "topk",
+                    "n", "num", "num_results", "k", "head_limit", "max_lines"}
+_TOOL_PATH_ARGS = {"path", "paths", "dir", "directory", "folder", "root", "cwd", "file", "files", "target"}
+_TOOL_GLOB_ARGS = {"include", "glob", "file_pattern", "filename_pattern", "files_pattern", "pattern_files"}
+_SHELL_WRAP = re.compile(r"^\s*(?:bash|sh|zsh)\s+(?:-l?c|-c)\s+(.*)$", re.S)
+
+
+def _shell_to_action(command: str) -> str:
+    """A shell command from a model, as the 1bcoder command it means:
+    grep / rg -> /grep, everything else -> /run. A `bash -lc '...'` wrapper is
+    unwrapped (1bcoder's /run already goes through the system shell)."""
+    command = command.strip()
+    m = _SHELL_WRAP.match(command)
+    if m:
+        inner = m.group(1).strip()
+        try:
+            parts = shlex.split(inner)
+            inner = parts[0] if len(parts) == 1 else inner
+        except ValueError:
+            pass
+        command = inner.strip()
+    if re.match(r"^(?:grep|egrep|fgrep|rg)\s", command):
+        return "/grep " + command.split(None, 1)[1]
+    for rx, to_read in _SHELL_READ:
+        m = rx.match(command)
+        if m:
+            return to_read(m)
+    return "/run " + command
+
+
+def _tool_call_to_action(cmd: str, args) -> str:
+    if not isinstance(args, dict):
+        return f"/{cmd} {args}" if args not in (None, "") else f"/{cmd}"
+    if cmd == "run":
+        command = args.get("command") or args.get("cmd") or args.get("script")
+        if isinstance(command, (list, tuple)):
+            parts = [str(x) for x in command]
+            # ["bash", "-lc", "<script>"]: the script is the command
+            if len(parts) == 3 and parts[0] in ("bash", "sh", "zsh") and parts[1] in ("-c", "-lc"):
+                command = parts[2]
+            else:
+                command = subprocess.list2cmdline(parts) if sys.platform == "win32" else shlex.join(parts)
+        if isinstance(command, str):
+            return _shell_to_action(command)
+    if cmd == "grep":
+        pattern, paths, flags = None, [], []
+        for key, v in args.items():
+            k = key.lower()
+            if k in _TOOL_LIMIT_ARGS or v in (None, "", False):
+                continue
+            if k in _TOOL_PATH_ARGS:
+                paths += [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
+            elif k in _TOOL_GLOB_ARGS:
+                flags += [f"--include={x}" for x in (v if isinstance(v, (list, tuple)) else [v])]
+            elif k in ("case_insensitive", "ignore_case", "-i", "i") and v is True:
+                flags.append("-i")
+            elif pattern is None and not isinstance(v, bool):
+                pattern = str(v)
+        if pattern is None:
+            return "/grep"
+        return "/grep " + " ".join(flags + [shlex.quote(pattern)] + [shlex.quote(p) for p in paths])
+    vals = []
+    for key, v in args.items():
+        if cmd == "find" and key.lower() in _TOOL_LIMIT_ARGS:
+            continue
+        if isinstance(v, (list, tuple)):
+            vals.extend(str(x) for x in v)
+        elif isinstance(v, dict):
+            vals.append(json.dumps(v, ensure_ascii=False))
+        elif v is not None and v != "":
+            vals.append(str(v))
+    return f"/{cmd} {' '.join(vals)}".rstrip()
+
+
+def _tool_calls_to_actions(tool_calls) -> list:
+    out = []
+    for tc in tool_calls or []:
+        fn = (tc or {}).get("function") or {}
+        name = (fn.get("name") or "").strip()
+        if not name:
+            continue
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {"_": args}
+        base = re.split(r"[.:/]", name)[-1]
+        cmd = _TOOL_ALIASES.get(base.lower(), base)
+        action = _tool_call_to_action(cmd, args)
+        # one action per line: a newline inside an argument would split it
+        out.append(" ".join(f"ACTION: {action}".split("\n")).rstrip())
+    return out
+
+
+# ── /grep: the grep every model already knows, in pure Python ────────────────
+
+def _bre_to_python(p: str) -> str:
+    """grep's basic regex (no -E) to Python: in BRE \\( \\) \\| \\{ \\} \\+ \\? are the
+    operators and the bare characters are literal; Python has it the other way round."""
+    out, i = [], 0
+    while i < len(p):
+        c = p[i]
+        if c == "\\" and i + 1 < len(p):
+            n = p[i + 1]
+            out.append(n if n in "()|{}+?" else c + n)
+            i += 2
+            continue
+        out.append("\\" + c if c in "()|{}+?" else c)
+        i += 1
+    return "".join(out)
+
+
+def _grep_parse(arg_str: str) -> dict:
+    """grep-style arguments -> options. Anything after an unquoted | ; && > is
+    dropped (`| head -20`, `2>/dev/null`): /grep caps its own output."""
+    try:
+        lx = shlex.shlex(arg_str, posix=True, punctuation_chars="|;&><")
+        lx.whitespace_split = True
+        tokens = list(lx)
+    except ValueError:                      # an unbalanced quote: plain split
+        tokens = arg_str.split()
+    for i, t in enumerate(tokens):
+        if t and set(t) <= set("|;&><"):
+            tokens = tokens[:i]
+            break
+    o = {"i": False, "l": False, "c": False, "v": False, "w": False, "x": False, "F": False, "E": False,
+         "include": [], "exclude": [], "max_count": None, "patterns": [], "paths": [], "ignored": []}
+    rest, i = [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "--":
+            rest += tokens[i + 1:]
+            break
+        if t.startswith("--"):
+            key, _, val = t[2:].partition("=")
+            if key in ("include", "exclude"):
+                if not val and i + 1 < len(tokens):
+                    i, val = i + 1, tokens[i + 1]
+                o[key].append(val)
+            elif key in ("ignore-case",):
+                o["i"] = True
+            elif key in ("files-with-matches",):
+                o["l"] = True
+            elif key in ("fixed-strings",):
+                o["F"] = True
+            elif key in ("extended-regexp",):
+                o["E"] = True
+            elif key in ("max-count",) and val.isdigit():
+                o["max_count"] = int(val)
+            elif key == "regexp" and val:
+                o["patterns"].append(val)
+            else:
+                o["ignored"].append(t)
+        elif t.startswith("-") and len(t) > 1 and not rest:
+            j = 1
+            while j < len(t):
+                f = t[j]
+                if f in "eAmBC":                # option with a value: -e PAT, -m 5, -A 3
+                    val = t[j + 1:] or (tokens[i + 1] if i + 1 < len(tokens) else "")
+                    if not t[j + 1:]:
+                        i += 1
+                    if f == "e":
+                        o["patterns"].append(val)
+                    elif f == "m" and val.isdigit():
+                        o["max_count"] = int(val)
+                    else:
+                        o["ignored"].append(f"-{f}")
+                    break
+                if f in "ilcvwxFE":
+                    o[f] = True
+                elif f in "rRnHsIP":            # recursive / line numbers / names: always on
+                    pass
+                else:
+                    o["ignored"].append(f"-{f}")
+                j += 1
+        else:
+            rest.append(t)
+        i += 1
+    if not o["patterns"] and rest:
+        o["patterns"].append(rest.pop(0))
+    o["paths"] = rest
+    return o
+
+
+def _grep_regex(o: dict):
+    """One compiled regex for the patterns; a pattern that does not compile
+    is searched as plain text (a model's `setHeader("Name"` is not a regex)."""
+    parts, literal = [], []
+    for p in o["patterns"]:
+        if o["F"]:
+            parts.append(re.escape(p))
+            continue
+        src = p if o["E"] else _bre_to_python(p)
+        try:
+            re.compile(src)
+            parts.append(src)
+        except re.error:
+            parts.append(re.escape(p))
+            literal.append(p)
+    src = "|".join(f"(?:{x})" for x in parts)
+    if o["w"]:
+        src = rf"\b(?:{src})\b"
+    if o["x"]:
+        src = rf"^(?:{src})$"
+    # MULTILINE: the whole-file pre-check must see ^ and $ at every line, as grep does
+    return re.compile(src, re.MULTILINE | (re.IGNORECASE if o["i"] else 0)), literal
+
+
+def _colors_supported(stream) -> bool:
+    """Whether ANSI colors should go to this stream: NO_COLOR / FORCE_COLOR first,
+    then only a real terminal that is not TERM=dumb, and on Windows only a console
+    whose virtual-terminal mode is (or can be switched) on."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE", "0") != "0":
+        return True
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.GetStdHandle(-12 if stream is sys.stderr else -11)
+            mode = ctypes.c_uint32()
+            if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            vt = 0x0004                                   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return bool(mode.value & vt) or bool(k32.SetConsoleMode(handle, mode.value | vt))
+        except Exception:
+            return False
+    return True
+
+
+class _AnsiStrip:
+    """A text stream that drops ANSI escape sequences on the way out — the
+    colors stay in the code, a file / pipe / plain console gets plain text."""
+    _PARTIAL = re.compile(r'\x1b(\[[0-9;?]*)?$')
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._held = ""        # an escape sequence split across two writes
+
+    def write(self, text):
+        text = self._held + text
+        m = self._PARTIAL.search(text)
+        self._held, text = (text[m.start():], text[:m.start()]) if m else ("", text)
+        return self._stream.write(re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', "", text))
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _setup_colors():
+    """Plain text wherever colors would show up as ␛[90m garbage."""
+    if not _colors_supported(sys.stdout):
+        sys.stdout = _AnsiStrip(sys.stdout)
+    if not _colors_supported(sys.stderr):
+        sys.stderr = _AnsiStrip(sys.stderr)
+
+
 def _ok(msg: str):   print(f"{_GREEN}{msg}{_R}")
 def _err(msg: str):  print(f"{_RED}error: {msg}{_R}")
 def _info(msg: str): print(f"{_CYAN}{msg}{_R}")
 def _warn(msg: str): print(f"{_YELL}{msg}{_R}")
 
-def _input(prompt: str = "") -> str:
+
+_JEV_MOD = None
+
+
+def _jev():
+    """Lazy-load the jev adapter (jev.py next to chat.py) — decision models via /v1/systemone."""
+    global _JEV_MOD
+    if _JEV_MOD is None:
+        try:
+            import jev as _m
+        except ImportError:
+            import importlib.util
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev.py")
+            _spec = importlib.util.spec_from_file_location("jev", _p)
+            _m = importlib.util.module_from_spec(_spec)
+            sys.modules["jev"] = _m
+            _spec.loader.exec_module(_m)
+        _JEV_MOD = _m
+    return _JEV_MOD
+
+
+_LOOP_MOD = None
+
+
+def _loop_stream():
+    """Lazy-load loop_stream.py (next to chat.py) — pure helpers of /loop."""
+    global _LOOP_MOD
+    if _LOOP_MOD is None:
+        try:
+            import loop_stream as _m
+        except ImportError:
+            import importlib.util
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loop_stream.py")
+            _spec = importlib.util.spec_from_file_location("loop_stream", _p)
+            _m = importlib.util.module_from_spec(_spec)
+            sys.modules["loop_stream"] = _m
+            _spec.loader.exec_module(_m)
+        _LOOP_MOD = _m
+    return _LOOP_MOD
+
+
+_NOTE_MOD = None
+
+
+def _note_store():
+    """Lazy-load note_store.py (next to chat.py) — pure helpers of /note."""
+    global _NOTE_MOD
+    if _NOTE_MOD is None:
+        try:
+            import note_store as _m
+        except ImportError:
+            import importlib.util
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "note_store.py")
+            _spec = importlib.util.spec_from_file_location("note_store", _p)
+            _m = importlib.util.module_from_spec(_spec)
+            sys.modules["note_store"] = _m
+            _spec.loader.exec_module(_m)
+        _NOTE_MOD = _m
+    return _NOTE_MOD
+
+
+_ADE_MOD = None
+_HERDR = None        # the herdr pane 1bcoder reports to (ade.Herdr), None outside herdr
+
+
+def _ade():
+    """Lazy-load ade.py (next to chat.py) — 1bcoder in herdr / orca."""
+    global _ADE_MOD
+    if _ADE_MOD is None:
+        try:
+            import ade as _m
+        except ImportError:
+            import importlib.util
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ade.py")
+            _spec = importlib.util.spec_from_file_location("ade", _p)
+            _m = importlib.util.module_from_spec(_spec)
+            sys.modules["ade"] = _m
+            _spec.loader.exec_module(_m)
+        _ADE_MOD = _m
+    return _ADE_MOD
+
+
+def _input(prompt: str = "", none_on_eof: bool = False) -> str:
     """sys.stdin.readline() wrapper — bypasses pyreadline3 on Windows so special
-    characters (@, >, ~, `, < etc.) are not swallowed at the prompt."""
+    characters (@, >, ~, `, < etc.) are not swallowed at the prompt.
+    none_on_eof: None when nothing came back, not even a line break — EOF, or Ctrl+C
+    on Windows, where readline returns "" first and the KeyboardInterrupt follows."""
+    if _HERDR:   # waiting at the main prompt = idle, at any other question = blocked
+        _HERDR.set("idle" if prompt in ("> ", "··· ") else "blocked")
     print(prompt, end="", flush=True)
     try:
-        return sys.stdin.readline().rstrip("\n")
+        line = sys.stdin.readline()
+        if none_on_eof and not line:
+            return None
+        return line.rstrip("\n")
     except (EOFError, KeyboardInterrupt):
         raise
+    finally:
+        if _HERDR:
+            _HERDR.set("working")
 
 
 
-def _multiline_input() -> tuple:
+def _swallow_late_interrupt():
+    """On Windows a Ctrl+C reaches Python a moment after readline returned "": wait
+    that moment out here, or it lands on the next "> " and ends the program."""
+    try:
+        time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+
+
+def _multiline_input(default: str = "") -> tuple:
     """Open a multi-line text editor in the terminal.
+
+    default — text already typed (the prompt's " \\t"): it opens in the editor, every
+    line editable.
 
     Uses prompt_toolkit if available (Alt+Enter / Esc→Enter to submit).
     Falls back to a line-by-line collector terminated by '/end' on its own line.
@@ -96,7 +528,7 @@ def _multiline_input() -> tuple:
               " · /save [file] to save · Ctrl+T or /prompt [name] to save as /prompt"
               " · Ctrl+C to cancel]")
         try:
-            text = _pt_prompt('··· ', multiline=True, key_bindings=kb)
+            text = _pt_prompt('··· ', multiline=True, key_bindings=kb, default=default)
         except KeyboardInterrupt:
             print()
             return "", None
@@ -144,7 +576,9 @@ def _multiline_input() -> tuple:
 
     except ImportError:
         print("[multiline — type /end to submit · /prompt [name] to save as /prompt · Ctrl+C to cancel]")
-        lines = []
+        lines = default.split("\n") if default else []
+        for _l in lines:             # no editor here: show what is kept, go on below it
+            print(f"··· {_l}")
         prompt_name = None
         while True:
             try:
@@ -335,6 +769,24 @@ class _Tee:
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_ANSI_ANY_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+
+class _LoopNoInput:
+    """Stand-in for sys.stdin while /loop captures a cmd: source — any attempt
+    to read interactive input fails fast instead of blocking the loop."""
+    encoding = "utf-8"
+
+    def readline(self, *a, **k):
+        raise EOFError("no interactive input inside /loop cmd:")
+
+    read = readline
+
+    def isatty(self):
+        return False
+
+    def __iter__(self):
+        return iter(())
 
 
 def _strip_ui_separators(text: str) -> str:
@@ -387,7 +839,10 @@ INSTALL_BCODER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_
 SCRIPTS_DIR        = os.path.join(BCODER_DIR, "scripts")
 CTX_DIR            = os.path.join(BCODER_DIR, "ctx")
 PROJECTS_DIR       = os.path.join(BCODER_DIR, "projects")
+NOTES_DIR          = os.path.join(BCODER_DIR, "note")       # /note: titled notes, one .md each
 GLOBAL_SCRIPTS_DIR = os.path.join(HOME_BCODER_DIR, "scripts")
+COMMANDS_DIR        = os.path.join(BCODER_DIR, "command")       # /command: named scripts with help
+GLOBAL_COMMANDS_DIR = os.path.join(HOME_BCODER_DIR, "command")
 PROMPTS_FILE       = os.path.join(HOME_BCODER_DIR, "prompts.txt")
 PROC_DIR           = os.path.join(HOME_BCODER_DIR, "proc")
 LOCAL_PROC_DIR     = os.path.join(BCODER_DIR, "proc")
@@ -409,19 +864,22 @@ PROFILES_FILE        = os.path.join(BCODER_DIR, "profiles.txt")
 GLOBAL_PROFILES_FILE = os.path.join(HOME_BCODER_DIR, "profiles.txt")
 
 DEFAULT_AGENT_TOOLS = [
-    "read", "readln", "tree", "find", "insert_code", "save_code", "fim", "ls", "mkdir",
+    "read", "readln", "tree", "find", "grep", "insert_code", "save_code", "fim", "ls", "mkdir",
+    "note list", "note term", "note search",
 ]
 
 DEFAULT_AGENT_TOOLS_ADVANCED = [
     "read", "run", "insert_code", "save_code", "bkup", "diff", "patch_code",
-    "tree", "find", "ls", "mkdir",
+    "tree", "find", "grep", "ls", "mkdir",
     "map index", "map find", "map idiff", "map diff", "map trace", "map keyword",
+    "note list", "note term", "note search",
     "help",
 ]
 
 DEFAULT_AGENT_TOOLS_ASK = [
-    "read", "readln", "tree", "find", "ls",
+    "read", "readln", "tree", "find", "grep", "ls",
     "map index", "map find", "map trace", "map keyword",
+    "note list", "note term", "note search",
 ]
 
 ASK_RESULT_LIMIT_CHARS = 4000   # ~1K tokens — truncate if result exceeds this
@@ -513,6 +971,7 @@ Strategy:
 2. To locate relevant identifiers use ACTION: /map find \keyword  (single word, no quotes)
 3. To find real code identifiers from a phrase use ACTION: /map keyword extract phrase -f -c  (no quotes)
 4. To search file content use a single keyword e.g. ACTION: /find keyword -c
+   or search like grep, e.g. ACTION: /grep -rn "some text" src
 5. To read specific sections use ACTION: /read file start-end
 6. Stop when you have enough to answer
 
@@ -589,6 +1048,14 @@ Commands
           /find user_id -c -i
           /find config --ext py ctx
           /find \.connect\( -c
+/grep [-i] [-l] [-c] [-v] [-w] [-F|-E] [--include=GLOB] <pattern> [path ...]
+    Search file contents like grep -rn: prints path:line:text, recursive, line numbers.
+    Pure Python, so the same on Windows. Quoted patterns, combined flags (-rni),
+    basic or extended regex work as in grep; a trailing | head ... is ignored.
+    Sets {{grep_files}} to a comma-separated list of matching files.
+    e.g.  /grep -rn "Sonar-Version" server
+          /grep -il validation server/sonar-web/src/main/js/apps/create
+          /grep -E "setHeader|getHeader" --include=*.java .
 /find <term1> [term2 ...] -r [--ext <ext>]
     Ranked search using BM25 (in-memory FTS5). Returns top-10 files by relevance.
     Terms are space- or comma-separated. No regex — plain keyword matching.
@@ -791,7 +1258,14 @@ Commands
           ```
           /write
 
-/script list              List all scripts (* = current). Shows global scripts (g:) and project scripts.
+/script list              List all scripts (* = current) with the first line of each one's help.
+/script help [N|name]     Show a script's help: its leading # lines (the open script if none given).
+    Help convention — the top of the file, before the first command:
+      # name — what it does, in one line (shown by /script list and /command list)
+      # When: what input it suits, what it gives back
+      # Model: the smallest model it works with (e.g. 1B: short text; 4B: up to ~3k tokens)
+      # Usage:
+      #   /script run name file=notes.md
 /script open              Select and load a script (type number). Includes global and project scripts.
     Script format: one command per line. Lines starting with # are comments (skipped).
     :LABEL                          A label — a bare line, referenced by GATE: as a jump target.
@@ -842,6 +1316,38 @@ Commands
     spaces/quotes/colons and always FAILs regardless of content. For any check on freeform text,
     use pattern-gate (matches a regex against the reply via stdin, not eval — no such risk).
     See _bcoder_data/scripts/SystemQueryRouter.txt for a full example using both GATE shapes.
+
+/command                  List the commands: scripts in .1bcoder/command/ (project) and ~/.1bcoder/command/.
+/command list             Same, numbered, with the first line of each one's help.
+/command help <name|N>    Show a command's help: its leading # lines (convention: /help script).
+/command <name|N> [args]  Run it like /script run. {{args}} = everything after the name,
+                          {{1}} {{2}} … its words; a missing {{key}} is asked for.
+    Whatever the command switches on — /param, /proc on|before|gate, /role, /think,
+    /model, /var — is put back when it ends, also when it stops on an error.
+    Its replies stay in the context. A command may run /script; a command inside a
+    command is refused. No #POS is written into a command file.
+    e.g.  /command summary notes.md
+          /command commit-msg
+          /command help action-items
+
+Multi-line input (the prompt, scripts, commands):
+    text \\              a space and a backslash at the end: the line goes on with the next
+                         one (the line break kept, the next line's leading spaces dropped);
+                         " \\\\" is a literal " \\".
+    text \\t             at the prompt: everything typed so far moves into the /text editor,
+                         every line editable. " \\\\t" is a literal " \\t".
+    header <<<           in a script or command: a block up to the ">>>" line, taken as it is
+    ...                  (indentation kept, only {{name}} expands — no $ ~ @). A bare block is
+    >>> [-> var]         one prompt to the model; "/var set p =<<<" sets p; ">>> -> var"
+                         captures the reply. An unclosed <<< stops the script before it runs.
+    e.g.  /var set rules =<<<
+          Answer in Ukrainian.
+          Keep the code identifiers as they are.
+          >>>
+          <<<
+          {{rules}}
+          List every task given in the text above as a table: who | what | by when.
+          >>> -> tasks
 
 /prompt save <name>   Save the last user message as a reusable prompt template.
                       Name becomes the filename (no spaces, .txt added automatically).
@@ -929,6 +1435,43 @@ Commands
           /translate last mode:mini lang:de
           /translate off
 
+/jev <rubric|N> [key=value ...] Judge the last output ($, else last reply) with a rubric via a decision
+    model (Ollama /v1/systemone, e.g. tev1:0.8b). Prints a criterion table + PASS/FAIL verdict.
+    Does not change $ — run several rubrics on the same output one after another.
+    Rubrics may use {{name}} placeholders anywhere (instructions, levels, messages, regex patterns —
+    in a pattern the value matches literally). Like /script: a /var value is used silently, a
+    missing one is asked for and saved to /var; key=value sets it. /jev on|gate on ask at bind time,
+    then the binding reads the current /var value on every run.
+/jev "<question>" [options: a, b, c]   Quick question on the last output, no rubric file:
+    without options -> yes/no (noul) with p(true); with options -> choice with probabilities.
+/jev list                       Rubrics with numbers: global first, then local (g:/l:).
+/jev show <rubric|N>            Show a rubric's criteria, types, levels and thresholds.
+/jev model                      Current decision model and its details (size, quantization, context).
+/jev model list                 Decision models installed on the jev host (capability "decision").
+/jev model set <name|N>         Choose a decision model (N = number in /jev model list) and save it.
+/jev param                      Show jev params (~/.1bcoder/jev.json).
+/jev param clear                Reset all jev params to defaults (the model too).
+/jev param <key> <value>        Change one: model, host (empty = main host), timeout (s; ~300 for 4B on CPU),
+    keep_alive (5m), threshold (0..1, default for criteria), batch (1..64 questions per request),
+    on_error (fail|pass — what a gate does when the decision model is unreachable).
+/jev on <rubric|N>              watch: judge every reply, print a one-line verdict, never blocks.
+/jev gate on <rubric|N>         gate: judge every agent reply before ACTIONs; failing criteria become
+    FAIL: lines (agent retries with the exact rule and reading). Regex criteria run first and a
+    regex failure skips the model call. Bindings show up in /proc as jev:<rubric>.
+/jev off [rubric]               Remove jev watch/gate bindings (all, or for one rubric).
+/jev help                       This help.
+    Rubrics (.yaml/.yml/.json): ~/.1bcoder/rubrics/ (global),
+    .1bcoder/rubrics/ (local; a local rubric hides a global one with the same name). Criteria are
+    check: jev (type noul|choice|score) or check: regex (pattern, fail_if: match|nomatch).
+    Numbers work like /script run: /jev 2 == /jev tree_rules if it is #2 in /jev list.
+    $, ~ and @ are NOT expanded inside /jev commands (quoted questions are passed as typed).
+    e.g.  /jev model set tev1:0.8b
+          /run python -c "print('def add(a, b): return a + b')"
+          /jev "Is this Python code?"
+          /jev "Which language is this?" options: python, javascript, go
+          /jev relevance
+          /jev gate on tree_rules
+
 /visual setup host:<url> model:<name> [timeout:<s>] [profile:<name>]
     Configure a dedicated vision model (separate from the main model).
     Config stored globally in ~/.1bcoder/visual.json — persists across sessions.
@@ -955,15 +1498,47 @@ Commands
     e.g.  /web search python asyncio tutorial -> urls
           /web fetch https://docs.python.org/3/library/asyncio.html
 
-/flow list                List available flows (built-in + global + local).
+/flow list                List available flows (global + local).
 /flow <name> [args]       Run a flow — deterministic Python pipeline with loops and lists.
-    Flows live in _bcoder_data/flows/ (built-in) or ~/.1bcoder/flows/ (global/local).
+    Flows live in ~/.1bcoder/flows/ (global) or .1bcoder/flows/ (local; hides a global one).
     Built-in flows: webask, grounding, simargl_files, py_error_trace, commit_message
     e.g.  /flow webask what is asyncio -d 5
           /flow grounding dependency injection
           /flow simargl_files add user authentication
           /flow py_error_trace -f error.txt
           /flow commit_message
+
+/loop <source> [split:<cutter>] [--llm "<prompt>"] [--jev <rubric|N|"question">] [--radogast <task.yaml>]
+      [--keep pass|fail|all] [--ctx N] [--max-tokens N] [--out <file>] [--fresh] [--rg-min F] [--rg-dup F] [-y]
+    Turn anything into a stream of elements and act on each one with a fresh context.
+    Sources (exactly one):
+      dir:<path> [file:<glob>] [-r]   one element per text file (binary files skipped, natural sort)
+      file:<path>                     the whole file as one element (usually with split:)
+      last                            the last output ($: /find, /map, /tree, /rag... or the last reply)
+      cmd:"<slash command>"           run a read-only command and stream its output (no edits/agents/scripts)
+    Cutters: split:"## " (line prefix; an unnumbered first ## heading counts as section 1),
+      split:re:"^## \\d+\\." (regex at line start), split:blank (paragraphs), split:line,
+      split:tokens:N (~N tokens, cut on line boundaries). No split: = one element per file.
+      An element over --max-tokens (default num_ctx/2) is re-cut by tokens with a "part K of M" breadcrumb.
+    Actions, in this order: --radogast (embedding similarity to the task.yaml goal + out-of-scope hits;
+      annotations only, filters only with --rg-min F) -> --jev (rubric, or a quoted yes/no question)
+      -> --llm (one call per element: role + last --ctx N messages + prompt + breadcrumb + element).
+      --keep pass|fail|all chooses which elements go on to --llm and into the output (default pass).
+      After the loop --radogast prints a stream report: duplicate clusters (--rg-dup, default 0.85),
+      key_terms absent from every element, 5 elements farthest from the goal. The default embedding
+      model (bge-small-en) is English-only — similarities on Ukrainian text are unreliable.
+    --out <file>: <file>.jsonl raw log (written after every element) + <file> rendered by extension:
+      .md (heading + text per element), .csv (one row per element, columns = criteria), .txt (text only).
+      Rerunning the same command resumes: ids already in the log are skipped. A different action
+      (prompt, rubric, cutter, keep...) on an existing log is refused — add --fresh to start over.
+      Ctrl+C stops the loop; the interrupted element is not logged.
+    At the end: summary table; the results are offered to context (-y adds without asking) and set $.
+    $, ~ and @ are NOT expanded inside /loop (~ in paths is expanded as the home directory).
+    e.g.  /loop dir:concepts/ file:*.md split:"## " --llm "list everything about MCP server settings" --out mcp.md
+          /loop dir:logs/ file:*.log split:tokens:3000 --jev log_errors --keep fail --out errors.csv
+          /loop cmd:"/find mcp -c" split:blank --jev "Does this configure an MCP server?" --llm "Extract the settings"
+          /loop last split:"## " --jev TEACHING_STYLE --keep fail
+          /loop dir:.1bcoder/planMD/plan4 file:item_*.md --radogast .1bcoder/planMD/plan4/.radogast/task.yaml
 
 /var save <file>            Save all session variables to a key=value file (auto adds .var if no ext).
                              First line is always "# <description>" — set with /var set description=...
@@ -1198,8 +1773,8 @@ Note: /switch always keeps the conversation context (-sc).
 /rag list             Show all registered RAG projects from global registry.
 /rag add [name] [path]  Register cwd (or given path) as a named RAG project.
 /rag remove <name>    Remove project from registry.
-/rag init             Run simargl init wizard in cwd.
-/rag ingest           Run simargl ingest in cwd (task DB mode).
+/rag init             Run the mokosh init wizard in cwd (repository + tracker).
+/rag ingest           Run mokosh ingest in cwd (commits + tasks -> units.db).
 /rag status           Show simargl status for cwd.
     Workflow: /rag init  →  /rag index  →  /rag search <query>
     e.g.  /rag add myapp /my/project/home
@@ -1372,6 +1947,12 @@ Note: /switch always keeps the conversation context (-sc).
           /hook list
           /hook clear before edit
 
+/ade
+    1bcoder in an agent workspace app. In a herdr pane 1bcoder registers itself as
+    agent '1bcoder' (idle at the prompt, blocked at a question, working otherwise) —
+    nothing to install. orca: add a Quick command `1bcoder` (Settings -> Terminal).
+    /ade shows what herdr and orca see.
+
 /bkup save <file>
     Save a backup copy as <file>.bkup (overwrites existing).
     e.g.  /bkup save calc.py
@@ -1463,6 +2044,24 @@ Note: /switch always keeps the conversation context (-sc).
           /proj find payment -f
           /proj find payment -c
           /config save
+
+/note def <term> <text|$>    Add a definition to the note <term> (.1bcoder/note/<term>.md, made if new).
+                             $ alone = the last reply/output, tagged [llm: <model> · date]; text = [user · date].
+/note fact <term> <text|$>   Add a fact to the note <term>. Same $ rule.
+/note keyword <term> <k1,k2> Add keywords: a search for any of them finds the note.
+/note list                   List all notes with their number of definitions and facts.
+    Read the list of notes to see what is already written down.
+/note term <term> [ctx]      Show the whole note; ctx also adds it to the context.
+    Read one note: all its definitions, keywords and facts.
+/note search <words> [ctx]   Notes holding every word (name, keywords, definitions, facts); "a phrase" is one word.
+    Search the notes: definitions in full, only the facts with the words. No match -> how many notes exist.
+/note load <N,M>             Add the Nth and Mth notes of the last search (whole notes) to the context.
+    In an agent, list/term/search/load print into the agent's own context, never the main one.
+    e.g.  what does booklify do?          -> /note def booklify $
+          which database does it use?     -> /note fact booklify $
+          /note fact booklify "booklify has 4 types of users"
+          /note keyword booklify books, exchange
+          /note search sqlite             -> /note load 1,3
 
 /stats                  Show session statistics: LLM calls, tokens, speed (pp/tg), commands.
 /stats reset            Reset all counters for the current session.
@@ -2040,9 +2639,30 @@ def _merge_text_file(src: str, dst: str) -> list[str]:
     return added
 
 
+def _copy_missing_files(src_root: str, dst_root: str) -> list:
+    """Copy every file under src_root that does not exist under dst_root (recursive).
+    Existing files are never overwritten. Returns copied paths relative to src_root."""
+    import shutil
+    copied = []
+    for root, dirs, files in os.walk(src_root):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        rel_dir = os.path.relpath(root, src_root)
+        for fname in files:
+            if fname.endswith(".pyc"):
+                continue
+            rel = os.path.normpath(os.path.join(rel_dir, fname))
+            dst = os.path.join(dst_root, rel)
+            if not os.path.exists(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(os.path.join(root, fname), dst)
+                copied.append(rel.replace(os.sep, "/"))
+    return copied
+
+
 def _bootstrap_global_dir():
     """Copy missing items from wheel's _bcoder_data/ to ~/.1bcoder/.
-    On upgrade: merges new entries in aliases.txt and profiles.txt without overwriting user data.
+    On upgrade: copies files that are new in the wheel into existing folders and
+    merges new entries in aliases.txt and profiles.txt — never overwrites user data.
     Tracks last bootstrapped version in ~/.1bcoder/.version to detect upgrades."""
     import shutil
     if not os.path.isdir(INSTALL_BCODER_DIR):
@@ -2069,6 +2689,9 @@ def _bootstrap_global_dir():
 
     # ── upgrade: merge new entries in text files ──────────────────────────────
     if current_ver and current_ver != last_ver and last_ver:
+        new_files = _copy_missing_files(INSTALL_BCODER_DIR, HOME_BCODER_DIR)
+        if new_files:
+            print(f"[1bcoder] updated ~/.1bcoder/ — new files: {', '.join(new_files)}")
         merge_files = ["aliases.txt", "profiles.txt"]
         merged = []
         for fname in merge_files:
@@ -2172,7 +2795,9 @@ def _save_profile(name, workers, comment=""):
 def _load_script(path):
     if not path or not os.path.exists(path):
         return []
-    with open(path, "r", encoding="utf-8") as f:
+    # utf-8-sig: a BOM (PowerShell, Notepad) would hide the first line's "/" and
+    # send the command to the model as chat
+    with open(path, "r", encoding="utf-8-sig") as f:
         return f.readlines()
 
 
@@ -2225,13 +2850,119 @@ def _clear_pos(lines: list, path: str) -> None:
 
 def _build_label_map(content_lines: list) -> dict:
     """One pass over a script's content lines -> {label_name: line_index}.
-    Labels may be referenced both forward and backward in the same script."""
+    Labels may be referenced both forward and backward in the same script.
+    A ":word" line inside a <<< … >>> block is prompt text, not a label."""
     label_map = {}
-    for i, raw in enumerate(content_lines):
-        m = _LABEL_RE.match(raw.rstrip("\n").strip())
+    i = 0
+    while i < len(content_lines):
+        line = content_lines[i].rstrip("\r\n")
+        if _opens_block(line):
+            close = _block_close(content_lines, i)
+            i = (close if close is not None else len(content_lines)) + 1
+            continue
+        m = _LABEL_RE.match(line.strip())
         if m:
             label_map[m.group(1)] = i
+        i += 1
     return label_map
+
+
+# ── multi-line input: " \" goes on, " \t" opens the editor, <<< … >>> is a block ──
+# Everywhere a line is read (the prompt, a script, a /command):
+#   text \          a space and a backslash at the end: the line goes on with the
+#                   next one (the backslash dropped, the line break kept; the next
+#                   line's leading spaces dropped).  " \\" is a literal " \".
+#   text \t         typed at the prompt: the text so far moves into the editor
+#                   (/text), where every line can be edited.  " \\t" is literal.
+#   header <<<      in a script: a block running to a ">>>" line (">>> -> var"
+#   …               captures the result).  Its lines are taken as they are, with
+#   >>>             their indentation; only {{name}} expands — no $ ~ @.  A bare
+#                   block is one prompt to the model; "/var set p =<<<" sets p.
+
+_BLOCK_OPEN     = "<<<"
+_BLOCK_CLOSE_RE = re.compile(r'^\s*>>>\s*(?:->\s*(\w+))?\s*$')
+
+
+def _continues(line: str) -> tuple:
+    """(text, mode) of one line: mode None = complete, "cont" = goes on with the
+    next line (" \\"), "edit" = move into the editor (" \\t")."""
+    s = line.rstrip()
+    if s == "\\":
+        return "", "cont"
+    if s == "\\t":
+        return "", "edit"
+    if s.endswith(" \\\\"):            # " \\" -> a literal " \"
+        return s[:-1], None
+    if s.endswith(" \\\\t"):           # " \\t" -> a literal " \t"
+        return s[:-3] + "\\t", None
+    if s.endswith(" \\"):
+        return s[:-2].rstrip(), "cont"
+    if s.endswith(" \\t"):
+        return s[:-3].rstrip(), "edit"
+    return s, None
+
+
+def _opens_block(line: str) -> bool:
+    s = line.strip()
+    return s.endswith(_BLOCK_OPEN) and not s.startswith("#")
+
+
+def _block_close(content_lines: list, start: int):
+    """Index of the ">>>" line closing the block opened at start, or None."""
+    for j in range(start + 1, len(content_lines)):
+        if _BLOCK_CLOSE_RE.match(content_lines[j].rstrip("\r\n")):
+            return j
+    return None
+
+
+def _unclosed_block(content_lines: list):
+    """1-based line number of a <<< never closed by >>>, or None."""
+    i = 0
+    while i < len(content_lines):
+        if _opens_block(content_lines[i]):
+            close = _block_close(content_lines, i)
+            if close is None:
+                return i + 1
+            i = close
+        i += 1
+    return None
+
+
+def _script_step(content_lines: list, pc: int) -> tuple:
+    """The step starting at line pc -> (text, next_pc, literal, capture_var).
+    One line, a run of " \\" lines joined, or a whole <<< … >>> block (literal)."""
+    first = content_lines[pc].rstrip("\r\n")
+    if _opens_block(first):
+        close = _block_close(content_lines, pc)
+        if close is None:
+            raise ValueError(f"line {pc + 1}: {_BLOCK_OPEN} is never closed by >>>")
+        header = first.rstrip()[:-len(_BLOCK_OPEN)].rstrip()
+        body = "\n".join(l.rstrip("\r\n") for l in content_lines[pc + 1:close])
+        text = f"{header}\n{body}" if header else body
+        return text, close + 1, True, _BLOCK_CLOSE_RE.match(
+            content_lines[close].rstrip("\r\n")).group(1)
+    parts, j = [], pc
+    while j < len(content_lines):
+        line = content_lines[j].rstrip("\r\n")
+        text, mode = _continues(line)
+        if mode == "edit":              # the editor is for the prompt, not a script
+            text = line.rstrip()
+        parts.append(text if j == pc else text.lstrip())
+        j += 1
+        if mode != "cont":
+            break
+    return "\n".join(parts), j, False, None
+
+
+def _script_header(path: str) -> list:
+    """The help of a script or command: its leading # lines, without the "# "."""
+    lines = []
+    for raw in _content_lines(_load_script(path)):
+        s = raw.rstrip("\r\n")
+        if not s.startswith("#"):
+            break
+        lines.append(s[2:] if s.startswith("# ") else s[1:])
+    return lines
 
 
 def _split_gate_args(raw: str) -> list:
@@ -2300,6 +3031,17 @@ def _parse_script_apply_args(rest: str):
         elif filename is None:
             filename = token
     return auto_yes, filename, params
+
+
+def _list_command_files():
+    """[(name, path)] of /command files — project .1bcoder/command/ over ~/.1bcoder/command/."""
+    found = {}
+    for d in (GLOBAL_COMMANDS_DIR, COMMANDS_DIR):          # project last: it wins
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.endswith(".txt") and not f.startswith("_"):
+                    found[f[:-4]] = os.path.join(d, f)
+    return sorted(found.items())
 
 
 def _list_script_files():
@@ -2716,11 +3458,11 @@ _KNOWN_CMDS = [
     "/save", "/save_code", "/write", "/run", "/script", "/mcp",
     "/parallel", "/patch", "/patch_code", "/fix", "/fim", "/fimctx", "/bkup", "/diff", "/agent", "/tree",
     "/ls", "/mkdir",
-    "/find", "/map", "/ctx", "/think", "/format", "/param", "/model",
+    "/find", "/grep", "/map", "/ctx", "/think", "/format", "/param", "/model",
     "/host", "/help", "/init", "/clear", "/stats", "/exit",
     "/prompt", "/proc", "/team", "/var", "/config", "/alias",
-    "/doc", "/tempctx", "/proj", "/text", "/role", "/ask", "/translate",
-    "/web", "/flow", "/visual", "/profile", "/switch", "/rag",
+    "/doc", "/tempctx", "/proj", "/note", "/command", "/text", "/role", "/ask", "/translate",
+    "/web", "/flow", "/visual", "/profile", "/switch", "/rag", "/jev", "/loop", "/ade",
 ]
 
 # file_idx : position of the file-path argument (None = no file arg)
@@ -2758,7 +3500,7 @@ _CMD_SPEC = {
     "/tempctx":      dict(file_idx=None, kw_idx=1, keywords=["clear", "cut", "compact"]),    
     "/think":    dict(file_idx=None, kw_idx=1, keywords=["include", "exclude", "show", "hide"]),
     "/script":     dict(file_idx=None, kw_idx=1, keywords=[
-                      "list", "open", "create", "show", "run", "add",
+                      "list", "help", "open", "create", "show", "run", "add",
                       "clear", "reset", "reapply", "refresh", "apply"]),
     "/map":      dict(file_idx=None, kw_idx=1, keywords=["index", "find", "trace", "deps", "diff", "idiff", "keyword"]),
     "/prompt":   dict(file_idx=None, kw_idx=1, keywords=["save", "load", "list", "delete"]),
@@ -2768,6 +3510,7 @@ _CMD_SPEC = {
     "/config":   dict(file_idx=None, kw_idx=1, keywords=["save", "load", "show", "auto", "del"]),
     "/proj":     dict(file_idx=None, kw_idx=1, keywords=["set", "status", "list", "save", "load", "show", "find", "keyword", "file", "index"]),
     "/alias":    dict(file_idx=None, kw_idx=1, keywords=["save", "clear"]),
+    "/note":     dict(file_idx=None, kw_idx=1, keywords=["def", "fact", "keyword", "list", "term", "search", "load"]),
     "/doc":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
     "/translate": dict(file_idx=None, kw_idx=1, keywords=["setup", "on", "off", "status", "last"]),
     "/visual":    dict(file_idx=None, kw_idx=1, keywords=["setup", "status", "explain"]),
@@ -2904,6 +3647,11 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
         elif cmd_root == "/hook":
             if len(tokens) > 3 and tokens[1] in ("before", "after"):
                 name_idx = 3
+        elif cmd_root == "/command":
+            if len(tokens) > 2 and tokens[1] == "help":
+                name_idx = 2
+            elif len(tokens) > 1 and not tokens[1].isdigit():
+                name_idx = 1
         if name_idx is not None and name_idx not in fixes and len(tokens) > name_idx:
             tok = tokens[name_idx]
             if not tok.startswith("-") and not tok.startswith("@"):
@@ -2923,6 +3671,14 @@ def fix_command(cmd: str, auto: bool = False, extra_cmds: list | None = None,
             fixed_cmd = prefix + m.group(2)
         else:
             fixed_cmd = " ".join(tokens)
+    elif "\n" in cmd:
+        # a multi-line command (" \" or <<< … >>>): swap the fixed words in place,
+        # keeping every line break and indentation
+        pieces = re.split(r'(\s+)', cmd)
+        for i, (_, new) in fixes.items():
+            if 2 * i < len(pieces):
+                pieces[2 * i] = new
+        fixed_cmd = "".join(pieces)
     else:
         fixed_cmd = " ".join(tokens)
 
@@ -3436,8 +4192,9 @@ class CoderCLI:
                         "samples": n}
 
             def _model_entry(m):
+                # by_host buckets count only requests and generated tokens
                 e = {"requests": m["requests"], "tokens_gen": m["tokens_gen"],
-                     "tokens_prompt": m["tokens_prompt"], "tokens_cached": m.get("tokens_cached", 0)}
+                     "tokens_prompt": m.get("tokens_prompt", 0), "tokens_cached": m.get("tokens_cached", 0)}
                 for lbl in ("pp", "tg"):
                     sd = _spd_dict(m, lbl)
                     if sd:
@@ -3682,6 +4439,11 @@ class CoderCLI:
         self._load_model_meta()
         self._auto_apply  = False   # True while agent is running with auto_apply
         self._in_agent    = False   # True while inside any agent loop (/agent, /ask)
+        # Commands append their output to self.messages unless _in_agent: an agent's
+        # own tee captures what they print. A script run with -y sets _auto_apply but
+        # stays a normal session, so /run, /find, /tree ... still reach the context.
+        self._capturing   = False   # True while "<cmd> -> var" captures printed output
+        self._script_auto = False   # True while /script apply -y runs: no keyboard questions
         self._agent_msgs: list = [] # reference to active agent_msgs list (set in _run_agent_loop)
         self._agent_ctx:  int  = 0  # agent context limit (0 = use num_ctx); set via /tempctx N
         self._current_task: str = ""  # current agent task string — exposed as BCODER_TASK to procs
@@ -3732,7 +4494,24 @@ class CoderCLI:
         else:
             print(f"{_DIM}{self.SEP}{_R}")
 
+    def _note_offered(self, ctx_add: str = ""):
+        """Remember text a command offered for context, whatever the answer —
+        so $, /jev and /loop last see /find, /map, /tree, /diff output."""
+        if ctx_add:
+            self._last_output = ctx_add
+
+    def _agent_result_choice(self) -> str:
+        """What to carry from a finished agent into the main context: s / a / n.
+        A script run with -y never stops for the keyboard (a headless run started
+        from a console would hang here). It takes the summary: the agent's final
+        reply joins the context, so the script's next steps can work with it."""
+        if getattr(self, "_script_auto", False):
+            print("  Add to main context? [s]ummary / [a]ll / [n]one: s  (script -y)")
+            return "s"
+        return _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+
     def _confirm(self, prompt: str, ctx_add: str = "") -> bool:
+        self._note_offered(ctx_add)
         if ctx_add:
             new_toks  = len(ctx_add) // 4
             cur_toks  = sum(len(m["content"]) for m in self.messages) // 4
@@ -3777,6 +4556,8 @@ class CoderCLI:
         if self._role and not (messages and messages[0].get("role") == "system"):
             messages = [{"role": "system", "content": self._role}] + list(messages)
         chunks = []
+        tool_calls = []                   # native tool calls (Ollama: whole; OpenAI: by index, in fragments)
+        oa_calls: dict = {}
         self._last_tps = None
         self._last_pp_tps = None
         _t_start = time.time()
@@ -3819,6 +4600,11 @@ class CoderCLI:
                         except json.JSONDecodeError:
                             continue
                         delta = (data.get("choices") or [{}])[0].get("delta", {})
+                        for tc in delta.get("tool_calls") or []:
+                            slot = oa_calls.setdefault(tc.get("index", len(oa_calls)), {"name": "", "arguments": ""})
+                            fn = tc.get("function") or {}
+                            slot["name"] += fn.get("name") or ""
+                            slot["arguments"] += fn.get("arguments") or ""
                         # reasoning_content field (DeepSeek, LM Studio reasoning models)
                         reasoning = delta.get("reasoning_content") or ""
                         if reasoning and self.think_show:
@@ -3885,6 +4671,7 @@ class CoderCLI:
                             continue
                         data = json.loads(line)
                         msg = data.get("message", {})
+                        tool_calls.extend(msg.get("tool_calls") or [])
                         # Ollama native thinking field (Qwen3, some models)
                         thinking = msg.get("thinking", "")
                         if thinking and self.think_show:
@@ -3937,6 +4724,13 @@ class CoderCLI:
                             _est_prompt = sum(len(m.get("content") or "") for m in messages) // 4
                             _stat_cached = max(0, _est_prompt - _stat_prompt)
                             break
+            tool_calls += [{"function": c} for _, c in sorted(oa_calls.items())]
+            actions = _tool_calls_to_actions(tool_calls)
+            if actions:
+                text = ("\n" if chunks else "") + "\n".join(actions)
+                print(f"\n{_DIM}[native tool call → ACTION]{_R}")
+                _print(text)
+                chunks.append(text)
         except KeyboardInterrupt:
             print("\n[interrupted]")
             return None  # sentinel: interrupted (vs "" which means empty reply)
@@ -3970,7 +4764,8 @@ class CoderCLI:
             if _elapsed > 0.01:
                 self._last_tps = (len(reply) / 4) / _elapsed
         self._last_pp_tps = _stat_pp_tps
-        if reply is not None and reply != "":
+        # a call that only thought (or failed to answer) still cost its tokens
+        if reply or _stat_gen or _stat_prompt:
             if _stat_gen == 0 and reply:
                 _stat_gen = len(reply) // 4   # fallback estimate for OpenAI
             self._stats["requests"]      += 1
@@ -4032,6 +4827,16 @@ class CoderCLI:
                 break
             if not user_input:
                 continue
+            try:
+                user_input = self._read_more(user_input)
+            except (KeyboardInterrupt, EOFError):
+                # Ctrl+C in a " \" continuation: drop what was typed, back to "> "
+                # (not out of 1bcoder, as Ctrl+C at "> " itself does)
+                _swallow_late_interrupt()
+                print("\n[cancelled]")
+                continue
+            if not user_input:
+                continue
             if user_input not in self._history or (self._history and self._history[-1] != user_input):
                 self._history.append(user_input)
             _msg_count_before = len(self.messages)
@@ -4085,6 +4890,30 @@ class CoderCLI:
             else:
                 self._last_input = user_input
 
+    def _read_more(self, first: str):
+        """The prompt's line endings: " \\" reads one more line (the line break kept),
+        " \\t" moves everything typed so far into the editor (/text). None = cancelled."""
+        text, mode = _continues(first)
+        if mode is None:
+            return first
+        lines = [text]
+        while mode == "cont":
+            line = _input("··· ", none_on_eof=True)    # Ctrl+C here raises, or gives None
+            if line is None:
+                raise KeyboardInterrupt
+            text, mode = _continues(line)
+            lines.append(text.lstrip())
+        joined = "\n".join(lines).strip()
+        if mode == "edit":
+            joined, prompt_name = _multiline_input(default=joined)
+            joined = joined.strip()
+            if joined and prompt_name is not None:
+                if not prompt_name:
+                    prompt_name = self._prompt_input("  prompt name:").strip().replace(" ", "-")
+                if prompt_name:
+                    self._save_prompt(prompt_name, joined)
+        return joined or None
+
     # ── command routing ────────────────────────────────────────────────────────
 
     # commands excluded from cmd_history (session management, not reusable work)
@@ -4093,13 +4922,21 @@ class CoderCLI:
         "/model", "/host", "/ctx", "/script",
     })
 
+    # commands whose arguments are taken literally: no $ / ~ / @ expansion in _route
+    _NO_EXPAND_CMDS = frozenset({"/jev", "/loop", "/grep",    # $ ~ @ are regex / Java text there
+                                 "/note"})   # /note expands a bare $ itself: a reply may hold ~ and @
+
     # shorthand aliases expanded before fix_command and routing
     _ALIASES = {
         }
 
-    def _route(self, user_input: str, auto: bool = False):
+    def _route(self, user_input: str, auto: bool = False, literal: bool = False,
+               capture: str | None = None):
+        # literal: the text of a <<< … >>> block — no $ ~ @ expansion, no suffix
+        # operators read out of it (its last line may well say "a -> b");
+        # capture: the variable of its closing ">>> -> var" line
         # ── /prompt save <name> suffix — works appended to any text ───────────
-        _ps = re.search(r'\s+/prompt\s+save\s+(\S+)\s*$', user_input)
+        _ps = None if literal else re.search(r'\s+/prompt\s+save\s+(\S+)\s*$', user_input)
         if _ps:
             name = _ps.group(1).replace(" ", "-")
             text = user_input[:_ps.start()].strip()
@@ -4110,8 +4947,8 @@ class CoderCLI:
             return
 
         # ── capture suffix:  command -> varname ───────────────────────────────
-        capture_var = None
-        m = re.search(r'\s+->\s*(\w+)\s*$', user_input)
+        capture_var = capture
+        m = None if literal else re.search(r'\s+->\s*(\w+)\s*$', user_input)
         if m:
             capture_var = m.group(1)
             user_input  = user_input[:m.start()].strip()
@@ -4119,7 +4956,7 @@ class CoderCLI:
         if user_input.startswith("/"):
             user_input = self._ALIASES.get(user_input.split()[0], user_input)  # hardcoded shorthands
             user_input = self._expand_alias(user_input)                         # user-defined aliases
-            _dyn_roots = {"/flow", "/proc", "/script", "/hook"}
+            _dyn_roots = {"/flow", "/proc", "/script", "/hook", "/command"}
             _cmd0 = user_input.split()[0]
             _dyn_target = _cmd0 if _cmd0 in _dyn_roots else _fuzzy_fix(_cmd0, list(_dyn_roots), cutoff=0.7)
             _dyn_kw = {_dyn_target: self._list_names(_dyn_target)} if _dyn_target else None
@@ -4128,26 +4965,28 @@ class CoderCLI:
             if self._vars and "{{" in user_input:
                 user_input = _apply_params(user_input, self._vars)
             # expand $ to last output, ~ to last input, @ to file picker
-            if "$" in user_input:
+            # (skipped for commands that take free text / regex literally, e.g. /jev)
+            _no_expand = literal or user_input.split()[0] in self._NO_EXPAND_CMDS
+            if "$" in user_input and not _no_expand:
                 user_input = user_input.replace("$", self._last_output)
-            if "~" in user_input:
+            if "~" in user_input and not _no_expand:
                 user_input = user_input.replace("~", self._last_input)
-            if "@p" in user_input:
+            if "@p" in user_input and not _no_expand:
                 resolved = self._resolve_at_profile(user_input)
                 if resolved is None:
                     return
                 user_input = resolved
-            if "@r" in user_input:
+            if "@r" in user_input and not _no_expand:
                 resolved = self._resolve_at_rag(user_input)
                 if resolved is None:
                     return
                 user_input = resolved
-            if "@/" in user_input:
+            if "@/" in user_input and not _no_expand:
                 resolved = self._resolve_at_dir(user_input)
                 if resolved is None:
                     return
                 user_input = resolved
-            if "@" in user_input:
+            if "@" in user_input and not _no_expand:
                 resolved = self._resolve_at(user_input)
                 if resolved is None:
                     return
@@ -4157,15 +4996,27 @@ class CoderCLI:
                 self.cmd_history.append(user_input)
         else:
             # expand $ and ~ in plain chat messages too
-            if "$" in user_input:
+            if "$" in user_input and not literal:
                 user_input = user_input.replace("$", self._last_output)
-            if "~" in user_input:
+            if "~" in user_input and not literal:
                 user_input = user_input.replace("~", self._last_input)
 
         if capture_var:
-            with _Tee() as tee:
-                self._route(user_input, auto=auto)
+            was_capturing, self._capturing = self._capturing, True
+            calls_before = self._stats.get("requests", 0)
+            try:
+                with _Tee() as tee:
+                    if literal:
+                        self._route(user_input, auto=auto, literal=True)
+                    else:
+                        self._route(user_input, auto=auto)
+            finally:
+                self._capturing = was_capturing
             captured = _strip_ui_separators(tee.getvalue()).strip()
+            if not user_input.startswith("/") and self._stats.get("requests", 0) != calls_before:
+                # a question to the model: the variable gets its answer, not the printed
+                # stream (which carries the <think> reasoning and the UI around it)
+                captured = re.sub(r'<think>.*?</think>', '', self.last_reply or "", flags=re.DOTALL).strip()
             self._last_output = captured
             self._vars[capture_var] = captured
             _ok(f"[var] {capture_var} captured ({len(captured)} chars)")
@@ -4279,12 +5130,16 @@ class CoderCLI:
             self._cmd_prompt(user_input)
         elif user_input.startswith("/translate"):
             self._cmd_translate(user_input)
+        elif user_input.startswith("/jev"):
+            self._cmd_jev(user_input)
         elif user_input.startswith("/visual"):
             self._cmd_visual(user_input)
         elif user_input.startswith("/web"):
             self._cmd_web(user_input)
         elif user_input.startswith("/flow"):
             self._cmd_flow(user_input)
+        elif user_input == "/loop" or user_input.startswith("/loop "):
+            self._cmd_loop(user_input)
         elif user_input.startswith("/proc"):
             self._cmd_proc(user_input)
         elif user_input.startswith("/mcp"):
@@ -4312,6 +5167,8 @@ class CoderCLI:
                 self._run_hook("after_fix", _ha)
         elif user_input.startswith("/hook"):
             self._cmd_hook(user_input)
+        elif user_input.startswith("/ade"):
+            print(_ade().status(_HERDR))
         elif user_input.startswith("/bkup"):
             self._cmd_bkup(user_input)
         elif user_input.startswith("/diff"):
@@ -4332,18 +5189,24 @@ class CoderCLI:
             self._cmd_mkdir(user_input)
         elif user_input.startswith("/find"):
             self._cmd_find(user_input)
+        elif user_input.startswith("/grep"):
+            self._cmd_grep(user_input)
         elif user_input.startswith("/team"):
             self._cmd_team(user_input)
         elif user_input.startswith("/var"):
             self._cmd_var(user_input)
         elif user_input.startswith("/text"):
-            self._cmd_note()
+            self._cmd_text()
         elif user_input.startswith("/role"):
             self._cmd_role(user_input)
         elif user_input.startswith("/config"):
             self._cmd_config(user_input)
         elif user_input.startswith("/proj"):
             self._cmd_proj(user_input)
+        elif user_input.startswith("/note"):
+            self._cmd_note(user_input)
+        elif user_input.startswith("/command"):
+            self._cmd_command(user_input)
         elif user_input.startswith("/doc"):
             self._cmd_doc(user_input)
         elif user_input.startswith("/"):
@@ -5502,7 +6365,7 @@ advanced_tools =
             ctx_text = "\n".join(plain_lines) + summary_p
             if not inject_ctx:
                 inject_ctx = self._confirm("Add tree to context? [Y/n]", ctx_add=ctx_text)
-            if inject_ctx and not self._auto_apply:
+            if inject_ctx and not self._in_agent:
                 self.messages.append({"role": "user", "content": ctx_text})
                 _ok(f"[tree] injected into context ({len(plain_lines)} lines)")
 
@@ -5539,7 +6402,7 @@ advanced_tools =
             output = f"{display}/\n" + "\n".join(f"  {l}" for l in lines)
 
         self._last_output = output
-        if not self._auto_apply:
+        if not self._in_agent:
             self.messages.append(
                 {"role": "user", "content": f"[ls: {display}]\n```\n{output}\n```"}
             )
@@ -5572,7 +6435,7 @@ advanced_tools =
                   else "nothing created — path(s) already existed" if not failed
                   else "failed to create: " + ", ".join(failed))
         self._last_output = output
-        if not self._auto_apply:
+        if not self._in_agent:
             self.messages.append(
                 {"role": "user", "content": f"[mkdir: {' '.join(tokens)}]\n{output}"}
             )
@@ -5584,6 +6447,98 @@ advanced_tools =
         "node_modules", "__pycache__", ".venv", "venv", "env",
         ".1bcoder", "dist", "build", ".mypy_cache", ".pytest_cache",
     })
+
+    def _cmd_grep(self, user_input: str):
+        """grep -rn semantics over the project, pure Python (Windows has no grep)."""
+        arg_str = user_input[len("/grep"):].strip()
+        if not arg_str:
+            print("usage: /grep [-i] [-l] [-c] [-v] [-w] [-x] [-F|-E] [--include=GLOB] <pattern> [path ...]")
+            return
+        o = _grep_parse(arg_str)
+        if not o["patterns"]:
+            print("[grep] no pattern given")
+            return
+        rx, literal = _grep_regex(o)
+        MAX_LINES, MAX_COL = 60, 240
+        import fnmatch
+
+        targets, missing = [], []
+        for p in o["paths"] or ["."]:
+            full = p if os.path.isabs(p) else os.path.join(WORKDIR, p)
+            (targets if os.path.exists(full) else missing).append(full)
+
+        def files():
+            for t in targets:
+                if os.path.isfile(t):
+                    yield t
+                    continue
+                for dirpath, dirnames, filenames in os.walk(t):
+                    dirnames[:] = sorted(d for d in dirnames if d not in self._FIND_SKIP_DIRS and not d.startswith("."))
+                    for fname in sorted(filenames):
+                        if o["include"] and not any(fnmatch.fnmatch(fname, g) for g in o["include"]):
+                            continue
+                        if o["exclude"] and any(fnmatch.fnmatch(fname, g) for g in o["exclude"]):
+                            continue
+                        yield os.path.join(dirpath, fname)
+
+        def rel(path):
+            r = os.path.relpath(path, WORKDIR)
+            return (path if r.startswith("..") else r).replace("\\", "/")
+
+        MAX_BYTES = 2_000_000                 # bundles and data dumps, not code
+        out, hit_files, total = [], [], 0
+        for full in files():
+            try:
+                if os.path.getsize(full) > MAX_BYTES:
+                    continue
+                with open(full, "rb") as fh:
+                    raw = fh.read()
+                if b"\x00" in raw[:8192]:
+                    continue
+                content = raw.decode("utf-8", errors="replace")
+                # one search over the whole text first: most files have no match,
+                # and splitting them into lines is what made a tree search slow
+                if not o["v"] and not rx.search(content):
+                    continue
+                n = 0
+                for lineno, line in enumerate(content.splitlines(), 1):
+                    if bool(rx.search(line)) == o["v"]:
+                        continue
+                    n += 1
+                    if not (o["l"] or o["c"]) and len(out) < MAX_LINES:
+                        out.append(f"{rel(full)}:{lineno}:{line[:MAX_COL]}{' ...' if len(line) > MAX_COL else ''}")
+                    if o["max_count"] and n >= o["max_count"]:
+                        break
+            except OSError:
+                continue
+            if n:
+                total += n
+                hit_files.append(rel(full))
+                if o["l"] and len(out) < MAX_LINES:
+                    out.append(rel(full))
+                elif o["c"] and len(out) < MAX_LINES:
+                    out.append(f"{rel(full)}:{n}")
+
+        lines = [f"grep: {rel(m)}: No such file or directory" for m in missing]
+        lines += out
+        shown = len(out)
+        listed = len(hit_files) if (o["l"] or o["c"]) else total
+        if listed > shown:
+            lines.append(f"... {listed - shown} more (showing {shown}); narrow the pattern or the path")
+        notes = []
+        if literal:
+            notes.append("searched as plain text: " + ", ".join(literal))
+        if o["ignored"]:
+            notes.append("ignored options: " + " ".join(o["ignored"]))
+        summary = f"[grep] {total} matching line(s) in {len(hit_files)} file(s)" + (f"; {'; '.join(notes)}" if notes else "")
+        lines.append(summary if (total or notes or missing) else "[grep] no matches")
+        text = "\n".join(lines)
+        print(text)
+        self._last_output = text
+        self._vars["grep_files"] = ",".join(hit_files)
+        if self._confirm("Add results to context? [Y/n]", ctx_add=text) and not self._in_agent:
+            self.messages.append({"role": "user", "content": f"[grep {arg_str}]\n{text}"})
+            _ok("[grep] injected into context")
 
     def _cmd_find(self, user_input: str):
         tokens = user_input.split()
@@ -5734,7 +6689,7 @@ advanced_tools =
             ctx_text = "\n".join(ctx_lines)
             if not inject_ctx:
                 inject_ctx = self._confirm("Add results to context? [Y/n]", ctx_add=ctx_text)
-            if inject_ctx and not self._auto_apply:
+            if inject_ctx and not self._in_agent:
                 self.messages.append({"role": "user", "content": ctx_text})
                 _ok(f"[find] injected into context ({len(ctx_lines)} lines)")
 
@@ -5798,7 +6753,7 @@ advanced_tools =
         ctx_text = "\n".join(ctx_lines)
         if not inject_ctx:
             inject_ctx = self._confirm("Add results to context? [Y/n]", ctx_add=ctx_text)
-        if inject_ctx and not self._auto_apply:
+        if inject_ctx and not self._in_agent:
             self.messages.append({"role": "user", "content": ctx_text})
             _ok(f"[find] injected into context")
 
@@ -5829,7 +6784,13 @@ advanced_tools =
                 content, total = read_file(path, start, end, line_numbers=ln)
                 self._stats["files_read"] += 1
                 label = path + (f" lines {start}-{end}" if start else f" ({total} lines)")
-                if self._in_agent:
+                if self._capturing:
+                    # "/read f -> var": the variable gets the file text itself,
+                    # not the context-injection notice; nothing goes into context
+                    if len(tokens) > 1:
+                        print(f"[file: {label}]")
+                    print(content)
+                elif self._in_agent:
                     # inside agent (any agent, regardless of its own auto_apply
                     # config): print to stdout so Tee captures it for agent_msgs.
                     # Was gated on self._auto_apply, which is only True for
@@ -6950,7 +7911,7 @@ advanced_tools =
             print(_cdiff(dline))
         plain = "\n".join(diff)
         if inject or self._confirm("  add diff to context? [Y/n]:", ctx_add=plain):
-            if not self._auto_apply:
+            if not self._in_agent:
                 self.messages.append({"role": "user", "content": f"[diff: {file_a} vs {file_b}]\n{plain}"})
                 _ok(f"[diff] injected into context")
 
@@ -6958,25 +7919,38 @@ advanced_tools =
         print(f"$ {shell_cmd}")
         self._stats["run_calls"] += 1
         run_timeout = self.params.get("run_timeout", 30)
+        # nobody at the keyboard (agent, script -y): a command must not wait for input —
+        # `sed` or `python -` without a file would otherwise read stdin forever
+        unattended = self._in_agent or self._auto_apply or getattr(self, "_script_auto", False)
         try:
-            proc = subprocess.run(
-                shell_cmd, shell=True, capture_output=True,
-                timeout=run_timeout if run_timeout else None,
-                encoding="utf-8", errors="replace",
-            )
-            output = proc.stdout + proc.stderr
+            returncode, output, timed_out = _run_shell(
+                shell_cmd, run_timeout or None, stdin=subprocess.DEVNULL if unattended else None)
+            if timed_out:
+                output = (output + "\n" if output else "") + \
+                    f"[timeout after {run_timeout}s: the command and its child processes were killed]"
             print(output if output else "(no output)")
-            status = f"exit code {proc.returncode}"
+            status = f"exit code {returncode}" if not timed_out else f"timeout {run_timeout}s"
             self._last_output = output or "(no output)"
-            if not self._auto_apply:
+            if not self._in_agent:
                 self.messages.append(
                     {"role": "user", "content": f"[run: {shell_cmd}  ({status})]\n```\n{output or '(no output)'}```"}
                 )
             print(f"{status} — injected into context")
-        except subprocess.TimeoutExpired:
-            print("timeout after 30s")
         except OSError as e:
             _err(e)
+
+    def _script_path(self, ref: str):
+        """A script by its /script list number, its name (.txt optional) or a path; None if absent."""
+        global_plans, local_plans = _list_script_files()
+        all_plans = [p for _, p in global_plans] + [p for _, p in local_plans]
+        if ref.isdigit():
+            idx = int(ref) - 1
+            return all_plans[idx] if 0 <= idx < len(all_plans) else None
+        name = ref if ref.endswith(".txt") else ref + ".txt"
+        for cand in (ref, os.path.join(SCRIPTS_DIR, name), os.path.join(GLOBAL_SCRIPTS_DIR, name)):
+            if os.path.isfile(cand):
+                return cand
+        return None
 
     def _cmd_script(self, user_input: str):
         parts = user_input.split(None, 2)
@@ -6999,7 +7973,29 @@ advanced_tools =
                 for i, (src, label, path) in enumerate(all_plans, 1):
                     marker = " *" if path == current else ""
                     prefix = f"{_DIM}g:{_R} " if src == "g" else "   "
-                    print(f"  {i}. {prefix}{label}{marker}")
+                    head = _script_header(path)
+                    gist = f"  {_DIM}{head[0][:70]}{_R}" if head else ""
+                    print(f"  {i}. {prefix}{label}{marker}{gist}")
+
+        elif sub == "help":
+            # /script help [N|name] — the script's leading # lines
+            ref = rest.strip()
+            if not ref:
+                if not _need_script():
+                    return
+                path = self._script_file
+            else:
+                path = self._script_path(ref)
+                if not path:
+                    print(f"[script] no script '{ref}' — /script list")
+                    return
+            head = _script_header(path)
+            print(f"{_DIM}{path}{_R}")
+            if head:
+                print("\n".join(head))
+            else:
+                print("[script] no help — write # lines at the top of the script "
+                      "(first: '# name — what it does')")
 
         elif sub == "open":
             global_plans, local_plans = _list_script_files()
@@ -7201,6 +8197,12 @@ advanced_tools =
                 print("nothing to apply")
                 return
             label_map = _build_label_map(content)
+            _open_at = _unclosed_block(content)
+            if _open_at:
+                _err(f"[script] line {_open_at}: {_BLOCK_OPEN} is never closed by >>> — nothing run")
+                return
+            # a /command runs its file without touching it: no #POS written into it
+            persist = not getattr(self, "_in_command", False)
 
             pc = 0 if locals().get("_script_run_reset") else _load_pos(raw_lines)
             if pc >= len(content):
@@ -7219,7 +8221,15 @@ advanced_tools =
             # (not just a "pending" subset — [v]-filtering no longer exists).
             steps_for_keys = [(i, l.rstrip("\n")) for i, l in enumerate(content)
                                if l.strip() and not l.strip().startswith("#")]
+            # a step's own "-> key" capture fills the key at run time: nothing to ask
+            captured_keys = {m.group(1) for _, l in steps_for_keys
+                             if (m := re.search(r'\s+->\s*(\w+)\s*$', l))}
+            # … and so does its own /var set (a <<< block's text often goes into one)
+            captured_keys |= {m.group(1) for _, l in steps_for_keys
+                              if (m := re.match(r'\s*/var\s+set\s+(\w+)', l))}
             for key in _find_template_keys(steps_for_keys):
+                if key in captured_keys:
+                    continue
                 if not self._vars.get(key):   # missing or NaN sentinel
                     value = self._prompt_input(f"  {key} = ? ")
                     if value:
@@ -7229,8 +8239,10 @@ advanced_tools =
             print(f"script: {len(content)} line(s) {suffix}")
             original_confirm = self._confirm
             if auto_yes:
-                self._confirm = lambda prompt, **kw: True
+                self._confirm = lambda prompt, ctx_add="", **kw: (self._note_offered(ctx_add), True)[1]
                 self._auto_apply = True
+            was_script_auto = getattr(self, "_script_auto", False)
+            self._script_auto = auto_yes or was_script_auto
 
             MAX_STEPS = 1000   # loop-safety cap — a runaway GATE loop stops here
             executed  = 0
@@ -7272,10 +8284,13 @@ advanced_tools =
                             pc = label_map[target]
                         else:
                             pc += 1
-                        _save_pos(content, pc, self._script_file)
+                        if persist:
+                            _save_pos(content, pc, self._script_file)
                         continue
 
-                    cmd_str = _apply_params(raw, self._vars)
+                    # one line, " \" lines joined, or a <<< … >>> block (taken literally)
+                    text, next_pc, literal, block_var = _script_step(content, pc)
+                    cmd_str = _apply_params(text, self._vars)
                     self._sep(f"Step [{executed}] line {pc + 1}")
                     print(cmd_str)
                     if not auto_yes:
@@ -7285,20 +8300,122 @@ advanced_tools =
                             return
                         if ans.lower() not in ("", "y", "yes"):
                             print("[skipped]")
-                            pc += 1
-                            _save_pos(content, pc, self._script_file)
+                            pc = next_pc
+                            if persist:
+                                _save_pos(content, pc, self._script_file)
                             continue
-                    self._route(cmd_str, auto=True)
-                    pc += 1
-                    _save_pos(content, pc, self._script_file)
+                    if literal:
+                        self._route(cmd_str, auto=True, literal=True, capture=block_var)
+                    else:
+                        self._route(cmd_str, auto=True)
+                    pc = next_pc
+                    if persist:
+                        _save_pos(content, pc, self._script_file)
             finally:
                 self._confirm = original_confirm
                 self._auto_apply = False
+                self._script_auto = was_script_auto
             print("script complete")
-            _clear_pos(_load_script(self._script_file), self._script_file)
+            if persist:
+                _clear_pos(_load_script(self._script_file), self._script_file)
 
         else:
-            print("usage: /script list | open [N] | create | show [N] | run <file> | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
+            print("usage: /script list | help [N] | open [N] | create | show [N] | run <file> | add <cmd> | clear | reset | reapply | refresh | apply [-y]")
+
+    # ── /command: a named script with its own help, run in a sandbox of settings ──
+    # A command is a script in .1bcoder/command/<name>.txt (or ~/.1bcoder/command/):
+    # its leading # lines are the help, the rest runs like /script run.  Whatever
+    # it switches on — /param, /proc on|before|gate, /role, /think, /model, /var —
+    # is put back when it ends, also when it fails.  Its replies stay in the context:
+    # that is what it is for.  A command may run scripts; a command inside a command
+    # is refused (the saved settings of the outer one would be overwritten).
+
+    _COMMAND_STATE = ("params", "timeout", "think_in_ctx", "think_show", "log_requests",
+                      "_proc_active", "_proc_before", "_proc_gates", "_proc_gates_post",
+                      "_role", "_hooks", "_vars", "_agent_ctx", "_ctx_window",
+                      "model", "base_url", "provider", "num_ctx",
+                      "_meta_size", "_meta_quant", "_meta_ctx", "_script_file")
+
+    def _command_path(self, ref: str):
+        cmds = _list_command_files()
+        if ref.isdigit():
+            idx = int(ref) - 1
+            return cmds[idx] if 0 <= idx < len(cmds) else (None, None)
+        name = ref[:-4] if ref.endswith(".txt") else ref
+        return next(((n, p) for n, p in cmds if n == name), (None, None))
+
+    def _cmd_command(self, user_input: str):
+        import copy as _copy
+        parts = user_input.split(None, 2)
+        sub = parts[1] if len(parts) > 1 else ""
+
+        if sub in ("", "list"):
+            cmds = _list_command_files()
+            if not cmds:
+                print(f"[command] no commands yet — put a script in {COMMANDS_DIR} "
+                      f"or {GLOBAL_COMMANDS_DIR} (/help command)")
+                return
+            for i, (name, path) in enumerate(cmds, 1):
+                head = _script_header(path)
+                gist = f"  {_DIM}{head[0][:70]}{_R}" if head else ""
+                print(f"  {i:2}. {name}{gist}")
+            return
+
+        if sub == "help":
+            ref = parts[2].strip() if len(parts) > 2 else ""
+            if not ref:
+                print("usage: /command help <name|N>")
+                return
+            name, path = self._command_path(ref)
+            if not path:
+                print(f"[command] no command '{ref}' — /command list")
+                return
+            head = _script_header(path)
+            print(f"{_DIM}{path}{_R}")
+            print("\n".join(head) if head else
+                  "[command] no help — write # lines at the top (first: '# name — what it does')")
+            return
+
+        name, path = self._command_path(sub)
+        if not path:
+            print(f"[command] no command '{sub}' — /command list")
+            return
+        if getattr(self, "_in_command", False):
+            _err(f"[command] /command {name}: a command cannot run another command "
+                 f"(it would overwrite the settings saved by '{self._in_command}')")
+            return
+        args = parts[2] if len(parts) > 2 else ""
+        # {{args}} / {{1}} {{2}} … it uses but was not given: show its help, run nothing
+        # (asking "1 = ?" says nothing about what the 1 is)
+        body = "".join(l for l in _content_lines(_load_script(path)) if not l.startswith("#"))
+        wants = [int(n) for n in re.findall(r'\{\{(\d+)\}\}', body)]
+        needed = max(wants + ([1] if "{{args}}" in body else []), default=0)
+        if len(args.split()) < needed:
+            print(f"[command] {name} needs {needed} argument(s), got {len(args.split())}")
+            head = _script_header(path)
+            if head:
+                print("\n".join(head))
+            return
+
+        saved = {}
+        for attr in self._COMMAND_STATE:
+            if hasattr(self, attr):
+                try:
+                    saved[attr] = _copy.deepcopy(getattr(self, attr))
+                except Exception:
+                    saved[attr] = getattr(self, attr)
+        self._in_command = name
+        # {{args}} = everything after the name, {{1}} {{2}} … its words
+        self._vars["args"] = args
+        for i, word in enumerate(args.split(), 1):
+            self._vars[str(i)] = word
+        try:
+            self._cmd_script(f"/script run \"{path.replace(os.sep, '/')}\"")
+        finally:
+            for attr, value in saved.items():
+                setattr(self, attr, value)
+            self._in_command = False
+            print(f"[command] {name} done — settings restored")
 
     def _save_prompt(self, name: str, text: str):
         """Save text as a named prompt entry to prompts.txt. Newlines stored as \\n."""
@@ -7457,6 +8574,8 @@ advanced_tools =
         auto=False — manual /proc run: confirm ACTION, ask to inject result.
         Returns captured stdout or "" on failure.
         """
+        if name.startswith("jev:"):
+            return self._jev_bound(name, input_text)
         try:
             parts = shlex.split(name)
         except ValueError:
@@ -7596,7 +8715,7 @@ advanced_tools =
                     self._sep("tool")
                     self._route(action_line)
             elif self._confirm("  inject proc result into context? [Y/n]:"):
-                if not self._auto_apply:
+                if not self._in_agent:
                     self.messages.append({"role": "user", "content": f"[proc:{name}]\n{stdout}"})
                 print("[proc] injected")
 
@@ -8083,7 +9202,7 @@ advanced_tools =
                 _ok("[visual] description injected into context")
             else:
                 ans = self._confirm("Inject description into context? [Y/n]", ctx_add=inject_text)
-                if not ans:
+                if ans:
                     self.messages.append({"role": "user", "content": inject_text})
             return
 
@@ -8169,7 +9288,7 @@ advanced_tools =
         dirs, ext = [], ""
         if cmd_root == "/flow":
             dirs = [os.path.join(d, "flows")
-                    for d in (BCODER_DIR, HOME_BCODER_DIR, INSTALL_BCODER_DIR)]
+                    for d in (BCODER_DIR, HOME_BCODER_DIR)]
             ext = ".py"
         elif cmd_root == "/proc":
             dirs = [LOCAL_PROC_DIR, PROC_DIR]
@@ -8177,6 +9296,8 @@ advanced_tools =
         elif cmd_root in ("/script", "/hook"):
             dirs = [SCRIPTS_DIR, GLOBAL_SCRIPTS_DIR]
             ext = ".txt"
+        elif cmd_root == "/command":   # its own words first: an exact name is never "fixed"
+            return ["list", "help"] + [n for n, _ in _list_command_files()]
         seen: set = set()
         names: list = []
         for d in dirs:
@@ -8193,7 +9314,7 @@ advanced_tools =
 
     def _cmd_flow(self, user_input: str):
         """
-/flow <name> [args]   Run a flow from _bcoder_data/flows/<name>.py.
+/flow <name> [args]   Run a flow from .1bcoder/flows/ or ~/.1bcoder/flows/<name>.py.
 /flow list            List available flows.
         """
         import importlib.util as _ilu
@@ -8202,8 +9323,7 @@ advanced_tools =
 
         def _find_flow(name):
             for d in (os.path.join(BCODER_DIR, "flows"),
-                      os.path.join(HOME_BCODER_DIR, "flows"),
-                      os.path.join(INSTALL_BCODER_DIR, "flows")):
+                      os.path.join(HOME_BCODER_DIR, "flows")):
                 p = os.path.join(d, name + ".py")
                 if os.path.isfile(p):
                     return p
@@ -8213,7 +9333,6 @@ advanced_tools =
             dirs = [
                 os.path.join(BCODER_DIR, "flows"),
                 os.path.join(HOME_BCODER_DIR, "flows"),
-                os.path.join(INSTALL_BCODER_DIR, "flows"),
             ]
             shown = set()
             for d in dirs:
@@ -8681,9 +9800,695 @@ Config stored in ~/.1bcoder/translate.json
         else:
             print("usage: /proc list | help <name> | run <name> | on <name> | off | new <name>")
 
+    # ── /jev ────────────────────────────────────────────────────────────────────
+    # Decision models (Ollama /v1/systemone): LLM generates -> jev perceives ->
+    # Python decides. Adapter lives in jev.py; see concepts/JEV.md (simrgl repo).
+
+    _JEV_QUESTION_RE = re.compile(r'^/jev\s+["“«](.+?)["”»]\s*(?:options:\s*(.+))?$', re.S)
+
+    def _jev_settings(self) -> dict:
+        """jev settings with host resolved (jev host, else the main host)."""
+        jev = _jev()
+        s = jev.load_settings()
+        if not (s.get("host") or "").strip() and self.provider == "openai":
+            raise jev.JevConfigError(
+                "main host is OpenAI-compatible — /v1/systemone needs an Ollama host: "
+                "/jev param host localhost:11434")
+        s["host"] = jev.resolve_host(s, self.base_url)
+        return s
+
+    def _jev_state(self) -> str:
+        return self._last_output or self.last_reply or ""
+
+    @staticmethod
+    def _jev_out(line: str = "", color: str = ""):
+        """print() that survives cp1251/cp1252 consoles (Cyrillic rubric text)."""
+        s = f"{color}{line}{_R}" if color else line
+        try:
+            print(s)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(s.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+    def _jev_print(self, result: dict):
+        jev = _jev()
+        for i, line in enumerate(jev.format_table(result)):
+            if i == 0:
+                self._jev_out(line, _GREEN if result.get("passed") else _RED)
+            elif line.lstrip().startswith("FAIL"):
+                self._jev_out(line, _RED)
+            elif line.lstrip().startswith("jev unavailable"):
+                self._jev_out(line, _YELL)
+            else:
+                self._jev_out(line)
+
+    def _jev_load_rubric(self, key: str, interactive: bool = True) -> dict:
+        """Load a rubric, filling {{name}} placeholders from /var.
+
+        Like /script: a set var is used silently; a missing one is asked for
+        (interactive) and saved into session vars. Non-interactive callers
+        (watch/gate bindings) get a JevConfigError naming what is missing."""
+        jev = _jev()
+        scope, name, path, raw = jev.read_rubric(key, WORKDIR)
+        if interactive:
+            for k in jev.rubric_params(raw):
+                if not self._vars.get(k):   # missing or NaN sentinel
+                    value = self._prompt_input(f"  {k} = ? ")
+                    if value:
+                        self._vars[k] = value
+        return jev.normalize_rubric(raw, name, path, scope, params=self._vars)
+
+    def _jev_resolve_rubric_name(self, key: str) -> str:
+        """Rubric number or name -> canonical rubric name (file stem)."""
+        return _jev().resolve_rubric(key, WORKDIR)[1]
+
+    def _jev_bound(self, entry: str, input_text: str | None = None) -> str:
+        """Run a jev:<rubric>[ --gate] binding from the /proc lists.
+
+        watch -> prints a one-line verdict, returns "" (never FAIL: lines — the
+        agent loop treats FAIL: from watch procs as failures too).
+        gate  -> returns FAIL: lines (empty = PASS); regex failure skips the model."""
+        jev = _jev()
+        parts = entry.split()
+        rname = parts[0][len("jev:"):]
+        gate = "--gate" in parts[1:]
+        tag = f"[jev:{rname}{' gate' if gate else ''}]"
+        state = input_text or self.last_reply
+        if not state:
+            return ""
+        try:
+            settings = self._jev_settings()
+            # values are read from /var on every run, so a changed {{task}} is followed
+            rubric = self._jev_load_rubric(rname, interactive=False)
+            result = jev.run_rubric(state, rubric, settings, short_circuit=gate)
+        except jev.JevConfigError as e:
+            self._jev_out(f"{tag} config error: {e}", _RED)
+            return f"FAIL: {rname} — jev config error: {e}" if gate else ""
+        except Exception as e:
+            self._jev_out(f"{tag} error: {type(e).__name__}: {e}", _RED)
+            if gate:
+                try:
+                    on_error = jev.load_settings().get("on_error", "fail")
+                except Exception:
+                    on_error = "fail"
+                if on_error == "fail":
+                    return f"FAIL: {rname} — jev error: {e}"
+            return ""
+        failed = [c["id"] for c in result["criteria"] if c.get("passed") is False]
+        if result.get("error"):
+            self._jev_out(f"{tag} jev unavailable: {result['error']} "
+                          f"(on_error={result.get('on_error')})", _YELL)
+        if result.get("passed"):
+            self._jev_out(f"{_DIM}{tag} PASS ({len(result['criteria'])} criteria){_R}")
+        else:
+            self._jev_out(f"{tag} not passed: {', '.join(failed) or 'jev unavailable'}", _YELL)
+        if gate:
+            return "\n".join(jev.fail_lines(result))
+        return ""
+
+    def _cmd_jev(self, user_input: str):
+        jev = _jev()
+        text = user_input.strip()
+        parts = text.split()
+        sub = parts[1] if len(parts) > 1 else ""
+        try:
+            # ── quick question ────────────────────────────────────────────────
+            m = self._JEV_QUESTION_RE.match(text)
+            if m:
+                question = m.group(1).strip()
+                options = [o.strip() for o in (m.group(2) or "").split(",") if o.strip()]
+                state = self._jev_state()
+                if not state:
+                    self._jev_out("[jev] error: nothing to judge — no last output or reply yet", _RED)
+                    return
+                res = jev.ask(state, question, options, self._jev_settings())
+                if res["kind"] == "noul":
+                    verdict = "yes" if res["passed"] else "no"
+                    self._jev_out(f"[jev] {question}", _CYAN)
+                    self._jev_out(f"  {verdict}  p(true)={res['value']:.3f}  "
+                                  f"(threshold {jev.load_settings().get('threshold')})",
+                                  _GREEN if res["passed"] else _YELL)
+                else:
+                    self._jev_out(f"[jev] {question}", _CYAN)
+                    conf = res.get("confidence")
+                    self._jev_out(f"  -> {res['value']}" + (f"  (confidence {conf:.2f})" if conf is not None else ""),
+                                  _GREEN)
+                    probs = res.get("probabilities") or {}
+                    for k, p in sorted(probs.items(), key=lambda kv: -(kv[1] or 0)):
+                        self._jev_out(f"     {k:<20} {p:.3f}")
+                return
+            if text.startswith('/jev "') or text.startswith("/jev “"):
+                print('usage: /jev "<question>" [options: a, b, c]')
+                return
+
+            if sub in ("", "help"):
+                self._cmd_help("/help jev")
+
+            elif sub == "list":
+                rubrics = jev.list_rubrics(WORKDIR)
+                if not rubrics:
+                    print("[jev] no rubrics — add .yaml files to .1bcoder/rubrics/ or ~/.1bcoder/rubrics/")
+                    return
+                bound = {p.split()[0][4:] for lst in (self._proc_active, self._proc_gates)
+                         for p in lst if p.startswith("jev:")}
+                for i, (scope, name, path) in enumerate(rubrics, 1):
+                    try:
+                        r = jev.normalize_rubric(jev._read_rubric_file(path), name, path, scope)
+                        desc = f"{r['description']}  [{len(r['criteria'])} criteria]"
+                        if r["params"]:
+                            desc += "  {{" + "}} {{".join(r["params"]) + "}}"
+                    except jev.JevConfigError as e:
+                        desc = f"(invalid: {e})"
+                    mark = " *" if name in bound else ""
+                    self._jev_out(f"  {i:>2}. {scope}: {name:<20} {desc}{mark}")
+
+            elif sub == "show":
+                if len(parts) < 3:
+                    print("usage: /jev show <rubric|N>"); return
+                scope, name, path, raw = jev.read_rubric(parts[2], WORKDIR)
+                r = jev.normalize_rubric(raw, name, path, scope)   # placeholders as written
+                settings = jev.load_settings()
+                self._jev_out(f"[jev] {r['name']}  ({r['path']})", _CYAN)
+                if r["title"] != r["name"]:
+                    self._jev_out(f"  name: {r['title']}")
+                if r["description"]:
+                    self._jev_out(f"  {r['description']}")
+                if r["params"]:
+                    vals = "  ".join(f"{k}={self._vars[k]!r}" if self._vars.get(k) else f"{k}=?"
+                                     for k in r["params"])
+                    self._jev_out(f"  params: {vals}")
+                thr_r = r["threshold"]
+                self._jev_out(f"  threshold: {thr_r if thr_r is not None else str(settings.get('threshold')) + ' (/jev param)'}"
+                              + (f"   split: {r['split']!r} (not applied yet)" if r.get("split") else ""))
+                for c in r["criteria"]:
+                    thr = c["threshold"] if c["threshold"] is not None else (
+                        thr_r if thr_r is not None else settings.get("threshold"))
+                    if c["kind"] == "regex":
+                        head = f"regex  fail_if:{c['fail_if']}" + (f" flags:{c['flags']}" if c["flags"] else "")
+                        self._jev_out(f"  - {c['id']:<20} {head}")
+                        self._jev_out(f"      pattern: {c['pattern']}")
+                    else:
+                        extra = ""
+                        if c["kind"] == "noul" and not c.get("pass_when", True):
+                            extra = "  pass_when:false"
+                        if c["kind"] == "choice" and c.get("pass"):
+                            extra = f"  pass:{c['pass']}"
+                        self._jev_out(f"  - {c['id']:<20} {c['kind']}  threshold:{thr}{extra}")
+                        self._jev_out(f"      {c['instructions']}")
+                        if c["kind"] == "score":
+                            for j, lv in enumerate(c["levels"]):
+                                self._jev_out(f"        {j}. {lv}")
+                        elif c["kind"] == "choice":
+                            for k, v in c["levels"].items():
+                                self._jev_out(f"        {k}: {v or ''}")
+                        elif c.get("criteria"):
+                            for k, v in c["criteria"].items():
+                                self._jev_out(f"        {k}: {v}")
+                    if c.get("message"):
+                        self._jev_out(f"      message: {c['message']}", _DIM)
+
+            elif sub == "model":
+                self._cmd_jev_model(parts[2:])
+
+            elif sub == "param":
+                path = jev.SETTINGS_FILE
+                if len(parts) == 3 and parts[2] == "clear":
+                    jev.save_settings(dict(jev.DEFAULTS))
+                    self._jev_out("[jev] params reset to defaults — set a model again: /jev model set <name|N>", _GREEN)
+                    return
+                if len(parts) < 3:
+                    s = jev.load_settings()
+                    self._jev_out(f"[jev] params  ({path}{'' if os.path.isfile(path) else ', not saved yet'})", _CYAN)
+                    for k in jev.DEFAULTS:
+                        v = s.get(k)
+                        note = ""
+                        if k == "host" and not v:
+                            note = f"  (main host: {self.base_url})"
+                        if k == "model" and not v:
+                            note = "  (not set — /jev model list, /jev model set <name|N>)"
+                        self._jev_out(f"  {k:<11} {v!r}{note}")
+                    return
+                key = parts[2]
+                raw = text.split(None, 3)[3] if len(parts) > 3 else ""
+                value = jev.coerce_setting(key, raw)
+                s = jev.load_settings()
+                s[key] = value
+                jev.save_settings(s)
+                self._jev_out(f"[jev] {key} = {value!r}", _GREEN)
+
+            elif sub in ("on", "gate"):
+                gate = sub == "gate"
+                rest = parts[2:]
+                if gate:
+                    if not rest or rest[0] != "on" or len(rest) < 2:
+                        print("usage: /jev gate on <rubric|N>"); return
+                    rest = rest[1:]
+                if not rest:
+                    print(f"usage: /jev {'gate on' if gate else 'on'} <rubric|N>"); return
+                # asks for missing {{params}} now; the binding re-reads /var on each run
+                r = self._jev_load_rubric(rest[0])
+                if any(c["kind"] != "regex" for c in r["criteria"]):
+                    s = self._jev_settings()
+                    if not (s.get("model") or "").strip():
+                        raise jev.JevConfigError(
+                            "no decision model set — run /jev model list, then /jev model set <name|N>")
+                entry = f"jev:{r['name']}" + (" --gate" if gate else "")
+                target = self._proc_gates if gate else self._proc_active
+                if entry not in target:
+                    target.append(entry)
+                label = "gate (FAIL: lines before ACTIONs)" if gate else "watch (after every reply)"
+                self._jev_out(f"[jev] {r['name']} bound — {label}", _GREEN)
+
+            elif sub == "off":
+                all_lists = [self._proc_active, self._proc_before, self._proc_gates, self._proc_gates_post]
+                target = None
+                if len(parts) > 2:
+                    try:
+                        target = self._jev_resolve_rubric_name(parts[2])
+                    except jev.JevConfigError:
+                        target = parts[2]
+                removed = []
+                for lst in all_lists:
+                    for p in [p for p in lst if p.startswith("jev:")
+                              and (target is None or p.split()[0] == f"jev:{target}")]:
+                        lst.remove(p)
+                        removed.append(p)
+                if removed:
+                    self._jev_out(f"[jev] unbound: {', '.join(removed)}", _GREEN)
+                else:
+                    print(f"[jev] no jev bindings{' for ' + target if target else ''}")
+
+            else:
+                # /jev <rubric|N> [extra tokens]
+                rkey = parts[1]
+                # key=value args set {{key}} like /script run k=v (and persist into /var)
+                extra = []
+                rest = text.split(None, 2)[2] if len(parts) > 2 else ""
+                try:
+                    toks = shlex.split(rest)
+                except ValueError:
+                    toks = rest.split()
+                for tok in toks:
+                    k, eq, v = tok.partition("=")
+                    if eq and re.fullmatch(r"\w+", k):
+                        self._vars[k] = v
+                    else:
+                        extra.append(tok)
+                if extra:
+                    self._jev_out(f"[jev] ignoring extra arguments (split:/threshold: not implemented yet): {' '.join(extra)}", _YELL)
+                r = self._jev_load_rubric(rkey)
+                state = self._jev_state()
+                if not state:
+                    self._jev_out("[jev] error: nothing to judge — no last output or reply yet", _RED)
+                    return
+                settings = self._jev_settings() if any(c["kind"] != "regex" for c in r["criteria"]) \
+                    else jev.load_settings()
+                result = jev.run_rubric(state, r, settings)
+                self._jev_print(result)
+        except _jev().JevConfigError as e:
+            self._jev_out(f"[jev] {e}", _RED)
+        except _jev().JevError as e:
+            self._jev_out(f"[jev] decision model unavailable: {e}", _RED)
+
+    def _cmd_jev_model(self, args: list):
+        jev = _jev()
+        sub = args[0] if args else ""
+        settings = self._jev_settings()
+        host = settings["host"]
+        if sub == "":
+            name = (settings.get("model") or "").strip()
+            if not name:
+                self._jev_out("[jev] no decision model set — /jev model list, then /jev model set <name|N>", _YELL)
+                return
+            self._jev_out(f"[jev] model: {name}  (host {host})", _CYAN)
+            info = jev.show_model(host, name)
+            det = info.get("details") or {}
+            caps = info.get("capabilities")
+            ctx = next((v for k, v in (info.get("model_info") or {}).items()
+                        if k.endswith(".context_length")), None)
+            for label, val in (("family", det.get("family")), ("parameters", det.get("parameter_size")),
+                               ("quantization", det.get("quantization_level")), ("context", ctx),
+                               ("capabilities", ", ".join(caps) if isinstance(caps, list) else None)):
+                if val:
+                    self._jev_out(f"  {label:<13} {val}")
+            if isinstance(caps, list) and "decision" not in caps:
+                self._jev_out("  warning: this model does not report the 'decision' capability", _YELL)
+        elif sub == "list":
+            models = jev.decision_models(jev.list_models(host))
+            current = (settings.get("model") or "").strip()
+            if not models:
+                print(f"[jev] no decision models on {host} — e.g. ollama pull tev1:0.8b")
+                return
+            self._jev_out(f"[jev] decision models on {host}", _CYAN)
+            for i, mdl in enumerate(models, 1):
+                det = mdl.get("details") or {}
+                info = " ".join(x for x in (det.get("parameter_size"), det.get("quantization_level")) if x)
+                unv = "  (unverified)" if mdl["decision"] is None else ""
+                mark = " *" if mdl["name"] == current else ""
+                self._jev_out(f"  {i:>2}. {mdl['name']:<28} {info}{unv}{mark}")
+        elif sub == "set":
+            if len(args) < 2:
+                print("usage: /jev model set <name|N>"); return
+            key = args[1]
+            try:
+                models = jev.list_models(host)
+            except jev.JevError as e:
+                if key.isdigit():
+                    raise
+                self._jev_out(f"[jev] cannot verify model ({e}) — saving anyway", _YELL)
+                models = None
+            if models is not None:
+                dec = jev.decision_models(models)
+                if key.isdigit():
+                    i = int(key)
+                    if not 1 <= i <= len(dec):
+                        raise jev.JevConfigError(f"no decision model #{i} — /jev model list shows {len(dec)}")
+                    key = dec[i - 1]["name"]
+                else:
+                    found = next((m for m in models if m["name"] == key), None) \
+                        or next((m for m in models if m["name"] == key + ":latest"), None)
+                    if not found:
+                        raise jev.JevConfigError(f"model '{key}' not found on {host} — /jev model list")
+                    if found["decision"] is False:
+                        raise jev.JevConfigError(f"'{found['name']}' is not a decision model "
+                                                 f"(no 'decision' capability) — /jev model list")
+                    key = found["name"]
+            s = jev.load_settings()
+            s["model"] = key
+            jev.save_settings(s)
+            self._jev_out(f"[jev] model = {key}  (saved to {jev.SETTINGS_FILE})", _GREEN)
+        else:
+            print("usage: /jev model | /jev model list | /jev model set <name|N>")
+
+    # ── /loop ───────────────────────────────────────────────────────────────────
+    # Stream from anything (dir / file / last output / a command), act on every
+    # element with a fresh context: radogast -> jev -> llm. Pure helpers live in
+    # loop_stream.py; see concepts/LOOP.md (simrgl repo).
+
+    # cmd: sources must be read-only and non-interactive
+    _LOOP_BLOCKED_ROOTS = frozenset({
+        "/loop", "/exit", "/clear", "/model", "/host", "/profile", "/switch",
+        "/fix", "/write", "/script", "/prompt", "/text", "/team", "/parallel",
+        "/agent", "/ask", "/ctx", "/config", "/alias", "/hook", "/bkup", "/mkdir",
+    })
+    _LOOP_BLOCKED_PREFIXES = ("/edit", "/insert", "/patch", "/fim", "/save")
+    _LOOP_JEV_MAX_TOKENS = 1500
+
+    def _loop_capture_cmd(self, cmd: str) -> str:
+        """Run a slash command and return its output as text, without touching
+        the conversation: the text offered to _confirm (ctx_add) wins, then a
+        changed $ (e.g. /run, /rag), then the printed output (ANSI-stripped)."""
+        ls = _loop_stream()
+        cmd = (cmd or "").strip()
+        if not cmd.startswith("/"):
+            raise ls.LoopError('cmd: needs a slash command, e.g. cmd:"/find mcp -c"')
+        roots = {cmd.split()[0]}
+        try:
+            roots.add(self._expand_alias(cmd).split()[0])
+        except Exception:
+            pass
+        for r in list(roots):
+            fixed = _fuzzy_fix(r, _KNOWN_CMDS + list(self._aliases.keys()), cutoff=0.65)
+            if fixed:
+                roots.add(fixed)
+        for r in roots:
+            if r in self._LOOP_BLOCKED_ROOTS or r.startswith(self._LOOP_BLOCKED_PREFIXES):
+                raise ls.LoopError(f"cmd: {r} is not allowed as a /loop source "
+                                   f"(it edits files, changes the session or runs an agent)")
+            if r not in _KNOWN_CMDS and r not in self._aliases and self._find_agent_def(r[1:]):
+                raise ls.LoopError(f"cmd: {r} is a named agent — not allowed as a /loop source")
+
+        offers: list = []
+        n0 = len(self.messages)
+        last0 = self._last_output
+        saved = (self._confirm, self._auto_apply, sys.stdin)
+        self._confirm = lambda prompt, ctx_add="", **kw: (offers.append(ctx_add) if ctx_add else None, False)[1]
+        self._auto_apply = True
+        sys.stdin = _LoopNoInput()
+        tee = _Tee()
+        try:
+            with tee:
+                self._route(cmd, auto=True)
+        except EOFError:
+            raise ls.LoopError(f"cmd: {cmd} needs interactive input — not usable as a /loop source")
+        except SystemExit:
+            pass
+        finally:
+            self._confirm, self._auto_apply, sys.stdin = saved
+            del self.messages[n0:]      # undo /rag, /visual, /ls, /run ... appends
+        if offers:
+            return "\n\n".join(offers)
+        if self._last_output and self._last_output != last0:
+            return self._last_output
+        return _ANSI_ANY_RE.sub("", _strip_ui_separators(tee.getvalue())).strip()
+
+    def _loop_llm(self, el, prompt: str, ctx_n: int):
+        """One fresh-context model call for one element; never touches self.messages.
+        Returns the reply, "" on a request error, None on Ctrl+C."""
+        msgs = []
+        if self._role:
+            msgs.append({"role": "system", "content": self._role})
+        if ctx_n:
+            hist = [m for m in self.messages if m.get("role") in ("user", "assistant")][-ctx_n:]
+            msgs += [{"role": m["role"], "content": m.get("content") or ""} for m in hist]
+        msgs.append({"role": "user", "content":
+                     f"{prompt}\n[element {el.index} of {el.total} — {el.crumb}]\n---\n{el.text}"})
+        return self._stream_chat(msgs)
+
+    def _loop_jev(self, el, spec: str, is_question: bool, rubric, settings) -> dict:
+        """jev verdict for one element: a rubric (run_rubric) or a quoted yes/no question (ask)."""
+        jev = _jev()
+        if is_question:
+            r = jev.ask(el.text, spec, None, settings)
+            return {"question": r["question"], "kind": "noul", "value": r["value"],
+                    "confidence": r.get("confidence"), "passed": r["passed"]}
+        return jev.run_rubric(el.text, rubric, settings)
+
+    @staticmethod
+    def _loop_verdict(rec: dict) -> str:
+        if rec.get("error"):
+            return f"ERROR {rec['error']}"
+        bits = []
+        j = rec.get("jev")
+        if isinstance(j, dict):
+            v = "PASS" if j.get("passed") else "FAIL"
+            if "criteria" in j:
+                crits = j["criteria"]
+                failed = [c["id"] for c in crits if c.get("passed") is False]
+                bits.append(f"{v} {len(crits) - len(failed)}/{len(crits)}"
+                            + (f" ({', '.join(failed)})" if failed else ""))
+            else:
+                bits.append(f"{v} {j.get('value', 0):.2f}")
+        rg = rec.get("rg")
+        if rg:
+            s = f"sim {rg['sim']:.2f}"
+            if rg.get("oos"):
+                s += " out-of-scope: " + ",".join(sorted(rg["oos"]))
+            bits.append(s)
+        return "  ".join(bits) or "ok"
+
+    def _cmd_loop(self, user_input: str):
+        ls = _loop_stream()
+        arg_s = user_input.strip()[len("/loop"):].strip()
+        if arg_s in ("", "help", "-h", "--help"):
+            self._cmd_help("/help loop")
+            return
+        try:
+            self._loop_run(arg_s)
+        except ls.LoopError as e:
+            self._jev_out(f"[loop] {e}", _RED)
+        except _jev().JevConfigError as e:
+            self._jev_out(f"[loop] jev: {e}", _RED)
+
+    def _loop_run(self, arg_s: str):
+        ls = _loop_stream()
+        a = ls.parse_loop_args(arg_s)
+        for k in ("path", "out", "radogast"):
+            if a.get(k):
+                a[k] = os.path.expanduser(a[k])
+        sig = ls.action_sig(a)
+
+        # ── source ────────────────────────────────────────────────────────────
+        src = a["source"]
+        if src == "dir":
+            sources = ls.collect_dir(a["path"], a["glob"], a["recursive"], WORKDIR)
+            if not sources:
+                raise ls.LoopError(f"no text files in {a['path']}"
+                                   + (f" matching {a['glob']}" if a["glob"] else ""))
+        elif src == "file":
+            p = a["path"]
+            if not os.path.isfile(p):
+                raise ls.LoopError(f"file not found: {p}")
+            text = ls.read_text(p)
+            if text is None:
+                raise ls.LoopError(f"binary file: {p}")
+            sources = [(ls.make_id_base(p, WORKDIR), text)]
+        elif src == "last":
+            text = self._last_output or self.last_reply or ""
+            if not text.strip():
+                raise ls.LoopError("nothing in $ yet — run a command or ask the model first")
+            sources = [(f"last@{ls.sha8(text)}", text)]
+        else:
+            text = self._loop_capture_cmd(a["cmd"])
+            if not text.strip():
+                raise ls.LoopError(f"cmd: {a['cmd']} produced no output")
+            sources = [(f"cmd@{ls.sha8(text)}", text)]
+
+        max_tokens = a["max_tokens"] or max(256, self.num_ctx // 2)
+        if a["jev"] and not a["max_tokens"]:
+            # System One rejects any prompt over 2050 tokens (state + one question,
+            # never truncated; verified for tev1:0.8b and tev1:4b on Ollama 0.35).
+            # The estimate is rough, so keep a margin for the question text.
+            max_tokens = min(max_tokens, self._LOOP_JEV_MAX_TOKENS)
+        elements = ls.build_elements(sources, a["cutter"], max_tokens)
+        if not elements:
+            raise ls.LoopError("the source produced no elements")
+        self._jev_out(f"[loop] {len(elements)} element(s) from {len(sources)} source(s)", _CYAN)
+        if not (a["llm"] or a["jev"] or a["radogast"]):
+            self._jev_out("[loop] no action (--llm / --jev / --radogast) — elements are only listed", _YELL)
+
+        # ── jev setup (config errors abort before the first element) ──────────
+        jev = _jev()
+        rubric = settings = None
+        if a["jev"]:
+            if a["jev_is_question"]:
+                needs_model = True
+            else:
+                # {{params}} are asked once, before the first element
+                rubric = self._jev_load_rubric(a["jev"])
+                needs_model = any(c["kind"] != "regex" for c in rubric["criteria"])
+            settings = self._jev_settings() if needs_model else jev.load_settings()
+            if needs_model and not (settings.get("model") or "").strip():
+                raise jev.JevConfigError("no decision model set — run /jev model list, then /jev model set <name|N>")
+
+        # ── resume ────────────────────────────────────────────────────────────
+        jl = None
+        todo = elements
+        if a["out"]:
+            jl = ls.jsonl_path(a["out"])
+            if a["fresh"] and os.path.isfile(jl):
+                os.remove(jl)
+            sigs = ls.log_sigs(jl)
+            if sigs and sigs != {sig}:
+                raise ls.LoopError(f"{jl} was written by a different action (prompt, rubric, cutter, "
+                                   f"keep, ctx or radogast target changed) — add --fresh to start over, "
+                                   f"or use another --out")
+            done = ls.read_done_ids(jl)
+            todo = [e for e in elements if e.id not in done]
+            if len(todo) < len(elements):
+                self._jev_out(f"[loop] resuming: {len(elements) - len(todo)} already in {jl}, "
+                              f"{len(todo)} to go", _CYAN)
+
+        # ── radogast: embed goal + every element once ─────────────────────────
+        rg_by_id, rg_state = {}, None
+        if a["radogast"]:
+            target, cfg = ls.rg_load(a["radogast"])
+            texts = [e.text for e in elements]
+            self._jev_out(f"[loop] radogast: embedding {len(texts)} element(s) "
+                          f"({cfg.get('embedding_model')})", _DIM)
+            try:
+                goal_vec, vecs = ls.rg_embed(texts, target, cfg)
+            except ls.LoopError:
+                raise
+            except Exception as e:
+                raise ls.LoopError(f"radogast embedding failed: {type(e).__name__}: {e}")
+            for e, s in zip(elements, ls.rg_element_scores(texts, vecs, goal_vec, target)):
+                rg_by_id[e.id] = s
+            rg_state = (texts, vecs, goal_vec, target)
+
+        # ── the loop ──────────────────────────────────────────────────────────
+        run_recs = []
+        for el in todo:
+            rec = {"id": el.id, "source": el.source, "index": el.index, "total": el.total,
+                   "sha": el.sha, "sig": sig}
+            try:
+                passed = None                       # None = no filter applied
+                if el.id in rg_by_id:
+                    rec["rg"] = rg_by_id[el.id]
+                    if a["rg_min"] is not None:
+                        passed = rec["rg"]["sim"] >= a["rg_min"]
+                if a["jev"] and passed is not False:
+                    try:
+                        j = self._loop_jev(el, a["jev"], a["jev_is_question"], rubric, settings)
+                    except jev.JevConfigError:
+                        raise
+                    except jev.JevError as e:
+                        rec["error"] = f"jev: {e}"
+                    else:
+                        rec["jev"] = j
+                        if j.get("error"):
+                            rec["error"] = f"jev unavailable: {j['error']}"
+                        passed = bool(j.get("passed"))
+                if rec.get("error"):
+                    kept = False
+                elif passed is None or a["keep"] == "all":
+                    kept = True
+                else:
+                    kept = passed if a["keep"] == "pass" else not passed
+                rec["kept"] = kept
+                note = "" if kept else "  (skipped)"
+                self._jev_out(f"[{el.index}/{el.total}] {el.id} — {self._loop_verdict(rec)}{note}",
+                              _RED if rec.get("error") else (_GREEN if kept else _DIM))
+                if a["llm"] and kept:
+                    reply = self._loop_llm(el, a["llm"], a["ctx"])
+                    if reply is None:
+                        raise KeyboardInterrupt
+                    if reply:
+                        rec["llm"] = reply
+                    else:
+                        rec["error"] = "llm: empty reply or request failed"
+                        rec["kept"] = False
+                elif kept and not a["llm"]:
+                    rec["text"] = el.text
+            except KeyboardInterrupt:
+                self._jev_out("\n[loop] interrupted — the current element was not logged"
+                              + ("; rerun the same command to resume" if jl else ""), _YELL)
+                break
+            if jl:
+                ls.append_jsonl(jl, rec)
+            run_recs.append(rec)
+
+        # ── reports, render, context ──────────────────────────────────────────
+        all_recs = ls.read_log(jl) if jl else run_recs
+        rg_report = ""
+        if rg_state:
+            texts, vecs, goal_vec, target = rg_state
+            rep = ls.rg_stream_report([e.id for e in elements], texts, vecs, goal_vec, target, a["rg_dup"])
+            rg_report = ls.format_rg_report(rep)
+            for line in rg_report.split("\n"):
+                self._jev_out(line, _CYAN if line.startswith("[loop]") else "")
+        summary = ls.summary_table(all_recs)
+        for line in summary.split("\n"):
+            self._jev_out(line, _CYAN if line.startswith("[loop]") else "")
+        if jl:
+            rendered, warn = ls.render(jl, a["out"])
+            if warn:
+                self._jev_out(f"[loop] {warn}", _YELL)
+            self._jev_out(f"[loop] wrote {a['out']}  (log: {jl})", _GREEN)
+        else:
+            rendered = ls.render_records(run_recs, "md")
+
+        if not self._in_agent:
+            parts = [f"[loop {arg_s}]", summary]
+            if rg_report:
+                parts.append(rg_report)
+            if rendered.strip():
+                n_tok = ls.est_tokens(rendered)
+                if n_tok < self.num_ctx * 0.25:
+                    parts.append(rendered.strip())
+                elif a["out"]:
+                    parts.append(f"(results in {a['out']} — ~{n_tok} tokens, too large for context)")
+                else:
+                    parts.append(f"(results ~{n_tok} tokens, too large for context — rerun with --out <file>)")
+            ctx_text = "\n\n".join(parts)
+            if a["yes"] or self._confirm("add loop results to context? [Y/n]", ctx_add=ctx_text):
+                self.messages.append({"role": "user", "content": ctx_text})
+                _ok(f"[loop] results added to context")
+        self._last_output = rendered or summary
+
     # ── /text ───────────────────────────────────────────────────────────────────
 
-    def _cmd_note(self):
+    def _cmd_text(self):
         """Open multi-line editor, then send the composed text to the AI."""
         text, prompt_name = _multiline_input()
         if not text.strip():
@@ -9556,6 +11361,150 @@ Config stored in ~/.1bcoder/translate.json
         if not found_any:
             print(f"[proj find] no results for '{term}'")
 
+    # ── /note: titled notes — definitions and facts from the last reply or by hand ──
+    # Kept in .1bcoder/note/<term>.md (note_store.py). In an agent, what list / term /
+    # search / load print is the tool result — the agent's own context; the main
+    # context (self.messages) is touched only outside an agent, and only on ctx / load.
+
+    def _note_add_ctx(self, label: str, text: str):
+        if self._in_agent:
+            return              # already printed: the agent's tee carries it into the agent's context
+        self.messages.append({"role": "user", "content": f"[{label}]\n{text}"})
+        self._note_offered(text)
+        _ok(f"[note] added to context ({len(text) // 4} tok)")
+
+    def _cmd_note(self, user_input: str):
+        ns = _note_store()
+        parts = user_input.split(None, 2)
+        sub = parts[1] if len(parts) > 1 else ""
+        rest = parts[2].strip() if len(parts) > 2 else ""
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+
+        if sub in ("def", "fact"):
+            term, _, text = rest.partition(" ")
+            text = text.strip()
+            if not term or not text:
+                print(f"usage: /note {sub} <term> <text|$>")
+                return
+            if text == "$":
+                text = (self._last_output or "").strip()
+                who = (f"llm: {self.model}" if text and text == (self.last_reply or "").strip()
+                       else "output")
+                if not text:
+                    print("[note] nothing to take: no last reply or output yet")
+                    return
+            else:
+                if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+                    text = text[1:-1].strip()
+                who = "agent" if self._in_agent else "user"
+            try:
+                added = ns.add(NOTES_DIR, term, sub, text, f"[{who} · {today}]")
+            except ValueError as e:
+                _err(f"[note] {e}")
+                return
+            kind = "definition" if sub == "def" else "fact"
+            if added:
+                _ok(f"[note] {ns.norm(term)}: {kind} added ({who})")
+            else:
+                print(f"[note] {ns.norm(term)}: the same {kind} is already there")
+
+        elif sub == "keyword":
+            term, _, kws = rest.partition(" ")
+            if not term or not kws.strip():
+                print("usage: /note keyword <term> <k1,k2,...>")
+                return
+            try:
+                all_kw = ns.add_keywords(NOTES_DIR, term, kws.split(","))
+            except ValueError as e:
+                _err(f"[note] {e}")
+                return
+            _ok(f"[note] {ns.norm(term)}: keywords {', '.join(all_kw)}")
+
+        elif sub == "list":
+            notes = ns.all_notes(NOTES_DIR)
+            if not notes:
+                print("[note] no notes yet — /note def <term> <text|$>")
+                return
+            print(f"[note] {len(notes)} note(s):")
+            print(ns.format_list(notes))
+
+        elif sub == "term":
+            tokens = rest.split()
+            add_ctx = len(tokens) > 1 and tokens[-1].lower() == "ctx"
+            term = " ".join(tokens[:-1] if add_ctx else tokens)
+            if not term:
+                print("usage: /note term <term> [ctx]")
+                return
+            note = ns.read(NOTES_DIR, term)
+            if note is None:
+                print(f"[note] no note '{ns.norm(term)}' — {len(ns.all_notes(NOTES_DIR))} note(s) in total: /note list")
+                return
+            text = ns.format_note(note)
+            print(text)
+            self._note_offered(text)
+            if add_ctx:
+                self._note_add_ctx(f"note: {note['term']}", text)
+
+        elif sub == "search":
+            tokens = rest.split()
+            add_ctx = len(tokens) > 1 and tokens[-1].lower() == "ctx"
+            query = " ".join(tokens[:-1] if add_ctx else tokens)
+            if not query:
+                print("usage: /note search <words> [ctx]")
+                return
+            hits = ns.search(NOTES_DIR, query)
+            self._note_hits = [h["note"]["term"] for h in hits]
+            if not hits:
+                notes = ns.all_notes(NOTES_DIR)
+                if not notes:
+                    print(f"[note] no match for '{query}' — there are no notes yet")
+                elif len(notes) <= 30:
+                    print(f"[note] no match for '{query}' — {len(notes)} note(s) in total: "
+                          + ", ".join(n["term"] for n in notes))
+                else:
+                    print(f"[note] no match for '{query}' — {len(notes)} note(s) in total: /note list")
+                return
+            text = ns.format_hits(hits)
+            print(text)
+            print(f"[/note load N,M — add the Nth and Mth notes to context]")
+            self._note_offered(text)
+            if add_ctx:
+                self._note_add_ctx(f"note search: {query}", text)
+
+        elif sub == "load":
+            hits = getattr(self, "_note_hits", [])
+            if not hits:
+                print("[note] nothing to load — run /note search <words> first")
+                return
+            try:
+                nums = ns.parse_numbers(rest)
+            except ValueError as e:
+                _err(f"[note] {e}")
+                return
+            if not nums:
+                print("usage: /note load <N,M>")
+                return
+            bad = [n for n in nums if not 1 <= n <= len(hits)]
+            if bad:
+                _err(f"[note] no result {', '.join(map(str, bad))} — the last search found {len(hits)}")
+                return
+            blocks = []
+            for n in nums:
+                note = ns.read(NOTES_DIR, hits[n - 1])
+                if note is not None:
+                    blocks.append(ns.format_note(note))
+            text = "\n\n".join(blocks)
+            if self._in_agent:
+                print(text)     # the agent's context gets the notes through its tee
+            else:
+                print(f"[note] {', '.join(hits[n - 1] for n in nums)}")
+            self._note_add_ctx("notes", text)
+
+        else:
+            print("usage: /note def|fact <term> <text|$>  |  /note keyword <term> <k1,k2>  |  "
+                  "/note list  |  /note term <term> [ctx]  |  /note search <words> [ctx]  |  /note load <N,M>")
+
     def _cmd_proj(self, user_input: str):
         """Project context management — local .1bcoder/projects/<key>/
 
@@ -10084,7 +12033,7 @@ Config stored in ~/.1bcoder/translate.json
                 self._stats["mcp_bytes"] += len(str(result))
                 print(f"[mcp] {tool_name}:")
                 print(result)
-                if not self._auto_apply:
+                if not self._in_agent:
                     self.messages.append({"role": "user", "content": f"[mcp: {tool_name}]\n{result}"})
                 print("[mcp] injected into context")
             except Exception as e:
@@ -10582,7 +12531,7 @@ Config stored in ~/.1bcoder/translate.json
         result = '\n\n'.join(matches)
         print(result)
 
-        if ctx and not self._auto_apply:
+        if ctx and not self._in_agent:
             self.messages.append({"role": "user",
                                    "content": f"[help: /{cmd}]\n{result}"})
             print(f"\n[help] /{cmd} injected into context")
@@ -10907,7 +12856,7 @@ Config stored in ~/.1bcoder/translate.json
             # full map
             print(result)
             if auto_yes or self._confirm("  add full map to context? [Y/n]:", ctx_add=result):
-                if not self._auto_apply:
+                if not self._in_agent:
                     self.messages.append({"role": "user", "content": f"[project map]\n{result}"})
                 print("[map] full map injected into context")
             return
@@ -10924,7 +12873,7 @@ Config stored in ~/.1bcoder/translate.json
         print(f"[map] {{{{map_files}}}} set — {len(paths)} file(s)")
 
         if auto_yes or self._confirm("  add to context? [Y/n]:", ctx_add=result):
-            if not self._auto_apply:
+            if not self._in_agent:
                 self.messages.append({"role": "user",
                                        "content": f"[map find: {clean_q}]\n{result}"})
             print("[map] injected into context")
@@ -10963,7 +12912,7 @@ Config stored in ~/.1bcoder/translate.json
             print(result)
             print()
             if auto_yes or self._confirm("  add to context? [Y/n]:", ctx_add=result):
-                if not self._auto_apply:
+                if not self._in_agent:
                     self.messages.append({"role": "user",
                                            "content": f"[map trace: {label}]\n{result}"})
                 print("[map] trace injected into context")
@@ -11020,7 +12969,7 @@ Config stored in ~/.1bcoder/translate.json
 
             if collected:
                 content = "\n\n".join(collected)
-                if not self._auto_apply:
+                if not self._in_agent:
                     self.messages.append({"role": "user",
                                            "content": f"[map trace: {label}]\n{content}"})
                 print(f"[map] {len(collected)} path(s) injected into context")
@@ -11036,7 +12985,7 @@ Config stored in ~/.1bcoder/translate.json
             print(result)
             print()
             if auto_yes or self._confirm("  add to context? [Y/n]:", ctx_add=result):
-                if not self._auto_apply:
+                if not self._in_agent:
                     self.messages.append({"role": "user",
                                            "content": f"[map trace: {label}]\n{result}"})
                 print("[map] trace injected into context")
@@ -11101,7 +13050,7 @@ Config stored in ~/.1bcoder/translate.json
         print()
 
         if changes > 0 and self._confirm("  add diff to context? [Y/n]:", ctx_add=result):
-            if not self._auto_apply:
+            if not self._in_agent:
                 self.messages.append({"role": "user", "content": result})
             print(f"{_GREEN}[map] diff injected into context{_R}")
 
@@ -11247,7 +13196,7 @@ Config stored in ~/.1bcoder/translate.json
         tee = _Tee(sys.stdout)
         original_confirm = self._confirm
         if auto_apply:
-            self._confirm = lambda _prompt, **kw: True
+            self._confirm = lambda _prompt, ctx_add="", **kw: (self._note_offered(ctx_add), True)[1]
             self._auto_apply = True
 
         original_stdout = sys.stdout
@@ -11585,7 +13534,7 @@ Config stored in ~/.1bcoder/translate.json
                     print(f"{_DIM}[{label}] no ACTION and no plan steps remaining — done{_R}")
                     if on_done:
                         self._route(on_done)
-                    ans = _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                    ans = self._agent_result_choice()
                     if ans == "a":
                         self.messages.extend(agent_msgs[msgs_offset:])
                         _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
@@ -11604,7 +13553,7 @@ Config stored in ~/.1bcoder/translate.json
                         self._route(_pa, auto=True)
                     if on_done:
                         self._route(on_done)
-                    ans = _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                    ans = self._agent_result_choice()
                     if ans == "a":
                         self.messages.extend(agent_msgs[msgs_offset:])
                         _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
@@ -11662,7 +13611,8 @@ Config stored in ~/.1bcoder/translate.json
                 # not a blanket skip of the whole gates_post list: a proc like `ladder` (evidence
                 # tracking) is the OPPOSITE case -- it specifically NEEDS to see read results to
                 # do its job, so it must still run on read-only turns.
-                _READ_ONLY_VERBS = {"/read", "/readln", "/tree", "/find", "/ls", "/view", "/diff", "/map", "/mkdir"}
+                _READ_ONLY_VERBS = {"/read", "/readln", "/tree", "/find", "/grep", "/ls", "/view", "/diff", "/map", "/mkdir",
+                                    "/note"}
                 _action_verbs = {c.strip().split()[0] for c in actions if c.strip()}
                 _all_read_only = bool(_action_verbs) and _action_verbs <= _READ_ONLY_VERBS
                 _SKIP_ON_READ_ONLY = {"autocheck"}
@@ -11700,7 +13650,7 @@ Config stored in ~/.1bcoder/translate.json
                         print(f"[{label}] autoexit — task verified complete")
                         if on_done:
                             self._route(on_done)
-                        ans = _input("  Add to main context? [s]ummary / [a]ll / [n]one: ").strip().lower()
+                        ans = self._agent_result_choice()
                         if ans == "a":
                             self.messages.extend(agent_msgs[msgs_offset:])
                             _ok(f"[{label}] {len(agent_msgs) - msgs_offset} message(s) added to context")
@@ -12368,6 +14318,7 @@ def main():
     parser.add_argument("--ctx", metavar="FILE",
                         help="Load context from file before starting (e.g. myctx/ctx.txt)")
     args = parser.parse_args()
+    _setup_colors()
     _bootstrap_global_dir()
 
     if args.init:
@@ -12383,6 +14334,17 @@ def main():
     explicit_model = args.model is not None
 
     if args.scriptapply:
+        # headless output is usually redirected to a file; on Windows that stream is the
+        # ANSI code page (cp1251, cp1252), where the UI's box characters raise UnicodeEncodeError
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(errors="replace")
+            except (AttributeError, ValueError):
+                pass
+        # headless never waits for the keyboard: -y covers _confirm, but some prompts
+        # (agent end-of-run, map trace, param fill) read stdin directly; an empty stdin
+        # gives each of them its default answer, as when stdin is not a console
+        sys.stdin = io.StringIO("")
         script = args.scriptapply
         if not os.path.isabs(script):
             local_path  = os.path.join(SCRIPTS_DIR, script)
@@ -12419,7 +14381,9 @@ def main():
         lines = _load_script(script)
         if lines and _POS_RE.match(lines[0].rstrip("\n")):
             _clear_pos(lines, script)
-        param_tokens = " ".join(f"{k}={v}" for k, v in params.items())
+        # quoted: "/script apply" re-splits this line with shlex, and a value such as
+        # task="login fails after reset" must stay one token
+        param_tokens = " ".join(shlex.quote(f"{k}={v}") for k, v in params.items())
         script_fwd = script.replace("\\", "/")   # shlex.split strips backslashes on Windows
         cli._cmd_script(f"/script apply -y {script_fwd} {param_tokens}".strip())
         sys.exit(0)
@@ -12485,6 +14449,10 @@ def main():
         print()
         sys.exit(0)
     else:
+        global _HERDR
+        _HERDR = _ade().Herdr.here(["1bcoder", *sys.argv[1:]])   # in a herdr pane: report itself
+        if _HERDR:
+            _HERDR.start()
         cli = CoderCLI(base_url, model, models, provider)
         if args.ctx:
             cli._cmd_ctx(f"/ctx load {args.ctx}")

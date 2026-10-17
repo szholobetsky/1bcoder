@@ -25,7 +25,7 @@ Usage:
 index:
   --glossary <dir>   glossary directory (e.g. .1bcoder/glossary/myproject) —
                      must already exist, built by /flow glossary index first.
-  --tasks <dir>      tasks/ folder from `simargl export --all`. The sibling
+  --tasks <dir>      tasks/ folder from `mokosh export --all`. The sibling
                      commits/ folder (same parent directory) is located
                      automatically — simargl always exports them as siblings.
   --host / --model   Ollama host:port and model, e.g.
@@ -417,7 +417,7 @@ def _cmd_index(rest: str) -> None:
     commits_dir = _os.path.join(_os.path.dirname(tasks_dir), "commits")
     if not _os.path.isdir(commits_dir):
         print(f"[history] commits dir not found next to tasks dir: {commits_dir}")
-        print("[history] run `simargl export --all` (not --join) to get this layout")
+        print("[history] run `mokosh export --all` (not --join) to get this layout")
         return
     if not _os.path.isdir(glossary_dir):
         print(f"[history] glossary dir not found: {glossary_dir}")
