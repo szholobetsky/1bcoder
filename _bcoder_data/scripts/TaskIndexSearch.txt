@@ -17,7 +17,7 @@
 # task            the task text; keep double quotes out of it, it is passed to the indexers on a command line
 # ontology_check  Y = add the co-change check; anything else or not given = skip it
 #
-# Needs: pip install gamayun simargl, a gamayun project and a simargl index of the task history.
+# Needs: pip install gamayun-ontology simargl, a gamayun project and a simargl index of the task history.
 /param run_timeout 300
 /param timeout 900
 /run gamayun search --project {{project}} --k 8 "{{task}}"
