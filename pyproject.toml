@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "1bcoder"
-version = "0.1.33"
+version = "0.1.34"
 description = "AI coding assistant agent for 1B–7B local models (Ollama, LMStudio, llama.cpp). Terminal REPL with file editing, project map, agents, scripts, and parallel multi-model queries."
 requires-python = ">=3.10"
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -27,7 +27,7 @@ Repository = "https://github.com/szholobetsky/1bcoder"
 1bcoder = "chat:main"
 
 [tool.setuptools]
-py-modules = ["chat", "map_index", "map_query", "jev", "loop_stream", "ade", "note_store"]
+py-modules = ["chat", "map_index", "map_query", "jev", "loop_stream", "ade", "note_store", "websearch"]
 
 [tool.setuptools.packages.find]
 include = ["_bcoder_data*"]

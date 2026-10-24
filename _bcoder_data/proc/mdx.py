@@ -6,7 +6,7 @@ Auto-fixes common Mermaid issues (bare multi-word node names).
 
 Supports:
   Markdown     via marked.js    — headers, tables, code blocks
-  LaTeX math   via KaTeX        — $inline$ and $$block$$ expressions
+  LaTeX math   via KaTeX        — $inline$, $$block$$ and ```math fences
   Diagrams     via Mermaid      — ```mermaid flowchart, sequence, class, etc.
 
 Usage:
@@ -32,7 +32,7 @@ Examples:
 
   See also: md — renders in terminal (no LaTeX, no Mermaid, no browser)
 """
-import sys, re, tempfile, webbrowser
+import sys, re, json, tempfile, webbrowser
 
 
 def fix_mermaid(text):
@@ -68,6 +68,29 @@ def fix_mermaid(text):
     return re.sub(r'```mermaid\n(.*?)```', fix_block, text, flags=re.DOTALL)
 
 
+def extract_math(text):
+    """Pull display math (```math fences, $$ on their own lines) out before marked.
+
+    marked eats LaTeX backslashes (\\, \\{ \\\\), so each block becomes a placeholder
+    div rendered by KaTeX after parsing. Other code fences are left untouched.
+    """
+    blocks = []
+
+    def keep(tex):
+        blocks.append(tex.strip())
+        return f'\n\n<div class="mdx-math" data-i="{len(blocks) - 1}"></div>\n\n'
+
+    parts = re.split(r'(^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*$)', text, flags=re.M | re.S)
+    for i, part in enumerate(parts):
+        m = re.match(r'[ \t]*```math[ \t]*\n(.*)\n[ \t]*```[ \t]*$', part, re.S)
+        if m:
+            parts[i] = keep(m.group(1))
+        elif not part.lstrip().startswith('```'):
+            parts[i] = re.sub(r'^[ \t]*\$\$(.*?)\$\$[ \t]*$', lambda m: keep(m.group(1)),
+                              part, flags=re.M | re.S)
+    return ''.join(parts), blocks
+
+
 if len(sys.argv) > 1 and sys.argv[1]:
     import os
     fpath = sys.argv[1]
@@ -81,6 +104,7 @@ else:
     text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 text = text.replace('\r\n', '\n')
 text = fix_mermaid(text)
+text, math_blocks = extract_math(text)
 
 f = tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8")
 f.write(f"""<!DOCTYPE html>
@@ -107,7 +131,14 @@ f.write(f"""<!DOCTYPE html>
 <div id="out"></div>
 <script>
   const text = {repr(text)};
+  const mathBlocks = {json.dumps(math_blocks)};
   document.getElementById('out').innerHTML = marked.parse(text);
+
+  if (typeof katex !== 'undefined') {{
+    document.querySelectorAll('div.mdx-math').forEach(el => {{
+      katex.render(mathBlocks[+el.dataset.i], el, {{ displayMode: true, throwOnError: false }});
+    }});
+  }}
 
   if (typeof renderMathInElement !== 'undefined') {{
     renderMathInElement(document.getElementById('out'), {{

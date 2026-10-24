@@ -413,6 +413,26 @@ def _loop_stream():
     return _LOOP_MOD
 
 
+_WEBSEARCH_MOD = None
+
+
+def _websearch():
+    """Lazy-load websearch.py (next to chat.py) — web search engines of /web and the flows."""
+    global _WEBSEARCH_MOD
+    if _WEBSEARCH_MOD is None:
+        try:
+            import websearch as _m
+        except ImportError:
+            import importlib.util
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "websearch.py")
+            _spec = importlib.util.spec_from_file_location("websearch", _p)
+            _m = importlib.util.module_from_spec(_spec)
+            sys.modules["websearch"] = _m
+            _spec.loader.exec_module(_m)
+        _WEBSEARCH_MOD = _m
+    return _WEBSEARCH_MOD
+
+
 _NOTE_MOD = None
 
 
@@ -1493,9 +1513,15 @@ Multi-line input (the prompt, scripts, commands):
           /view diagram.png
           /visual explain what technologies are shown?
 
-/web search <term> [-> varname]   Search DuckDuckGo; results shown + URLs saved to variable.
+/web search [-e engine] <term> [-> varname]   Search the web; results shown + URLs saved to variable.
 /web fetch <url> [-n 4000]        Fetch URL, strip HTML, inject cleaned text into context.
+/web engine                       List search engines and pick the default by number (DuckDuckGo
+                                  unless changed; ~/.1bcoder/search.json). Flows use it too.
+/web engine <N|name> [key=… | url=… | lang=…]   Set the default; brave/tavily need key=, searxng url=.
     e.g.  /web search python asyncio tutorial -> urls
+          /web search -e arxiv mutual information two corpora
+          /web engine 3
+          /web engine brave key=BSA...
           /web fetch https://docs.python.org/3/library/asyncio.html
 
 /flow list                List available flows (global + local).
@@ -3514,7 +3540,7 @@ _CMD_SPEC = {
     "/doc":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
     "/translate": dict(file_idx=None, kw_idx=1, keywords=["setup", "on", "off", "status", "last"]),
     "/visual":    dict(file_idx=None, kw_idx=1, keywords=["setup", "status", "explain"]),
-    "/web":       dict(file_idx=None, kw_idx=1, keywords=["search", "fetch"]),
+    "/web":       dict(file_idx=None, kw_idx=1, keywords=["search", "fetch", "engine"]),
     "/flow":      dict(file_idx=None, kw_idx=1, keywords=["list"]),
     "/profile":   dict(file_idx=None, kw_idx=1, keywords=["list", "show", "add", "save"]),
     "/switch":    dict(file_idx=None, kw_idx=1, keywords=["restore", "profile"]),
@@ -8999,60 +9025,15 @@ advanced_tools =
         p=_S(); p.feed(html_bytes.decode("utf-8","replace")); return "\n".join(p.out)
 
     @staticmethod
-    def _web_ddg_search(term: str, n: int = 8):
-        """Return list of (title, url, snippet) from DuckDuckGo HTML search."""
-        import requests as _r, re as _re
-        from urllib.parse import parse_qs, urlparse, unquote
-        from html.parser import HTMLParser
+    def _web_search(term: str, n: int = 8, engine: str = None):
+        """Return list of (title, url, snippet) from the default search engine
+        (/web engine, ~/.1bcoder/search.json; DuckDuckGo unless changed).
+        Raises websearch.SearchError — a blocked engine says so, not "no results"."""
+        ws = _websearch()
+        return ws.search(term, n, ws.load_settings(), engine=engine)
 
-        class _DDG(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.results = []
-                self._cur = {}
-                self._in = None
-            def handle_starttag(self, tag, attrs):
-                d = dict(attrs)
-                cls = d.get("class","")
-                if tag == "a" and "result__a" in cls:
-                    href = d.get("href","")
-                    try:
-                        params = parse_qs(urlparse(href).query)
-                        url = params.get("uddg",[""])[0]
-                        if not url: url = unquote(href)
-                    except Exception:
-                        url = href
-                    self._cur["url"] = url
-                    self._in = "title"
-                elif tag == "a" and "result__snippet" in cls:
-                    self._in = "snippet"
-            def handle_endtag(self, tag):
-                if self._in and tag == "a":
-                    if "url" in self._cur and "title" in self._cur:
-                        if "snippet" not in self._cur:
-                            self._cur["snippet"] = ""
-                        self.results.append((
-                            self._cur.get("title",""),
-                            self._cur.get("url",""),
-                            self._cur.get("snippet",""),
-                        ))
-                        self._cur = {}
-                    self._in = None
-            def handle_data(self, data):
-                if self._in == "title":
-                    self._cur["title"] = self._cur.get("title","") + data
-                elif self._in == "snippet":
-                    self._cur["snippet"] = self._cur.get("snippet","") + data
-
-        resp = _r.post(
-            "https://html.duckduckgo.com/html/",
-            data={"q": term},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
-        parser = _DDG()
-        parser.feed(resp.text)
-        return parser.results[:n]
+    # flows call this name (webask, webanalys, deepagent_*) — it follows /web engine too
+    _web_ddg_search = _web_search
 
     # ── /visual ─────────────────────────────────────────────────────────────
 
@@ -9208,15 +9189,67 @@ advanced_tools =
 
         print("usage: /visual setup | status | explain <image> [prompt] [-y]")
 
+    def _cmd_web_engine(self, args: list):
+        """/web engine — numbered list; a number (typed now or given) becomes the default.
+        key=/url=/lang= set the engine's options in ~/.1bcoder/search.json."""
+        ws = _websearch()
+        settings = ws.load_settings()
+        current = ws.default_engine(settings)
+        names = list(ws.ENGINES)
+        opts = dict(a.split("=", 1) for a in args if "=" in a)
+        picks = [a for a in args if "=" not in a]
+
+        if not picks and not opts:
+            print(f"[web] search engines  (* = default, saved in {ws.SETTINGS_FILE})")
+            for i, name in enumerate(names, 1):
+                label, need = ws.ENGINES[name]
+                gap = ws.missing(settings, name)
+                note = f"  — needs {gap}: /web engine {name} {gap}=…" if gap else ""
+                mark = " *" if name == current else "  "
+                print(f"  {i:>2}.{mark} {name:<10} {label}{note}")
+            if self._auto_apply or not sys.stdin.isatty():
+                return
+            try:
+                raw = _input(f"Pick [{names.index(current) + 1}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(); return
+            if not raw:
+                return
+            picks = [raw]
+
+        name = ws.resolve_engine(picks[0]) if picks else current
+        if not name:
+            print(f"[web] no engine '{picks[0]}' — /web engine lists 1..{len(names)}"); return
+        if opts:
+            eng = settings.setdefault("engines", {}).setdefault(name, {})
+            for k, v in opts.items():
+                k = k.strip().lower()
+                if k not in ("key", "url", "lang"):
+                    print(f"[web] unknown option '{k}' — key=, url=, lang="); return
+                eng[k] = v.strip()
+        gap = ws.missing(settings, name)
+        if gap:
+            ws.save_settings(settings)
+            print(f"[web] {name} needs a {gap} — /web engine {name} {gap}=…  (default stays {current})")
+            return
+        settings["default"] = name
+        ws.save_settings(settings)
+        print(f"[web] search engine = {name}  (saved to {ws.SETTINGS_FILE})")
+
     def _cmd_web(self, user_input: str):
         """
-/web search <term> [-> varname]   Search DuckDuckGo; optionally save URL list to variable.
+/web search [-e engine] <term> [-> varname]   Search the default engine (or -e); optionally save URL list to variable.
 /web fetch <url> [-n 4000]        Fetch URL, strip HTML, inject cleaned text into context.
+/web engine [N|name] [key=… url=… lang=…]   List search engines, pick the default by number.
         """
         parts = user_input.split(None, 2)
         sub = parts[1].lower() if len(parts) > 1 else ""
 
         ctx = self._agent_msgs if (self._in_agent and self._agent_msgs) else self.messages
+
+        if sub == "engine":
+            self._cmd_web_engine(parts[2].split() if len(parts) > 2 else [])
+            return
 
         if sub == "search":
             raw = parts[2] if len(parts) > 2 else ""
@@ -9224,12 +9257,21 @@ advanced_tools =
             if " -> " in raw:
                 raw, _, var_name = raw.partition(" ->")
                 var_name = var_name.strip().lstrip("$")
+            engine = None
+            em = re.match(r"\s*(?:-e|--engine)\s+(\S+)\s*", raw)
+            if em:
+                engine = _websearch().resolve_engine(em.group(1))
+                if not engine:
+                    print(f"[web] unknown engine '{em.group(1)}' — /web engine lists them"); return
+                raw = raw[em.end():]
             term = raw.strip()
             if not term:
-                print("usage: /web search <term> [-> varname]"); return
-            print(f"[web] searching: {term} ...")
+                print("usage: /web search [-e engine] <term> [-> varname]"); return
+            ws = _websearch()
+            engine = engine or ws.default_engine(ws.load_settings())
+            print(f"[web] searching ({engine}): {term} ...")
             try:
-                results = self._web_ddg_search(term)
+                results = self._web_search(term, engine=engine)
             except Exception as e:
                 print(f"[web] search failed: {e}"); return
             if not results:
